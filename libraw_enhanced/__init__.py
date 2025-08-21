@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+LibRaw Enhanced - High-performance RAW image processing with Metal acceleration
+
+Apple Silicon最適化とMetal Performance Shadersを活用した
+高速RAW画像処理ライブラリ
+"""
+
+__version__ = "0.1.0"
+__author__ = "LibRaw Enhanced Team"
+
+import warnings
+import platform
+
+# Core extension import with fallback
+try:
+    from . import _core
+    _CORE_AVAILABLE = True
+except ImportError as e:
+    _core = None
+    _CORE_AVAILABLE = False
+    warnings.warn(
+        f"LibRaw Enhanced core module not available: {e}\n"
+        "Please ensure the package was built correctly for your platform."
+    )
+
+# High-level API imports
+try:
+    from .high_level_api import (
+        RawImage, 
+        imread,
+        imread_buffer,
+    )
+except ImportError as e:
+    # Fallback implementations or warnings
+    warnings.warn(f"High-level API not available: {e}")
+    
+    # Minimal fallback implementations
+    def RawImage(*args, **kwargs):
+        raise RuntimeError("LibRaw Enhanced not properly installed")
+    
+    def imread(*args, **kwargs):
+        raise RuntimeError("LibRaw Enhanced not properly installed")
+
+# Core classes (low-level API)
+if _CORE_AVAILABLE:
+    try:
+        CPUAccelerator = _core.CPUAccelerator
+        Accelerator = _core.Accelerator
+        ImageBufferFloat32 = _core.ImageBufferFloat32
+        ProcessingParams = _core.ProcessingParams
+    except AttributeError:
+        # These classes might not be available in all builds
+        CPUAccelerator = None
+        Accelerator = None
+        ImageBufferFloat32 = None
+        ProcessingParams = None
+else:
+    CPUAccelerator = None
+    Accelerator = None
+    ImageBufferFloat32 = None
+    ProcessingParams = None
+
+# Constants and enums
+try:
+    from .constants import (
+        ColorSpace,
+        HighlightMode, 
+        FBDDNoiseReduction,
+        NoiseReduction,
+        DemosaicAlgorithm
+    )
+except ImportError:
+    # Define minimal constants as fallback
+    class ColorSpace:
+        sRGB = 1
+        AdobeRGB = 2
+        ProPhotoRGB = 4
+    
+    class HighlightMode:
+        Clip = 0
+        Unclip = 1
+        Blend = 2
+        Rebuild = 3
+
+# Pipeline functionality (optional)
+try:
+    from .pipeline_builder import (
+        PipelineBuilder,
+        Pipeline, 
+        ProcessingStep,
+        ProcessingStepType,
+        ProcessingMethod,
+        create_standard_pipeline,
+        create_high_quality_pipeline,
+        create_fast_pipeline
+    )
+    _PIPELINE_AVAILABLE = True
+except ImportError as e:
+    _PIPELINE_AVAILABLE = False
+    # Pipeline functionality is optional and not yet implemented
+    pass
+
+# Platform and capability detection
+def get_platform_info():
+    """プラットフォーム情報の取得"""
+    import platform  # Re-import to ensure availability
+    info = {
+        "platform": platform.system(),
+        "machine": platform.machine(),
+        "python_version": platform.python_version(),
+        "core_available": _CORE_AVAILABLE,
+        "pipeline_available": _PIPELINE_AVAILABLE,
+    }
+    
+    if _CORE_AVAILABLE:
+        try:
+            build_info = _core.get_build_info()
+            info.update(build_info)
+            
+            info["metal_available"] = _core.is_metal_available()
+            info["apple_silicon"] = _core.is_apple_silicon()
+            
+            if info["metal_available"]:
+                info["metal_devices"] = _core.get_metal_device_list()
+            
+        except (AttributeError, RuntimeError):
+            pass
+    
+    return info
+
+def is_apple_silicon():
+    """Apple Silicon環境の検出"""
+    if _CORE_AVAILABLE:
+        try:
+            return _core.is_apple_silicon()
+        except AttributeError:
+            pass
+    
+    # Fallback detection
+    import platform
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+def is_metal_available():
+    """Metal加速の可用性チェック"""
+    if _CORE_AVAILABLE:
+        try:
+            return _core.is_metal_available()
+        except AttributeError:
+            pass
+    
+    return False
+
+def get_version_info():
+    """バージョン情報の取得"""
+    info = {
+        "package_version": __version__,
+        "platform_info": get_platform_info()
+    }
+    
+    if _CORE_AVAILABLE:
+        try:
+            info["core_version"] = _core.get_version_info()
+        except AttributeError:
+            pass
+    
+    return info
+
+# rawpy互換関数のエクスポート
+__all__ = [
+    # Core classes (high-level API)
+    "RawImage", 
+    "imread",
+    "imread_buffer",
+    
+    # Core classes (low-level API)
+    "CPUAccelerator",
+    "Accelerator", 
+    "ImageBufferFloat32",
+    "ProcessingParams",
+    
+    # Platform detection  
+    "is_apple_silicon",
+    "is_metal_available", 
+    "get_platform_info",
+    "get_version_info",
+    
+    # Constants
+    "ColorSpace",
+    "HighlightMode",
+    "FBDDNoiseReduction", 
+    "NoiseReduction",
+    "DemosaicAlgorithm",
+]
+
+# Pipeline exports (conditional)
+if _PIPELINE_AVAILABLE:
+    __all__.extend([
+        "PipelineBuilder",
+        "Pipeline",
+        "ProcessingStep", 
+        "ProcessingStepType",
+        "ProcessingMethod",
+        "create_standard_pipeline",
+        "create_high_quality_pipeline", 
+        "create_fast_pipeline",
+    ])
+
+# Initialization and startup checks
+def _initialize_package():
+    """パッケージ初期化時のチェック"""
+    
+    # 基本的な可用性チェック
+    if not _CORE_AVAILABLE:
+        warnings.warn(
+            "LibRaw Enhanced core module is not available. "
+            "Some functionality will be limited. "
+            "Please check your installation."
+        )
+        return
+    
+    # Apple Silicon特有の最適化情報
+    if is_apple_silicon() and is_metal_available():
+        # デバッグモード以外では非表示
+        import os
+        if os.environ.get("LIBRAW_ENHANCED_DEBUG"):
+            print("LibRaw Enhanced: Metal acceleration available on Apple Silicon")
+    
+    # Performance hint for Intel Macs
+    elif platform.system() == "Darwin" and platform.machine() == "x86_64":
+        if os.environ.get("LIBRAW_ENHANCED_DEBUG"): 
+            print("LibRaw Enhanced: Running on Intel Mac, Metal features limited")
+
+# パッケージ初期化実行
+_initialize_package()
+
+# Clean up module namespace
+del warnings, platform
