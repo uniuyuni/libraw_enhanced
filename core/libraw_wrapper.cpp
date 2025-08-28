@@ -1,5 +1,4 @@
 #include "libraw_wrapper.h"
-#include "cpu_accelerator.h"
 #include <iostream>
 #include <memory>
 #include <chrono>
@@ -19,56 +18,12 @@
 
 namespace libraw_enhanced {
 
-// Type conversion utilities for upper pipeline processing
-ImageBufferFloat32 create_float32_from_uint16_pipeline(const uint16_t (*image)[4], size_t width, size_t height, size_t channels, BufferManager& buffer_manager) {
-    ImageBufferFloat32 result;
-    result.width = width;
-    result.height = height; 
-    result.channels = channels;
-    result.data = static_cast<float*>(buffer_manager.allocate(width * height * channels * sizeof(float)));
-    
-    // Convert uint16 to float32 using a more realistic scale
-    // Most camera RAW data uses 12-14 bits, not full 16 bits
-    // Using a smaller scale factor to avoid overly dark images
-    //const float scale = 1.0f / 65535.0f;  // 14-bit scale instead of 16-bit
-    const float scale = 1.0f / 16383.0f;  // 14-bit scale instead of 16-bit
-    size_t pixel_count = width * height;
-    
-    std::cout << "🔧 Converting uint16[4] to float32[" << channels << "] (" << pixel_count << " pixels)" << std::endl;
-    
-    // Convert with proper RGB channel extraction from demosaiced uint16[4] data
-    for (size_t i = 0; i < pixel_count; i++) {
-        // After demosaic: R=channel[0], G1=channel[1], B=channel[2], G2=channel[3]
-        if (channels == 3) {
-            // Convert each channel to float with proper precision, then combine G1+G2
-            float r_val = static_cast<float>(image[i][0]) * scale;  // Red
-            float g1_val = static_cast<float>(image[i][1]) * scale; // Green 1
-            float b_val = static_cast<float>(image[i][2]) * scale;  // Blue
-            float g2_val = static_cast<float>(image[i][3]) * scale; // Green 2
-            
-            // Assign RGB with proper G1+G2 averaging for better color accuracy
-            result.data[i * 3 + 0] = r_val;                    // Red
-            result.data[i * 3 + 1] = (g1_val + g2_val) * 0.5f; // Green (G1+G2)/2
-            //result.data[i * 3 + 1] = g1_val;                    // Green
-            result.data[i * 3 + 2] = b_val;                    // Blue
-        } else {
-            // Fallback: copy channels as-is
-            for (size_t c = 0; c < channels && c < 4; c++) {
-                result.data[i * channels + c] = static_cast<float>(image[i][c]) * scale;
-            }
-        }
-    }
-    
-    std::cout << "✅ Conversion completed successfully" << std::endl;
-    return result;
-}
-
-void convert_float32_to_uint8_pipeline(const ImageBufferFloat32& src, uint8_t* dst) {
+void convert_float32_to_uint8_pipeline(const ImageBufferFloat& src, uint8_t* dst) {
     size_t count = src.width * src.height * src.channels;
     const float scale = 255.0f;
     
     for (size_t i = 0; i < count; i++) {
-        float val = src.data[i] * scale;
+        float val = (&src.image[0][0])[i] * scale;
         val = std::max(0.0f, std::min(255.0f, val));
         dst[i] = static_cast<uint8_t>(val + 0.5f);
     }
@@ -84,8 +39,6 @@ public:
 #ifdef METAL_ACCELERATION_AVAILABLE
     std::unique_ptr<Accelerator> accelerator;
 
-    bool metal_enabled = false;
-    bool metal_available = false;
     // REMOVED: bool custom_pipeline_enabled (unused custom pipeline feature)
     ProcessingParams current_params;
     ushort* custom_rgb_buffer = nullptr;  // Custom RGB buffer for GPU processing
@@ -104,62 +57,6 @@ public:
         return duration.count() / 1000000.0;  // 秒単位で返す
     }
     
-    // RAW境界の0値を隣接ピクセルから補間で修正
-    void fix_raw_border_zeros(ImageBuffer& raw_buffer) {
-        const int border_width = 20;  // 境界20ピクセルをチェック
-        const int width = raw_buffer.width;
-        const int height = raw_buffer.height;
-        
-        int fixed_count = 0;
-        
-        // 全ての境界領域をスキャン
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                // 境界判定
-                bool is_border = (x < border_width || x >= width - border_width || 
-                                y < border_width || y >= height - border_width);
-                
-                if (is_border) {
-                    uint16_t* pixel = raw_buffer.image[y * width + x];
-                    
-                    // 0値ピクセルを発見した場合
-                    if (pixel[0] == 0) {
-                        // 隣接ピクセルから補間
-                        uint32_t sum = 0;
-                        int count = 0;
-                        
-                        // 3x3近傍から非0値を収集
-                        for (int dy = -1; dy <= 1; dy++) {
-                            for (int dx = -1; dx <= 1; dx++) {
-                                int nx = x + dx;
-                                int ny = y + dy;
-                                
-                                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                                    uint16_t neighbor_val = raw_buffer.image[ny * width + nx][0];
-                                    if (neighbor_val > 0) {
-                                        sum += neighbor_val;
-                                        count++;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // 補間値を設定
-                        if (count > 0) {
-                            pixel[0] = sum / count;
-                            fixed_count++;
-                        } else {
-                            // 近傍に非0値がない場合は適当な値を設定
-                            pixel[0] = 500;  // 適度な中間値
-                            fixed_count++;
-                        }
-                    }
-                }
-            }
-        }
-        
-        std::cout << "✅ Fixed " << fixed_count << " zero pixels in border regions" << std::endl;
-    }
     // LibRaw-compatible black level correction (internal function)
     void apply_black_level_correction(ImageBuffer& raw_buffer) {
         std::cout << "📋 Apply black level subtraction: " << processor.imgdata.color.black << std::endl;
@@ -193,11 +90,12 @@ public:
                     
                     // Clamp to valid range
                     if (val < 0) val = 0;
-                    if (val > 65535) val = 65535;
+                    if (val > processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
                     
                     raw_buffer.image[q][c] = val;
                 }
             }
+
         } else if (cblack[0] || cblack[1] || cblack[2] || cblack[3]) {
             // Simple per-channel black level correction
             std::cout << "📋 Using per-channel black level correction: " 
@@ -210,11 +108,12 @@ public:
                     
                     // Clamp to valid range
                     if (val < 0) val = 0;
-                    if (val > 65535) val = 65535;
+                    if (val > processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
                     
                     raw_buffer.image[q][c] = val;
                 }
             }
+
         } else {
             // Fallback: simple global black level
             std::cout << "📋 Using global black level: " << processor.imgdata.color.black << std::endl;
@@ -226,7 +125,7 @@ public:
                     
                     // Clamp to valid range
                     if (val < 0) val = 0;
-                    if (val > 65535) val = 65535;
+                    if (val > processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
                     
                     raw_buffer.image[q][c] = val;
                 }
@@ -235,9 +134,151 @@ public:
         
         std::cout << "✅ Black level subtraction completed for " << total_pixels << " pixels" << std::endl;
     }
-    
+
+    // LibRaw-compatible green matching (internal function)
+    void apply_green_matching(ImageBuffer& raw_buffer, uint32_t filters) {
+        std::cout << "📋 Apply green matching for G1/G2 equilibration" << std::endl;
+        
+        // Skip for XTrans sensors (only for Bayer)
+        if (filters == FILTERS_XTRANS) {
+            std::cout << "📋 Skipping green matching for XTrans sensor" << std::endl;
+            return;
+        }
+        
+        const int margin = 3;
+        const float thr = 0.01f;
+        const int width = raw_buffer.width;
+        const int height = raw_buffer.height;
+        const int maximum = processor.imgdata.color.maximum; // Dynamic maximum value
+        
+        // Find G2 pixel position in Bayer pattern
+        int oj = 2, oi = 2;
+        
+        // In RGGB Bayer pattern: R(0,0), G1(0,1), G2(1,0), B(1,1)
+        // We look for G2 positions which are typically at (1,0) pattern
+        // For more robust detection, we assume standard RGGB and start from (1,0)
+        oj = 1; // G2 row offset
+        oi = 0; // G2 col offset
+        
+        // Create working copy of image data
+        uint16_t (*img)[4] = (uint16_t(*)[4])calloc(height * width, sizeof(uint16_t[4]));
+        if (!img) {
+            std::cerr << "❌ Failed to allocate memory for green matching" << std::endl;
+            return;
+        }
+        
+        // Copy original data
+        memcpy(img, raw_buffer.image, height * width * sizeof(uint16_t[4]));
+        
+        int processed_pixels = 0;
+        
+        for (int j = oj + 2; j < height - margin; j += 2) {
+            for (int i = oi + 2; i < width - margin; i += 2) {
+                // Ensure we don't go out of bounds
+                if (j - 1 < 0 || j + 1 >= height || i - 1 < 0 || i + 1 >= width ||
+                    j - 2 < 0 || j + 2 >= height || i - 2 < 0 || i + 2 >= width) {
+                    continue;
+                }
+                
+                // Get surrounding G1 pixels (channel[1])
+                int o1_1 = img[(j - 1) * width + i - 1][1];
+                int o1_2 = img[(j - 1) * width + i + 1][1];
+                int o1_3 = img[(j + 1) * width + i - 1][1];
+                int o1_4 = img[(j + 1) * width + i + 1][1];
+                
+                // Get surrounding G2 pixels (channel[3])
+                int o2_1 = img[(j - 2) * width + i][3];
+                int o2_2 = img[(j + 2) * width + i][3];
+                int o2_3 = img[j * width + i - 2][3];
+                int o2_4 = img[j * width + i + 2][3];
+                
+                // Calculate averages
+                double m1 = (o1_1 + o1_2 + o1_3 + o1_4) / 4.0;
+                double m2 = (o2_1 + o2_2 + o2_3 + o2_4) / 4.0;
+                
+                // Calculate consistency (variation) in each group
+                double c1 = (abs(o1_1 - o1_2) + abs(o1_1 - o1_3) + abs(o1_1 - o1_4) +
+                            abs(o1_2 - o1_3) + abs(o1_3 - o1_4) + abs(o1_2 - o1_4)) / 6.0;
+                double c2 = (abs(o2_1 - o2_2) + abs(o2_1 - o2_3) + abs(o2_1 - o2_4) +
+                            abs(o2_2 - o2_3) + abs(o2_3 - o2_4) + abs(o2_2 - o2_4)) / 6.0;
+                
+                // Apply correction only in flat areas and non-saturated pixels
+                if ((img[j * width + i][3] < maximum * 0.95) && 
+                    (c1 < maximum * thr) && 
+                    (c2 < maximum * thr) && 
+                    (m2 > 0.1)) { // Avoid division by zero
+                    
+                    float correction = raw_buffer.image[j * width + i][3] * m1 / m2;
+                    raw_buffer.image[j * width + i][3] = correction > maximum ? maximum : (uint16_t)correction;
+                    processed_pixels++;
+                }
+            }
+        }
+        
+        free(img);
+        std::cout << "✅ Green matching completed: processed " << processed_pixels << " G2 pixels" << std::endl;
+    }
+
+    // LibRaw-compatible adjust_maximum implementation
+    void adjust_maximum(const ImageBuffer& raw_buffer, float threshold) {
+        std::cout << "📋 Apply adjust_maximum for dynamic maximum value adjustment (threshold: " << threshold << ")" << std::endl;
+        
+        // Early return if threshold is too small (LibRaw compatibility)
+        if (threshold < 0.00001f) {
+            std::cout << "📋 Skipping adjust_maximum: threshold too small (" << threshold << ")" << std::endl;
+            return;
+        }
+        
+        // Use default threshold if too large (LibRaw compatibility)
+        float auto_threshold = threshold;
+        if (threshold > 0.99999f) {
+            auto_threshold = 0.75f; // LIBRAW_DEFAULT_ADJUST_MAXIMUM_THRESHOLD
+            std::cout << "📋 Using default threshold: " << auto_threshold << std::endl;
+        }
+        
+        // Calculate data_maximum if not already set (LibRaw compatibility)
+        uint16_t real_max = processor.imgdata.color.data_maximum;
+        if (real_max == 0 && raw_buffer.image != nullptr) {
+            std::cout << "📋 Calculating data_maximum by scanning image data..." << std::endl;
+            
+            size_t total_pixels = raw_buffer.width * raw_buffer.height;
+            uint16_t max_value = 0;
+            
+            for (size_t i = 0; i < total_pixels; i++) {
+                for (int c = 0; c < 4; c++) {
+                    uint16_t val = raw_buffer.image[i][c];
+                    if (val > max_value) {
+                        max_value = val;
+                    }
+                }
+            }
+            
+            real_max = max_value;
+            processor.imgdata.color.data_maximum = real_max;
+            std::cout << "📋 Calculated data_maximum: " << real_max << std::endl;
+        }
+        
+        uint16_t current_max = processor.imgdata.color.maximum;
+        std::cout << "📋 Current maximum: " << current_max << ", data_maximum: " << real_max << std::endl;
+        
+        // Apply LibRaw's adjust_maximum logic
+        if (real_max > 0 && real_max < current_max && 
+            real_max > current_max * auto_threshold) {
+            
+            processor.imgdata.color.maximum = real_max;
+            std::cout << "✅ Adjusted maximum value: " << current_max << " → " << real_max 
+                      << " (threshold: " << auto_threshold << ")" << std::endl;
+        } else {
+            std::cout << "📋 No adjustment needed - conditions not met" << std::endl;
+            std::cout << "   real_max > 0: " << (real_max > 0) << std::endl;
+            std::cout << "   real_max < current_max: " << (real_max < current_max) << std::endl;
+            std::cout << "   real_max > current_max * threshold: " << (real_max > current_max * auto_threshold) 
+                      << " (" << real_max << " > " << (current_max * auto_threshold) << ")" << std::endl;
+        }
+    }
+
     // Main RAW to RGB processing pipeline (unified float32 processing)
-    bool process_raw_to_rgb(ImageBuffer& raw_buffer, ImageBufferFloat32& rgb_buffer, const ProcessingParams& params) {
+    bool process_raw_to_rgb(ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const ProcessingParams& params) {
         std::cout << "🎯 Starting unified RAW→RGB processing pipeline" << std::endl;
         std::cout << "📋 Parameters: demosaic=" << params.demosaic_algorithm << std::endl;
 
@@ -246,17 +287,21 @@ public:
             std::cerr << "❌ Accelerator not initialized" << std::endl;
             return false;
         }
+        
+        // Set GPU acceleration flag from processing parameters
+        accelerator->set_use_gpu_acceleration(params.use_gpu_acceleration);
 
         // Apply LibRaw-compatible black level subtraction
         apply_black_level_correction(raw_buffer);
 
+        // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
+        adjust_maximum(raw_buffer, params.adjust_maximum_thr);
+
         // set filters and xtrans
-        uint32_t filters = processor.imgdata.idata.filters;
-        char (&xtrans)[6][6] = processor.imgdata.idata.xtrans;
-        
-        // filters値の確認
+        uint32_t filters = processor.imgdata.idata.filters;        
+        char (&xtrans)[6][6] = processor.imgdata.idata.xtrans;        
         std::cout << "🔍 Filters value: " << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
-        
+
         // XTransパターンの詳細表示（XTransセンサーの場合のみ）
         if (filters == FILTERS_XTRANS) {
             std::cout << "🔍 XTrans Pattern from LibRaw:" << std::endl;
@@ -279,10 +324,28 @@ public:
                 std::cout << std::endl;
             }
         }
-                        
-        // RAW境界の0値を修正 (一時的に無効化)
-        // std::cout << "🔧 Fixing zero values in RAW border regions..." << std::endl;
-        // fix_raw_border_zeros(raw_buffer);
+        /*
+        if (filters > 0xff) {
+            for (uint32_t row = 0; row < raw_buffer.height; ++row) {
+                for (uint32_t col = 0; col < raw_buffer.width; ++col) {
+                    char c = fcol_bayer(row, col, filters);
+                    if (c == 1) {
+                        uint32_t idx = row * raw_buffer.width + col;
+                        if (raw_buffer.image[idx][1] < 1000) {
+                            raw_buffer.image[idx][1] = 1000;
+                        } else
+                        if (raw_buffer.image[idx][1] > processor.imgdata.color.maximum-1000) {
+                            //raw_buffer.image[idx][1] = (raw_buffer.image[idx][0] + raw_buffer.image[idx][2]) / 2;
+                            raw_buffer.image[idx][1] = processor.imgdata.color.maximum-1000;
+                        }
+                    }
+                }
+            }
+        }
+        */
+
+        // Apply green matching for Bayer sensors (after black level, before demosaic)
+        apply_green_matching(raw_buffer, filters);
 
         // Step 2: Apply pre-interpolation processing
         std::cout << "🔧 Applying pre-interpolation processing..." << std::endl;
@@ -292,27 +355,6 @@ public:
             return false;
         }
         std::cout << "✅ Pre-interpolation completed successfully" << std::endl;
-
-        // このコードは、demosaic_bayer_amaze を呼び出す前の、
-        // RAWデータをImageBufferにコピーする部分に相当します。
-        /**
-        if (filters > 0xFF) {
-            for (size_t row = 0; row < raw_buffer.height; ++row) {
-                for (size_t col = 0; col < raw_buffer.width; ++col) {
-                    
-                    uint16_t (*pixel)[4] = &raw_buffer.image[row * raw_buffer.width + col];
-                    
-                    int color_code = fcol_bayer(row, col, filters);
-
-                    // ✨ここが修正のポイント✨
-                    // G2 (コード=3) の場合でも、G1と同じチャンネル[1]にデータを格納する
-                    if (color_code == 3) {
-                        (*pixel)[1] = (*pixel)[3];  // G2をG1にコピー
-                    }
-                }
-            }
-        }
-        **/
 
         // Step 3: Camera matrix-based color space conversion (reuse float_rgb buffer)
         const char* camera_make = processor.imgdata.idata.make;
@@ -326,20 +368,24 @@ public:
             // Use fallback identity-like matrix for unknown cameras
             camera_matrix.set_default();
         }
+        /*
+        // Step 4: Create ImageBufferFloat for demosaic output
+        ImageBufferFloat rgb_float;
+        rgb_float.width = raw_buffer.width;
+        rgb_float.height = raw_buffer.height;
+        rgb_float.channels = 3;
+        rgb_float.image = new float[demosaic_output.width * demosaic_output.height][3];
+        */
 
-        // Step 4: Demosaic processing (unified CPU/GPU selection via accelerator)
-        bool demosaic_success = accelerator->demosaic_compute(raw_buffer, raw_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform);
+        // Step 5: Demosaic processing (unified CPU/GPU selection via accelerator)
+        // Phase 5: Pass LibRaw cam_mul for dynamic initialGain calculation and maximum_value for precise normalization
+        bool demosaic_success = accelerator->demosaic_compute(raw_buffer, rgb_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform, processor.imgdata.color.cam_mul, processor.imgdata.color.maximum);
         if (!demosaic_success) {
             std::cerr << "❌ Demosaic processing failed" << std::endl;
             // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
 
-        // Step 5: Convert input to float32 for unified processing
-        std::cout << "🔧 Converting to float32..." << std::endl;
-        ImageBufferFloat32 rgb_float = create_float32_from_uint16_pipeline(
-            raw_buffer.image, raw_buffer.width, raw_buffer.height, 3, buffer_manager
-        );
 
         // Step 6: Apply white balance to RAW data (float32 interface)        
         float effective_wb[4];
@@ -369,7 +415,7 @@ public:
         }
         std::cout << "[" << effective_wb[0] << ", " << effective_wb[1] 
                 << ", " << effective_wb[2] << ", " << effective_wb[3] << "]" << std::endl;
-        if (!accelerator->apply_white_balance(rgb_float, rgb_float, effective_wb)) {
+        if (!accelerator->apply_white_balance(rgb_buffer, rgb_buffer, effective_wb)) {
             std::cerr << "❌ White balance failed" << std::endl;
             // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
@@ -381,14 +427,14 @@ public:
             std::cout << "⚠️ Camera not in database, using fallback matrix" << std::endl;
             camera_matrix.set_default();
         }
-        if (!accelerator->convert_color_space(rgb_float, rgb_float, camera_matrix.transform)) {
+        if (!accelerator->convert_color_space(rgb_buffer, rgb_buffer, camera_matrix.transform)) {
             std::cerr << "❌ Camera matrix color conversion failed" << std::endl;
             // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
                 
         // Step 6: In-place gamma correction with color space awareness (reuse float_rgb buffer)  
-        if (!accelerator->gamma_correct(rgb_float, rgb_float, params.gamma_power, params.gamma_slope, params.output_color_space)) {
+        if (!accelerator->gamma_correct(rgb_buffer, rgb_buffer, params.gamma_power, params.gamma_slope, params.output_color_space)) {
             std::cerr << "❌ Gamma correction failed" << std::endl;
             // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
@@ -397,7 +443,7 @@ public:
         // Step 6.5: Highlight recovery (after gamma correction, before final output)
         if (params.highlight_mode > 2) {
             std::cout << "🔧 Applying highlight recovery (mode " << params.highlight_mode << ")..." << std::endl;
-            if (!recover_highlights_float32(rgb_float, params.highlight_mode)) {
+            if (!recover_highlights(rgb_buffer, params.highlight_mode)) {
                 std::cerr << "❌ Highlight recovery failed" << std::endl;
                 return false;
             }
@@ -405,18 +451,19 @@ public:
         }
         
         // Step 7: Copy processed data back to output buffer
+        /*
         rgb_buffer.width = rgb_float.width;
         rgb_buffer.height = rgb_float.height;
         rgb_buffer.channels = 3;
         
         // Copy the processed float32 data to the output buffer
         size_t total_elements = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
-        std::memcpy(rgb_buffer.data, rgb_float.data, total_elements * sizeof(float));
+        std::memcpy(rgb_buffer.image, rgb_float.image, total_elements * sizeof(float));
         
         std::cout << "✅ Processed data copied to output buffer (" << total_elements << " elements)" << std::endl;
-        
         // Note: rgb_temp.image allocated via buffer_manager - automatically managed
         std::cout << "✅ RGB buffer will be freed by buffer_manager" << std::endl;
+        */
         
         std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully" << std::endl;
         return true;
@@ -832,16 +879,7 @@ public:
 #ifdef METAL_ACCELERATION_AVAILABLE
         // Metal加速器初期化
         accelerator = std::make_unique<Accelerator>();
-        metal_available = accelerator->initialize();
-        metal_enabled = metal_available;
-        
-        if (metal_available) {
-            std::cout << "Metal acceleration initialized on: " 
-                      << accelerator->get_device_info() << std::endl;
-        } else {
-            std::cout << "Metal acceleration not available, using CPU processing" << std::endl;
-        }
-
+        accelerator->initialize();
 #else
         std::cout << "Metal acceleration not compiled in" << std::endl;
 #endif
@@ -904,7 +942,7 @@ public:
             raw_buffer.image = processor.imgdata.image;          // Now guaranteed non-null
             
             // Prepare output RGB buffer
-            ImageBufferFloat32 rgb_buffer;
+            ImageBufferFloat rgb_buffer;
             rgb_buffer.width = processor.imgdata.sizes.iwidth;   // Use processed width, not raw width
             rgb_buffer.height = processor.imgdata.sizes.iheight; // Use processed height, not raw height
             rgb_buffer.channels = 3;
@@ -914,9 +952,7 @@ public:
             size_t float_bytes = float_elements * sizeof(float);
             
             // Allocate persistent float buffer using BufferManager
-            rgb_buffer.data = static_cast<float*>(buffer_manager.allocate(float_bytes));
-            
-
+            rgb_buffer.image = static_cast<float(*)[3]>(buffer_manager.allocate(float_bytes));
             
             // Use unified processing pipeline
             if (process_raw_to_rgb(raw_buffer, rgb_buffer, current_params)) {
@@ -927,8 +963,9 @@ public:
                 std::cout << "🔄 Converting float32 to uint8..." << std::endl;
                 
                 // Convert float [0.0, 1.0] to uint8 [0, 255]
+                float* float_data = &rgb_buffer.image[0][0];
                 for (size_t i = 0; i < uint8_elements; i++) {
-                    float value = rgb_buffer.data[i];
+                    float value = float_data[i];
                     // Clamp and convert
                     value = std::max(0.0f, std::min(1.0f, value));
                     metal_processed_data[i] = static_cast<uint8_t>(value * 255.0f + 0.5f);
@@ -999,7 +1036,7 @@ public:
                 result.bits_per_sample = 8; // Fallback
             }
             
-            result.data = metal_processed_data;  // Copy the data
+            result.data.assign(metal_processed_data.begin(), metal_processed_data.end());  // Copy the data
             result.error_code = LIBRAW_SUCCESS;
             result.timing_info = timing_info;  // 計測情報を含める
             
@@ -1117,12 +1154,8 @@ public:
         }
     }
     
-    void enable_metal_acceleration(bool enable) {
-        metal_enabled = enable && metal_available;
-    }
-    
-    bool is_metal_available() const {
-        return metal_available;
+    bool is_gpu_available() const {
+        return accelerator->is_gpu_available();
     }
     
     std::string get_metal_device_info() const {
@@ -1171,26 +1204,12 @@ public:
         return result;
     }
     
-    // REMOVED: Unused process_with_custom_pipeline() method (67 lines)
-    // This was replaced by the unified process_raw_to_rgb() pipeline
-    
-    // REMOVED: Unused apply_white_balance_scaling() method (72 lines)
-    // White balance is now handled in the main process_raw_to_rgb() pipeline
-    
-    // REMOVED: Unused custom_demosaic() method (26 lines)
-    // Demosaic algorithm selection is now handled in accelerator.cpp
-    
-    // REMOVED: Unused has_gpu_bayer_implementation() and has_gpu_xtrans_implementation() (24 lines)
-    // GPU capability detection is now handled in accelerator.cpp
-    
-    // REMOVED: Massive unused custom_gpu_demosaic() function (~150+ lines)
-    // REMOVED: Unused custom_cpu_demosaic() function (~37 lines)
-    // Both functions were replaced by unified accelerator.cpp dispatch
     
     // LibRaw recover_highlights equivalent for float32 processing
-    bool recover_highlights_float32(ImageBufferFloat32& rgb_buffer, int highlight_mode) {
+    bool recover_highlights(ImageBufferFloat& rgb_buffer, int highlight_mode) {
         std::cout << "🔧 Starting highlight recovery (float32)..." << std::endl;
         
+        highlight_mode = 4;
         if (highlight_mode <= 2) {
             return true; // No highlight recovery needed
         }
@@ -1243,9 +1262,9 @@ public:
                     // Sample the SCALE x SCALE block
                     for (size_t row = mrow * SCALE; row < (mrow + 1) * SCALE && row < height; row++) {
                         for (size_t col = mcol * SCALE; col < (mcol + 1) * SCALE && col < width; col++) {
-                            const size_t idx = row * width * channels + col * channels;
-                            const float pixel_c = rgb_buffer.data[idx + c];
-                            const float pixel_kc = rgb_buffer.data[idx + kc];
+                            const size_t pixel_idx = row * width + col;
+                            const float pixel_c = rgb_buffer.image[pixel_idx][c];
+                            const float pixel_kc = rgb_buffer.image[pixel_idx][kc];
                             
                             // Check if pixel is saturated in channel c but not in reference channel
                             if (pixel_c >= hsat[c] * 0.99f && pixel_kc > 0.8f * max_value) {
@@ -1314,12 +1333,12 @@ public:
                     
                     for (size_t row = mrow * SCALE; row < (mrow + 1) * SCALE && row < height; row++) {
                         for (size_t col = mcol * SCALE; col < (mcol + 1) * SCALE && col < width; col++) {
-                            const size_t idx = row * width * channels + col * channels;
+                            const size_t pixel_idx = row * width + col;
                             
-                            if (rgb_buffer.data[idx + c] >= hsat[c] * 0.99f) {
-                                float val = rgb_buffer.data[idx + kc] * ratio;
-                                if (rgb_buffer.data[idx + c] < val) {
-                                    rgb_buffer.data[idx + c] = std::min(val, max_value);
+                            if (rgb_buffer.image[pixel_idx][c] >= hsat[c] * 0.99f) {
+                                float val = rgb_buffer.image[pixel_idx][kc] * ratio;
+                                if (rgb_buffer.image[pixel_idx][c] < val) {
+                                    rgb_buffer.image[pixel_idx][c] = std::min(val, max_value);
                                 }
                             }
                         }
@@ -1371,12 +1390,12 @@ void LibRawWrapper::set_processing_params(const ProcessingParams& params) {
     pimpl->set_processing_params(params);
 }
 
-void LibRawWrapper::enable_metal_acceleration(bool enable) {
-    pimpl->enable_metal_acceleration(enable);
+bool LibRawWrapper::is_gpu_available() const {
+    return pimpl->accelerator->is_gpu_available();
 }
 
-bool LibRawWrapper::is_metal_available() const {
-    return pimpl->is_metal_available();
+void LibRawWrapper::enable_gpu_acceleration(bool enable) {
+    pimpl->accelerator->set_use_gpu_acceleration(enable);
 }
 
 std::string LibRawWrapper::get_metal_device_info() const {
@@ -1645,15 +1664,13 @@ bool is_apple_silicon() {
 #endif
 }
 
+// REMOVED: Global is_gpu_available() function that creates temporary GPU instances
+// Use LibRawWrapper::is_gpu_available() or instance-based methods instead
+
 bool is_metal_available() {
+    // Backward compatibility - check if Metal is available without creating instances
 #ifdef METAL_ACCELERATION_AVAILABLE
-    // Check if we can create a GPU accelerator instance and initialize it
-    try {
-        auto gpu_accel = std::make_unique<GPUAccelerator>();
-        return gpu_accel->initialize();
-    } catch (...) {
-        return false;
-    }
+    return is_apple_silicon(); // Simple check - Apple Silicon has Metal support
 #else
     return false;
 #endif

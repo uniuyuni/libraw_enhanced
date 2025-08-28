@@ -172,32 +172,32 @@ PYBIND11_MODULE(_core, m) {
             });
 
     // ImageBufferFloat32構造体のバインディング
-    py::class_<ImageBufferFloat32>(m, "ImageBufferFloat32")
+    py::class_<ImageBufferFloat>(m, "ImageBufferFloat")
         .def(py::init<>())
-        .def_readwrite("width", &ImageBufferFloat32::width)
-        .def_readwrite("height", &ImageBufferFloat32::height)
-        .def_readwrite("channels", &ImageBufferFloat32::channels)
-        .def("is_valid", &ImageBufferFloat32::is_valid)
+        .def_readwrite("width", &ImageBufferFloat::width)
+        .def_readwrite("height", &ImageBufferFloat::height)
+        .def_readwrite("channels", &ImageBufferFloat::channels)
+        .def("is_valid", &ImageBufferFloat::is_valid)
         .def_property("data",
-            [](ImageBufferFloat32 &self) -> py::array_t<float> {
-                if (!self.data || self.width == 0 || self.height == 0 || self.channels == 0) {
+            [](ImageBufferFloat &self) -> py::array_t<float> {
+                if (!self.image || self.width == 0 || self.height == 0 || self.channels == 0) {
                     return py::array_t<float>();
                 }
-                size_t total_size = self.width * self.height * self.channels;
+                size_t total_pixels = self.width * self.height;
                 return py::array_t<float>(
-                    {total_size},
-                    {sizeof(float)},
-                    self.data,
+                    {total_pixels, self.channels},
+                    {sizeof(float) * self.channels, sizeof(float)},
+                    reinterpret_cast<float*>(self.image),
                     py::cast(self) // Keep object alive
                 );
             },
-            [](ImageBufferFloat32 &self, py::array_t<float> input) {
+            [](ImageBufferFloat &self, py::array_t<float> input) {
                 py::buffer_info buf = input.request();
                 size_t expected_size = self.width * self.height * self.channels;
-                if (buf.size != expected_size) {
+                if (static_cast<size_t>(buf.size) != expected_size) {
                     throw std::runtime_error("Data size mismatch");
                 }
-                self.data = static_cast<float*>(buf.ptr);
+                self.image = reinterpret_cast<float(*)[3]>(buf.ptr);
             });
 
     // CPUAccelerator class is internal implementation - not exposed to Python
@@ -297,8 +297,8 @@ PYBIND11_MODULE(_core, m) {
             [](LibRawWrapper& self, const ProcessingParams& params) {
                 self.set_processing_params(params);
             })
-        .def("enable_metal_acceleration", &LibRawWrapper::enable_metal_acceleration)
-        .def("is_metal_available", &LibRawWrapper::is_metal_available)
+        .def("enable_gpu_acceleration", &LibRawWrapper::enable_gpu_acceleration)
+        .def("is_gpu_available", &LibRawWrapper::is_gpu_available)
         .def("get_metal_device_info", &LibRawWrapper::get_metal_device_info)
         // REMOVED: .def("enable_custom_pipeline", &LibRawWrapper::enable_custom_pipeline, - unused custom pipeline feature
 #endif
@@ -307,7 +307,11 @@ PYBIND11_MODULE(_core, m) {
     // ヘルパー関数のバインディング
 #ifdef METAL_ACCELERATION_AVAILABLE
     m.def("is_apple_silicon", &is_apple_silicon, "Check if running on Apple Silicon");
-    m.def("is_metal_available", &is_metal_available, "Check if Metal is available");
+    // REMOVED: Global is_gpu_available function - use LibRawWrapper.is_gpu_available() instead
+    m.def("is_gpu_available", []() { 
+        // Return basic Apple Silicon check instead of creating GPU instances
+        return is_apple_silicon();
+    }, "Check if GPU might be available (basic check)");
     m.def("get_metal_device_list", &get_metal_device_list, "Get list of Metal devices");
     
     m.def("create_params_from_rawpy_args", &create_params_from_rawpy_args,
@@ -370,7 +374,7 @@ PYBIND11_MODULE(_core, m) {
 #else
     // Metal非対応環境用のスタブ関数
     m.def("is_apple_silicon", []() { return false; }, "Check if running on Apple Silicon (always false on non-Apple platforms)");
-    m.def("is_metal_available", []() { return false; }, "Check if Metal is available (always false on non-Apple platforms)");
+    m.def("is_gpu_available", []() { return false; }, "Check if GPU is available (always false on non-Apple platforms)");
     m.def("get_metal_device_list", []() { return std::vector<std::string>(); }, "Get list of Metal devices (empty on non-Apple platforms)");
 #endif
 

@@ -15,6 +15,16 @@
 
 namespace libraw_enhanced {
 
+// ✨ D50白色点 (ProPhotoRGBに準拠)
+static constexpr float d50_white[3] = {0.9642f, 1.0f, 0.8249f};
+
+// ✨ XYZから線形ProPhotoRGBへの変換マトリクス
+static constexpr float xyz_rgb[3][3] = {
+    {1.34578f, -0.04008f, -0.04033f},
+    {-0.25556f, 1.15949f, 0.09109f},
+    {0.00912f, -0.00994f, 1.00693f}
+};
+
 // ===== COMMON DEFINITIONS =====
 // These definitions are shared across CPU, GPU, and wrapper components
 
@@ -29,13 +39,13 @@ struct ImageBuffer {
 };
 
 // Float32 processing structures
-struct ImageBufferFloat32 {
-    float* data = nullptr;
+struct ImageBufferFloat {
+    float (*image)[3] = nullptr;
     size_t width = 0;
     size_t height = 0;
-    size_t channels = 0;
+    size_t channels = 3;  // Always 3 (RGB)
     
-    bool is_valid() const { return data != nullptr && width > 0 && height > 0 && channels > 0; }
+    bool is_valid() const { return image != nullptr && width > 0 && height > 0; }
 };
 
 // Processing parameters for all components
@@ -182,65 +192,79 @@ public:
     // Initialization and device info
     bool initialize();
     bool is_available() const;
+    bool is_gpu_available() const;
+
     std::string get_device_info() const;
     void set_debug_mode(bool enable) { /* Simplified debug mode */ }
     size_t get_memory_usage() const { return 0; }  // Simplified memory usage
     double get_last_processing_time() const { return 0.0; }  // Simplified timing
+    
+    // GPU acceleration control
+    void set_use_gpu_acceleration(bool enable);
     
     // Pre-interpolation processing (border handling, hot pixels, etc.)
     bool pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size = false);
     
     // Bayer demosaicing methods
     bool demosaic_bayer_linear(const ImageBuffer& raw_buffer,
-                                ImageBuffer& rgb_buffer, 
-                                uint32_t filters);
+                                ImageBufferFloat& rgb_buffer, 
+                                uint32_t filters,
+                                uint16_t maximum_value);
                                                          
     bool demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
-                            ImageBuffer& rgb_buffer,
-                            uint32_t filters);
+                            ImageBufferFloat& rgb_buffer,
+                            uint32_t filters,
+                            uint16_t maximum_value);
                                             
     bool demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
-                            ImageBuffer& rgb_buffer,
+                            ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
+                            uint16_t maximum_value,
                             int iterations = 1,   // デフォルト値
                             bool dcb_enhance = true); // デフォルト値
                            
     bool demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
-                            ImageBuffer& rgb_buffer,
-                            uint32_t filters);
+                            ImageBufferFloat& rgb_buffer,
+                            uint32_t filters,
+                            const float (&cam_mul)[4],
+                            uint16_t maximum_value);
     
     // Unified demosaic compute method with CPU/GPU selection
     bool demosaic_compute(const ImageBuffer& raw_buffer,
-                            ImageBuffer& rgb_buffer,
+                            ImageBufferFloat& rgb_buffer,
                             int algorithm,
                             uint32_t filters,
                             const char (&xtrans)[6][6],
-                            const float (&color_matrix)[3][4]);
+                            const float (&color_matrix)[3][4],
+                            const float (&cam_mul)[4],
+                            uint16_t maximum_value);
     
     // X-Trans demosaicing methods  
     bool demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
-                                ImageBuffer& rgb_buffer,
+                                ImageBufferFloat& rgb_buffer,
                                 const char (&xtrans)[6][6],
-                                const float (&color_matrix)[3][4]);
+                                const float (&color_matrix)[3][4],
+                                uint16_t maximum_value);
                               
     bool demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
-                                ImageBuffer& rgb_buffer,
+                                ImageBufferFloat& rgb_buffer,
                                 const char (&xtrans)[6][6],
-                                const float (&color_matrix)[3][4]);
+                                const float (&color_matrix)[3][4],
+                                uint16_t maximum_value);
                                    
     // White balance methods
-    bool apply_white_balance(const ImageBufferFloat32& rgb_input,
-                            ImageBufferFloat32& rgb_output,
+    bool apply_white_balance(const ImageBufferFloat& rgb_input,
+                            ImageBufferFloat& rgb_output,
                             const float wb_multipliers[4]);
 
     // Camera matrix-based color space conversion
-    bool convert_color_space(const ImageBufferFloat32& rgb_input,
-                            ImageBufferFloat32& rgb_output,
+    bool convert_color_space(const ImageBufferFloat& rgb_input,
+                            ImageBufferFloat& rgb_output,
                             const float transform[3][4]);
 
     // Gamma correction method
-    bool gamma_correct(const ImageBufferFloat32& rgb_input,
-                        ImageBufferFloat32& rgb_output,
+    bool gamma_correct(const ImageBufferFloat& rgb_input,
+                        ImageBufferFloat& rgb_output,
                         float gamma_power = 2.2f,
                         float gamma_slope = 4.5f,
                         int output_color_space = 1); // 1=sRGB, 2=Adobe RGB, etc.

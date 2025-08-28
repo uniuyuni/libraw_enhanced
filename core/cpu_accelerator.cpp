@@ -1,5 +1,7 @@
 #include "cpu_accelerator.h"
 #include "accelerator.h"
+#include "constants.h"
+#include "metal/shader_common.h"
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -36,78 +38,96 @@ void CPUAccelerator::release_resources() { initialized_ = false; }
 // Demosaic function for linear interpolation
 //===================================================================
 
-bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageBuffer& rgb_buffer, uint32_t filters) {
-#ifdef __APPLE__
+bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
     if (!initialized_) return false;
-    std::cout << "🔧 Starting CPU linear interpolation demosaic..." << std::endl;
-    const size_t width = raw_buffer.width, height = raw_buffer.height;
-    const int colors = 4;
-    std::cout << "📐 Image dimensions: " << width << "x" << height << std::endl;
-    std::cout << "🎨 Bayer filter pattern: 0x" << std::hex << filters << std::dec << std::endl;
 
-    const int size = (filters == 9) ? 6 : 16;
-    std::vector<int> code_buffer(size * size * 32);
-    int* code = code_buffer.data();
-    for (int row = 0; row < size; row++) {
-        for (int col = 0; col < size; col++) {
-            int* ip = code + (((row * 16) + col) * 32) + 1;
-            int f = fcol_bayer(row, col, filters);
-            int sum[4] = {0};
-            for (int y = -1; y <= 1; y++) {
-                for (int x = -1; x <= 1; x++) {
-                    int shift = (y == 0) + (x == 0);
-                    int color = fcol_bayer(row + y + 48, col + x + 48, filters);
-                    if (color == f) continue;
-                    *ip++ = (width * y + x) * 4 + color;
-                    *ip++ = shift;
-                    *ip++ = color;
-                    sum[color] += 1 << shift;
-                }
-            }
-            code[(row * 16 + col) * 32] = (ip - (code + ((row * 16) + col) * 32)) / 3;
-            for (int c = 0; c < colors; c++) {
-                if (c != f) {
-                    *ip++ = c;
-                    *ip++ = sum[c] > 0 ? 256 / sum[c] : 0;
-                }
-            }
+    std::cout << "🔧 Starting simple bilinear interpolation demosaic..." << std::endl;
+    const size_t width = raw_buffer.width, height = raw_buffer.height;
+
+    // まず RAW データをコピー（各ピクセルのネイティブカラーのみ）
+    for (size_t row = 0; row < height; row++) {
+        for (size_t col = 0; col < width; col++) {
+            size_t idx = row * width + col;
+            int color = fcol_bayer(row, col, filters);
+            
+            // RAW値を取得して正規化
+            float raw_val = (float)raw_buffer.image[idx][color] / (float)maximum_value;
+            
+            // 初期化：全チャンネルを0にセット
+            rgb_buffer.image[idx][0] = 0.0f;
+            rgb_buffer.image[idx][1] = 0.0f;
+            rgb_buffer.image[idx][2] = 0.0f;
+            
+            // ネイティブカラーをセット
+            rgb_buffer.image[idx][color] = raw_val;
         }
     }
-    std::cout << "✅ Generated interpolation lookup table (" << size << "x" << size << " pattern)" << std::endl;
-    linear_interpolate_loop_cpu(raw_buffer, code, size, colors);
-    std::cout << "✅ CPU linear interpolation completed successfully" << std::endl;
-    
-    // ✨デモザイク後境界補間✨: 最終処理で境界を修正
-    std::cout << "🔧 Post-demosaic border interpolation for LINEAR (1px border)..." << std::endl;
-    border_interpolate(raw_buffer, filters, 1);
-    
-    return true;
-#else
-    return false;
-#endif
-}
 
-void CPUAccelerator::linear_interpolate_loop_cpu(const ImageBuffer& raw_buffer, int* code, int size, int colors) {
-    const size_t width = raw_buffer.width, height = raw_buffer.height;
-    uint16_t (*image)[4] = raw_buffer.image;
-    std::cout << "🔧 Linear interpolation loop: " << (height - 2) << "x" << (width - 2) << " pixels" << std::endl;
+    // シンプルなバイリニア補間
     for (size_t row = 1; row < height - 1; row++) {
         for (size_t col = 1; col < width - 1; col++) {
-            uint16_t* pix = image[row * width + col];
-            int* ip = code + ((((row % size) * 16) + (col % size)) * 32);
-            int sum[4] = {0};
-            int num_samples = *ip++;
-            for (int i = 0; i < num_samples; i++, ip += 3) {
-                sum[ip[2]] += pix[ip[0]] << ip[1];
-            }
-            for (int i = colors; --i; ip += 2) {
-                if (ip[1] > 0) pix[ip[0]] = (sum[ip[0]] * ip[1]) >> 8;
+            size_t idx = row * width + col;
+            int color = fcol_bayer(row, col, filters);
+            
+            // 各ピクセルで欠けている色を補間
+            for (int c = 0; c < 3; c++) {
+                if (c == color) continue; // ネイティブカラーはスキップ
+                
+                float sum = 0.0f;
+                int count = 0;
+                
+                // 上下左右の隣接ピクセルをチェック
+                for (int dy = -1; dy <= 1; dy += 2) {
+                    for (int dx = -1; dx <= 1; dx += 2) {
+                        int ny = row + dy;
+                        int nx = col + dx;
+                        if (ny >= 0 && ny < (int)height && nx >= 0 && nx < (int)width) {
+                            int neighbor_color = fcol_bayer(ny, nx, filters);
+                            if (neighbor_color == c) {
+                                size_t neighbor_idx = ny * width + nx;
+                                sum += (float)raw_buffer.image[neighbor_idx][c] / (float)maximum_value;
+                                count++;
+                            }
+                        }
+                    }
+                }
+                
+                // 対角線上にない場合は、直交方向もチェック
+                if (count == 0) {
+                    for (int dy = -1; dy <= 1; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            if (dy == 0 && dx == 0) continue;
+                            int ny = row + dy;
+                            int nx = col + dx;
+                            if (ny >= 0 && ny < (int)height && nx >= 0 && nx < (int)width) {
+                                int neighbor_color = fcol_bayer(ny, nx, filters);
+                                if (neighbor_color == c) {
+                                    size_t neighbor_idx = ny * width + nx;
+                                    sum += (float)raw_buffer.image[neighbor_idx][c] / (float)maximum_value;
+                                    count++;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 平均値を設定
+                if (count > 0) {
+                    rgb_buffer.image[idx][c] = sum / count;
+                }
             }
         }
-        if ((row % 1000) == 0) std::cout << "🔄 Processed row " << row << "/" << height << std::endl;
     }
-    std::cout << "✅ Linear interpolation loop completed" << std::endl;
+
+    std::cout << "✅ Simple bilinear interpolation completed successfully" << std::endl;
+    
+    // 境界補間 - ENABLED for fair CPU vs GPU comparison
+    std::cout << "🔧 Applying CPU border interpolation for fair GPU comparison" << std::endl;
+    border_interpolate(rgb_buffer, filters, 1);
+    
+    return true;
 }
+
 
 //===================================================================
 // Demosaic function for AAHD (Adaptive AHD) demosaic
@@ -146,7 +166,9 @@ private:
     float yuv_cam[3][3];
     
     const ImageBuffer& raw_buffer_;
+    ImageBufferFloat& rgb_buffer_;
     uint32_t filters_;
+    const uint16_t maximum_value_;
     
     enum {
         HVSH = 1,
@@ -178,8 +200,8 @@ private:
     }
     
 public:
-    AAHD_Processor(const ImageBuffer& raw_buffer, uint32_t filters) 
-        : raw_buffer_(raw_buffer), filters_(filters) {
+    AAHD_Processor(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) 
+        : raw_buffer_(raw_buffer), rgb_buffer_(rgb_buffer), filters_(filters), maximum_value_(maximum_value) {
         
         nr_height = raw_buffer.height + nr_margin * 2;
         nr_width = raw_buffer.width + nr_margin * 2;
@@ -476,8 +498,8 @@ void AAHD_Processor::evaluate_ahd() {
             for (int d = 0; d < 2; ++d) {
                 for (int k = 0; k < 4; k++) {
                     ydiff[d][k] = std::abs(yuv[d][moff][0] - yuv[d][moff + hvdir[k]][0]);
-                    uvdiff[d][k] = sqr(yuv[d][moff][1] - yuv[d][moff + hvdir[k]][1]) +
-                                   sqr(yuv[d][moff][2] - yuv[d][moff + hvdir[k]][2]);
+                    uvdiff[d][k] = SQR(yuv[d][moff][1] - yuv[d][moff + hvdir[k]][1]) +
+                                   SQR(yuv[d][moff][2] - yuv[d][moff + hvdir[k]][2]);
                 }
             }
             float toth = ydiff[0][0] + ydiff[0][1] + (uvdiff[0][0] + uvdiff[0][1]) / 1000.0f;
@@ -526,23 +548,20 @@ void AAHD_Processor::combine_image() {
             size_t img_off = i * raw_buffer_.width + j;
             int d = (ndir[moff] & VER) ? 1 : 0;
             
-            raw_buffer_.image[img_off][0] = rgb_ahd[d][moff][0];
-            raw_buffer_.image[img_off][1] = rgb_ahd[d][moff][1];
-            raw_buffer_.image[img_off][2] = rgb_ahd[d][moff][2];
-            raw_buffer_.image[img_off][3] = rgb_ahd[d][moff][1];
+            rgb_buffer_.image[img_off][0] = (float)rgb_ahd[d][moff][0] / (float)maximum_value_;
+            rgb_buffer_.image[img_off][1] = (float)rgb_ahd[d][moff][1] / (float)maximum_value_;
+            rgb_buffer_.image[img_off][2] = (float)rgb_ahd[d][moff][2] / (float)maximum_value_;
         }
     }
     std::cout << "✅ AAHD processing completed" << std::endl;
 }
 
-bool CPUAccelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer, ImageBuffer& rgb_buffer, uint32_t filters) {
-#ifdef __APPLE__
+bool CPUAccelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
+
     if (!initialized_) return false;
     std::cout << "🔧 Starting AAHD (Adaptive AHD) demosaic..." << std::endl;
-    std::cout << "📐 AAHD processing: " << raw_buffer.width << "x" << raw_buffer.height << std::endl;
-    std::cout << "🎨 Bayer pattern: 0x" << std::hex << filters << std::dec << std::endl;
         
-    AAHD_Processor aahd_proc(raw_buffer, filters);
+    AAHD_Processor aahd_proc(raw_buffer, rgb_buffer, filters, maximum_value);
     aahd_proc.hide_hots();
     aahd_proc.make_ahd_greens(); 
     aahd_proc.make_ahd_rb();
@@ -553,12 +572,9 @@ bool CPUAccelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer, ImageBuf
     
     // ✨デモザイク後境界補間✨: 最終処理で境界を修正
     std::cout << "🔧 Post-demosaic border interpolation for AAHD (2px border)..." << std::endl;
-    border_interpolate(raw_buffer, filters, 2);
+    border_interpolate(rgb_buffer, filters, 2);
     
     return true;
-#else
-    return false;
-#endif
 }
 
 //===================================================================
@@ -572,20 +588,21 @@ private:
     int width, height;
     uint32_t filters;
     float (*image)[4];
+    uint16_t maximum_val_;
 
-    static float CLIP_FLOAT(float val) {
-        return val > 65535.0f ? 65535.0f : (val < 0.0f ? 0.0f : val);
+    float CLIP_FLOAT(float val) const {
+        return val > (float)maximum_val_ ? (float)maximum_val_ : (val < 0.0f ? 0.0f : val);
     }
 
 public:
-    static uint16_t CLIP_16BIT(float val) {
+    uint16_t CLIP_16BIT(float val) const {
         if (val < 0.0f) return 0;
-        if (val > 65535.0f) return 65535;
+        if (val > (float)maximum_val_) return maximum_val_;
         return static_cast<uint16_t>(val + 0.5f);
     }
 
-    DCB_Processor(float (*img_buffer)[4], int w, int h, uint32_t f)
-        : width(w), height(h), filters(f), image(img_buffer) {}
+    DCB_Processor(float (*img_buffer)[4], int w, int h, uint32_t f, uint16_t max_val)
+        : width(w), height(h), filters(f), image(img_buffer), maximum_val_(max_val) {}
 
     // (dcb_* 関連の全関数は、コンパイラの自動ベクトル化を妨げないよう、
     //  ループ内での関数呼び出しを避け、シンプルな記述に整理されています)
@@ -918,17 +935,14 @@ void DCB_Processor::run_dcb(int iterations, bool dcb_enhance) {
 
 } // anonymous namespace (DCB)
 
-bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuffer& rgb_buffer, uint32_t filters, int iterations, bool dcb_enhance) {
+bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value, int iterations, bool dcb_enhance) {
+
     if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid() || raw_buffer.width != rgb_buffer.width || raw_buffer.height != rgb_buffer.height) {
         std::cerr << "❌ DCB Demosaic: Invalid buffers or initialization state." << std::endl;
         return false;
     }
     std::cout << "🔧 Starting DCB demosaic (Clean Class Implementation)..." << std::endl;
-    
-    // ✨境界補間を後に移動✨: デモザイク処理前はスキップ
-    // std::cout << "🔧 Applying border interpolation for DCB (3px border)..." << std::endl;
-    // border_interpolate(raw_buffer, filters, 3);
-    
+        
     const size_t width = raw_buffer.width, height = raw_buffer.height;
     const size_t num_pixels = width * height;
 
@@ -939,38 +953,52 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
     
     // 手順1: 正しいRAWデータの読み出し
     for (size_t i = 0; i < num_pixels; ++i) {
-        uint16_t raw_value = 0;
-        for (int ch = 0; ch < 4; ++ch) {
-            if (raw_buffer.image[i][ch] != 0) {
-                raw_value = raw_buffer.image[i][ch];
-                break;
-            }
-        }
-        int color_idx = fcol_bayer(i / width, i % width, filters);
-        if (color_idx == 3) color_idx = 1;
+        size_t row = i / width;
+        size_t col = i % width;
+        int color_idx = fcol_bayer(row, col, filters);
+
+        uint16_t raw_value = raw_buffer.image[i][color_idx];
+
+        // 全チャンネルを0で初期化
         for(int c=0; c<4; ++c) sparse_image[i][c] = 0.0f;
+        
+        // ネイティブカラーのみをセット
         sparse_image[i][color_idx] = static_cast<float>(raw_value);
     }
     
-    // 手順2: バイリニア補間 (コンパイラによる自動ベクトル化を期待)
+    // 手順2: バイリニア補間 - 隣接ピクセルのネイティブ値から補間
     std::memcpy(work_image, sparse_image, num_pixels * sizeof(float[4]));
     for (size_t r = 1; r < height - 1; ++r) {
         for (size_t c = 1; c < width - 1; ++c) {
             size_t i = r * width + c;
             int f = fcol_bayer(r, c, filters);
-            if (f == 0) {
-                work_image[i][1] = (sparse_image[i - width][1] + sparse_image[i + width][1] + sparse_image[i - 1][1] + sparse_image[i + 1][1]) * 0.25f;
-                work_image[i][2] = (sparse_image[i - width - 1][2] + sparse_image[i - width + 1][2] + sparse_image[i + width - 1][2] + sparse_image[i + width + 1][2]) * 0.25f;
-            } else if (f == 2) {
-                work_image[i][1] = (sparse_image[i - width][1] + sparse_image[i + width][1] + sparse_image[i - 1][1] + sparse_image[i + 1][1]) * 0.25f;
-                work_image[i][0] = (sparse_image[i - width - 1][0] + sparse_image[i - width + 1][0] + sparse_image[i + width - 1][0] + sparse_image[i + width + 1][0]) * 0.25f;
-            } else {
-                if (fcol_bayer(r, c - 1, filters) == 0) {
-                    work_image[i][0] = (sparse_image[i - 1][0] + sparse_image[i + 1][0]) * 0.5f;
-                    work_image[i][2] = (sparse_image[i - width][2] + sparse_image[i + width][2]) * 0.5f;
-                } else {
-                    work_image[i][0] = (sparse_image[i - width][0] + sparse_image[i + width][0]) * 0.5f;
-                    work_image[i][2] = (sparse_image[i - 1][2] + sparse_image[i + 1][2]) * 0.5f;
+            
+            // 各チャンネルで欠けている色を隣接ピクセルから補間
+            for (int ch = 0; ch < 3; ch++) {
+                if (ch == f) continue; // ネイティブカラーはスキップ
+                
+                float sum = 0.0f;
+                int count = 0;
+                
+                // 隣接する8ピクセルをチェック
+                for (int dr = -1; dr <= 1; dr++) {
+                    for (int dc = -1; dc <= 1; dc++) {
+                        if (dr == 0 && dc == 0) continue;
+                        size_t nr = r + dr;
+                        size_t nc = c + dc;
+                        if (nr < height && nc < width) {
+                            size_t ni = nr * width + nc;
+                            int neighbor_color = fcol_bayer(nr, nc, filters);
+                            if (neighbor_color == ch) {
+                                sum += sparse_image[ni][ch];
+                                count++;
+                            }
+                        }
+                    }
+                }
+                
+                if (count > 0) {
+                    work_image[i][ch] = sum / count;
                 }
             }
         }
@@ -981,49 +1009,21 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
     std::cout << "🔧 DCB: Skipping border replication to avoid identical pixel issue" << std::endl;
 
     // 手順4: 完全なDCBアルゴリズムを実行
-    DCB_Processor dcb_proc(work_image, static_cast<int>(width), static_cast<int>(height), filters);
+    DCB_Processor dcb_proc(work_image, static_cast<int>(width), static_cast<int>(height), filters, maximum_value);
     dcb_proc.run_dcb(iterations, dcb_enhance);
     
-    // ✨✨✨ 手順5: NEONイントリンシックを使った超高速書き込み ✨✨✨
-#if defined(__aarch64__) && defined(__ARM_NEON)
-    float* float_ptr = &work_image[0][0];
-    uint16_t* uint_ptr = &rgb_buffer.image[0][0];
-    const float32x4_t v_zero = vdupq_n_f32(0.0f);
-    const float32x4_t v_max = vdupq_n_f32(65535.0f);
-    size_t end = num_pixels - (num_pixels % 4);
-
-    for (size_t i = 0; i < end; i += 4) {
-        float32x4x4_t v_pixels = vld4q_f32(float_ptr + i * 4);
-        v_pixels.val[0] = vmaxq_f32(v_zero, vminq_f32(v_pixels.val[0], v_max));
-        v_pixels.val[1] = vmaxq_f32(v_zero, vminq_f32(v_pixels.val[1], v_max));
-        v_pixels.val[2] = vmaxq_f32(v_zero, vminq_f32(v_pixels.val[2], v_max));
-        uint16x4_t r_u16 = vmovn_u32(vcvtq_u32_f32(v_pixels.val[0]));
-        uint16x4_t g_u16 = vmovn_u32(vcvtq_u32_f32(v_pixels.val[1]));
-        uint16x4_t b_u16 = vmovn_u32(vcvtq_u32_f32(v_pixels.val[2]));
-        uint16x4x4_t result = {{r_u16, g_u16, b_u16, g_u16}};
-        vst4_u16(uint_ptr + i * 4, result);
-    }
-    for(size_t i = end; i < num_pixels; ++i) { // 末尾の余り処理
-        rgb_buffer.image[i][0] = DCB_Processor::CLIP_16BIT(work_image[i][0]);
-        rgb_buffer.image[i][1] = DCB_Processor::CLIP_16BIT(work_image[i][1]);
-        rgb_buffer.image[i][2] = DCB_Processor::CLIP_16BIT(work_image[i][2]);
-        rgb_buffer.image[i][3] = rgb_buffer.image[i][1];
-    }
-#else
-    // NEON非対応環境用のフォールバック
+    // ✨✨✨ 手順5: float正規化書き込み ✨✨✨
+    // work_image (4チャンネル) から rgb_buffer (3チャンネル) への変換
     for (size_t i = 0; i < num_pixels; ++i) {
-        rgb_buffer.image[i][0] = DCB_Processor::CLIP_16BIT(work_image[i][0]);
-        rgb_buffer.image[i][1] = DCB_Processor::CLIP_16BIT(work_image[i][1]);
-        rgb_buffer.image[i][2] = DCB_Processor::CLIP_16BIT(work_image[i][2]);
-        rgb_buffer.image[i][3] = rgb_buffer.image[i][1];
+        rgb_buffer.image[i][0] = work_image[i][0] / (float)maximum_value;
+        rgb_buffer.image[i][1] = work_image[i][1] / (float)maximum_value;
+        rgb_buffer.image[i][2] = work_image[i][2] / (float)maximum_value;
     }
-#endif
-    
     std::cout << "✅ DCB demosaic completed successfully (Clean Class Implementation)" << std::endl;
     
     // ✨デモザイク後境界補間✨: 最終処理で境界を修正
     std::cout << "🔧 Post-demosaic border interpolation for DCB (3px border)..." << std::endl;
-    border_interpolate(raw_buffer, filters, 3);
+    border_interpolate(rgb_buffer, filters, 3);
     
     return true;
 }
@@ -1034,10 +1034,9 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
 
 namespace { // This file is for internal use only
 
-// A complete port of the AMaZE demosaicing algorithm from RawTherapee
 class AMaZE_Processor_RT {
 private:
-    // Constants from the original RawTherapee implementation
+    // Constants from the RawTherapee implementation
     static constexpr int TS = 160;
     static constexpr int TSH = TS / 2;
     static constexpr float eps = 1e-5f;
@@ -1052,43 +1051,62 @@ private:
     };
     static constexpr float gausseven[2] = {0.13719494435797422f, 0.05640252782101291f};
     static constexpr float gquinc[4] = {0.169917f, 0.108947f, 0.069855f, 0.0287182f};
+    
+    static inline float xmul2f(float x) { return x + x; }
+    static inline float xdiv2f(float x) { return x * 0.5f; }
 
-    // Member variables
+    float initialGain;
+    float clip_pt;
+    float clip_pt8;
+
     const ImageBuffer& raw_buffer_;
-    ImageBuffer& rgb_buffer_;
+    ImageBufferFloat& rgb_buffer_;
     const uint32_t filters_;
+    const float (&cam_mul_)[4];
     const size_t width_, height_;
-    int ex = 0, ey = 0; // Offset of the R pixel
+    const uint16_t maximum_value_;
+    int ex = 0, ey = 0;
+    unsigned int cfarray[2][2]; // Bayer pattern cache
 
-    // Helper functions
-    inline int FC(int row, int col) const { return fcol_bayer(row, col, filters_); }
-    static inline float SQR(float x) { return x * x; }
-    static inline uint16_t CLIP_U16(float val) {
-        if (val < 0.0f) return 0;
-        if (val > 65535.0f) return 65535;
-        return static_cast<uint16_t>(val + 0.5f);
-    }
     struct s_hv { float h; float v; };
 
 public:
-    AMaZE_Processor_RT(const ImageBuffer& raw, ImageBuffer& rgb, uint32_t f)
-        : raw_buffer_(raw), rgb_buffer_(rgb), filters_(f), width_(raw.width), height_(raw.height)
+    AMaZE_Processor_RT(const ImageBuffer& raw, ImageBufferFloat& rgb, uint32_t f, const float (&cam_mul)[4], uint16_t max_val)
+        : raw_buffer_(raw), rgb_buffer_(rgb), filters_(f), cam_mul_(cam_mul), width_(raw.width), height_(raw.height), maximum_value_(max_val)
     {
-        if (FC(0, 0) == 1) { // G
-            if (FC(0, 1) == 0) { ey = 0; ex = 1; } // GR
-            else { ey = 1; ex = 0; }               // GB
-        } else { // R or B
-            if (FC(0, 0) == 0) { ey = 0; ex = 0; } // RG
-            else { ey = 1; ex = 1; }               // BG
+        // Assuming G1==G2 and are not white-balanced (pre-demosaic)
+        float max_mul = std::max({cam_mul_[0], cam_mul_[2]});
+        float min_mul = std::min({cam_mul_[0], cam_mul_[2]});
+        initialGain = (min_mul > 1e-6f) ? (max_mul / min_mul) : 1.0f;
+        
+        clip_pt = 1.0f / initialGain;
+        clip_pt8 = 0.8f / initialGain;
+        
+        // Cache the 2x2 Bayer pattern based on the provided helper function
+        cfarray[0][0] = fcol_bayer(0, 0, filters_);
+        cfarray[0][1] = fcol_bayer(0, 1, filters_);
+        cfarray[1][0] = fcol_bayer(1, 0, filters_);
+        cfarray[1][1] = fcol_bayer(1, 1, filters_);
+        
+        // Determine R pixel offset (ey, ex)
+        if (cfarray[0][0] == 1) { // Top-left is G (GRBG or GBRG)
+            if (cfarray[0][1] == 0) { ey = 0; ex = 1; } // GRBG
+            else { ey = 1; ex = 0; }               // GBRG
+        } else { // Top-left is R or B (RGGB or BGGR)
+            if (cfarray[0][0] == 0) { ey = 0; ex = 0; } // RGGB
+            else { ey = 1; ex = 1; }               // BGGR
         }
     }
 
+    // A robust Bayer pattern lookup function, like in RawTherapee
+    unsigned int fc_rt(int r, int c) const {
+        return cfarray[r & 1][c & 1];
+    }
+
     void run() {
-        const float clip_pt = 1.0f;
-        const float clip_pt8 = 0.8f;
         static const int v1 = TS, v2 = 2*TS, v3 = 3*TS, p1 = -TS+1, p2 = -2*TS+2, p3 = -3*TS+3, m1 = TS+1, m2 = 2*TS+2, m3 = 3*TS+3;
         
-        std::vector<char> processing_buffer(14 * sizeof(float) * TS * TS + sizeof(unsigned char) * TS * TSH + 63);
+        std::vector<char> processing_buffer(15 * sizeof(float) * TS * TS + sizeof(unsigned char) * TS * TSH + 256);
         char* aligned_buffer = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(processing_buffer.data()) + 63) & ~63);
 
         float* rgbgreen     = reinterpret_cast<float*>(aligned_buffer);
@@ -1101,216 +1119,411 @@ public:
         float* hcdalt       = vcdalt + TS*TS;
         float* cddiffsq     = hcdalt + TS*TS;
         float* hvwt         = cddiffsq + TS*TS;
-        float* dgintv       = hvwt + TS*TSH;
+        float* dgintv       = reinterpret_cast<float*>(reinterpret_cast<char*>(hvwt) + sizeof(float) * TS * TSH);
         float* dginth       = dgintv + TS*TS;
         float* Dgrbsq1m     = dginth + TS*TS;
-        float* Dgrbsq1p     = Dgrbsq1m + TS*TSH;
-        float* cfa          = Dgrbsq1p + TS*TSH;
+        float* Dgrbsq1p     = reinterpret_cast<float*>(reinterpret_cast<char*>(Dgrbsq1m) + sizeof(float) * TS * TSH);
+        float* cfa          = reinterpret_cast<float*>(reinterpret_cast<char*>(Dgrbsq1p) + sizeof(float) * TS * TSH);
         unsigned char* nyquist = reinterpret_cast<unsigned char*>(cfa + TS*TS);
-        
         unsigned char* nyquist2 = reinterpret_cast<unsigned char*>(cddiffsq);
+        float* nyqutest     = reinterpret_cast<float*>(reinterpret_cast<char*>(nyquist) + sizeof(unsigned char) * TS * TSH);
 
         for (int top = -16; top < (int)height_; top += TS - 32) {
             for (int left = -16; left < (int)width_; left += TS - 32) {
-                int bottom = std::min(top + TS, (int)height_ + 16), right = std::min(left + TS, (int)width_ + 16);
-                int rr1 = bottom - top, cc1 = right - left;
-                int rrmin = (top < 0) ? 16 : 0, ccmin = (left < 0) ? 16 : 0;
-                int rrmax = (bottom > (int)height_) ? (int)height_ - top : rr1, ccmax = (right > (int)width_) ? (int)width_ - left : cc1;
+                int bottom = std::min(top + TS, (int)height_ + 16);
+                int right = std::min(left + TS, (int)width_ + 16);
+                int rr1 = bottom - top;
+                int cc1 = right - left;
+                int rrmin = (top < 0) ? 16 : 0;
+                int ccmin = (left < 0) ? 16 : 0;
+                int rrmax = (bottom > (int)height_) ? (int)height_ - top : rr1;
+                int ccmax = (right > (int)width_) ? (int)width_ - left : cc1;
 
-                for (int rr = rrmin; rr < rrmax; ++rr) for (int cc = ccmin; cc < ccmax; ++cc) {
-                    int c = FC(rr + top, cc + left); if (c == 3) c = 1;
-                    cfa[rr*TS+cc] = (float)raw_buffer_.image[(rr + top) * width_ + (cc + left)][c] / 65535.0f;
-                }
-                if (top < 0) for(int rr=0; rr<16; ++rr) for(int cc=0; cc<cc1; ++cc) cfa[rr*TS+cc] = cfa[(31-rr)*TS+cc];
-                if (bottom > (int)height_) for(int rr=rrmax; rr<rr1; ++rr) for(int cc=0; cc<cc1; ++cc) cfa[rr*TS+cc] = cfa[(2*rrmax-rr-1)*TS+cc];
-                if (left < 0) for(int cc=0; cc<16; ++cc) for(int rr=0; rr<rr1; ++rr) cfa[rr*TS+cc] = cfa[rr*TS+(31-cc)];
-                if (right > (int)width_) for(int cc=ccmax; cc<cc1; ++cc) for(int rr=0; rr<rr1; ++rr) cfa[rr*TS+cc] = cfa[rr*TS+(2*ccmax-cc-1)];
-                for(int i=0; i<TS*TS; ++i) rgbgreen[i] = cfa[i];
-                memset(nyquist, 0, sizeof(unsigned char) * TS * TSH);
-
-                for (int rr = 2; rr < rr1 - 2; rr++) for (int cc = 2, idx = rr*TS+cc; cc < cc1 - 2; cc++, idx++) {
-                    float delh = fabsf(cfa[idx+1]-cfa[idx-1]), delv = fabsf(cfa[idx+v1]-cfa[idx-v1]);
-                    dirwts0[idx] = eps+fabsf(cfa[idx+v2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-v2])+delv;
-                    dirwts1[idx] = eps+fabsf(cfa[idx+2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-2])+delh;
-                    delhvsqsum[idx] = SQR(delh)+SQR(delv);
-                }
+                // === Tile Initialization with 16-pixel border ===
+                const float scale = 1.0f / (float)maximum_value_;
                 
-                for (int rr = 4; rr < rr1 - 4; rr++) for (int cc = 4, idx=rr*TS+cc; cc < cc1 - 4; cc++, idx++) {
-                    int sgn = (FC(rr,cc)&1)?-1:1;
-                    float cru=cfa[idx-v1]*(dirwts0[idx-v2]+dirwts0[idx])/(dirwts0[idx-v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx-v2]));
-                    float crd=cfa[idx+v1]*(dirwts0[idx+v2]+dirwts0[idx])/(dirwts0[idx+v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx+v2]));
-                    float crl=cfa[idx-1]*(dirwts1[idx-2]+dirwts1[idx])/(dirwts1[idx-2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx-2]));
-                    float crr=cfa[idx+1]*(dirwts1[idx+2]+dirwts1[idx])/(dirwts1[idx+2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx+2]));
-                    float guha=cfa[idx-v1]+0.5f*(cfa[idx]-cfa[idx-v2]), gdha=cfa[idx+v1]+0.5f*(cfa[idx]-cfa[idx+v2]);
-                    float glha=cfa[idx-1]+0.5f*(cfa[idx]-cfa[idx-2]), grha=cfa[idx+1]+0.5f*(cfa[idx]-cfa[idx+2]);
-                    float guar=fabsf(1.f-cru)<arthresh?cfa[idx]*cru:guha, gdar=fabsf(1.f-crd)<arthresh?cfa[idx]*crd:gdha;
-                    float glar=fabsf(1.f-crl)<arthresh?cfa[idx]*crl:glha, grar=fabsf(1.f-crr)<arthresh?cfa[idx]*crr:grha;
-                    float hwt=dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]), vwt=dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
-                    float Gintvha=vwt*gdha+(1.f-vwt)*guha, Ginthha=hwt*grha+(1.f-hwt)*glha;
-                    vcdalt[idx]=sgn*(Gintvha-cfa[idx]); hcdalt[idx]=sgn*(Ginthha-cfa[idx]);
-                    if(cfa[idx]>clip_pt8||Gintvha>clip_pt8||Ginthha>clip_pt8) { vcd[idx]=vcdalt[idx]; hcd[idx]=hcdalt[idx]; guar=guha; gdar=gdha; glar=glha; grar=grha; }
-                    else { vcd[idx]=sgn*(vwt*gdar+(1.f-vwt)*guar-cfa[idx]); hcd[idx]=sgn*(hwt*grar+(1.f-hwt)*glar-cfa[idx]); }
-                    dgintv[idx]=std::min(SQR(guha-gdha),SQR(guar-gdar)); dginth[idx]=std::min(SQR(glha-grha),SQR(glar-grar));
-                }
-                
-                for (int rr = 4; rr < rr1 - 4; rr++) for (int cc = 4, idx = rr*TS+cc; cc < cc1-4; cc++, idx++) {
-                    float hcdvar=3.f*(SQR(hcd[idx-2])+SQR(hcd[idx])+SQR(hcd[idx+2]))-SQR(hcd[idx-2]+hcd[idx]+hcd[idx+2]);
-                    float hcdaltvar=3.f*(SQR(hcdalt[idx-2])+SQR(hcdalt[idx])+SQR(hcdalt[idx+2]))-SQR(hcdalt[idx-2]+hcdalt[idx]+hcdalt[idx+2]);
-                    float vcdvar=3.f*(SQR(vcd[idx-v2])+SQR(vcd[idx])+SQR(vcd[idx+v2]))-SQR(vcd[idx-v2]+vcd[idx]+vcd[idx+v2]);
-                    float vcdaltvar=3.f*(SQR(vcdalt[idx-v2])+SQR(vcdalt[idx])+SQR(vcdalt[idx+v2]))-SQR(vcdalt[idx-v2]+vcdalt[idx]+vcdalt[idx+v2]);
-                    if(hcdaltvar<hcdvar)hcd[idx]=hcdalt[idx]; if(vcdaltvar<vcdvar)vcd[idx]=vcdalt[idx];
-                    float Gintv, Ginth;
-                    if(FC(rr,cc)&1) {
-                        Ginth=-hcd[idx]+cfa[idx]; Gintv=-vcd[idx]+cfa[idx];
-                        if(hcd[idx]>0){if(3.f*hcd[idx]>(Ginth+cfa[idx]))hcd[idx]=-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx];else{float hwt2=1.f-3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx]);}}
-                        if(vcd[idx]>0){if(3.f*vcd[idx]>(Gintv+cfa[idx]))vcd[idx]=-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx];else{float vwt2=1.f-3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx]);}}
-                    } else {
-                        Ginth=hcd[idx]+cfa[idx]; Gintv=vcd[idx]+cfa[idx];
-                        if(hcd[idx]<0){if(3.f*hcd[idx]<-(Ginth+cfa[idx]))hcd[idx]=median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx];else{float hwt2=1.f+3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);}}
-                        if(vcd[idx]<0){if(3.f*vcd[idx]<-(Gintv+cfa[idx]))vcd[idx]=median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx];else{float vwt2=1.f+3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);}}
+                // Fill upper border
+                if (rrmin > 0) {
+                    for (int rr = 0; rr < 16; rr++) {
+                        for (int cc = ccmin; cc < ccmax; cc++) {
+                            int row = 32 - rr + top;
+                            int safe_row = std::max(0, std::min((int)height_ - 1, row));
+                            int safe_col = std::max(0, std::min((int)width_ - 1, cc + left));
+                            int c = fc_rt(safe_row, safe_col);
+                            float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                            cfa[rr * TS + cc] = val;
+                            rgbgreen[rr * TS + cc] = val;
+                        }
                     }
-                    if(Ginth>clip_pt)hcd[idx]=(FC(rr,cc)&1?-1:1)*(median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);
-                    if(Gintv>clip_pt)vcd[idx]=(FC(rr,cc)&1?-1:1)*(median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);
-                    cddiffsq[idx] = SQR(vcd[idx]-hcd[idx]);
                 }
 
-                for (int rr=6; rr<rr1-6; rr++) for (int cc=6+(FC(rr,2)&1), idx=rr*TS+cc; cc<cc1-6; cc+=2, idx+=2) {
-                    float uave=vcd[idx]+vcd[idx-v1]+vcd[idx-v2]+vcd[idx-v3], dave=vcd[idx]+vcd[idx+v1]+vcd[idx+v2]+vcd[idx+v3];
-                    float lave=hcd[idx]+hcd[idx-1]+hcd[idx-2]+hcd[idx-3], rave=hcd[idx]+hcd[idx+1]+hcd[idx+2]+hcd[idx+3];
-                    float Dgrbvvaru=SQR(vcd[idx]-uave)+SQR(vcd[idx-v1]-uave)+SQR(vcd[idx-v2]-uave)+SQR(vcd[idx-v3]-uave);
-                    float Dgrbvvard=SQR(vcd[idx]-dave)+SQR(vcd[idx+v1]-dave)+SQR(vcd[idx+v2]-dave)+SQR(vcd[idx+v3]-dave);
-                    float Dgrbhvarl=SQR(hcd[idx]-lave)+SQR(hcd[idx-1]-lave)+SQR(hcd[idx-2]-lave)+SQR(hcd[idx-3]-lave);
-                    float Dgrbhvarr=SQR(hcd[idx]-rave)+SQR(hcd[idx+1]-rave)+SQR(hcd[idx+2]-rave)+SQR(hcd[idx+3]-rave);
-                    float hwt=dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]), vwt=dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
-                    float vcdvar=epssq+vwt*Dgrbvvard+(1.f-vwt)*Dgrbvvaru, hcdvar=epssq+hwt*Dgrbhvarr+(1.f-hwt)*Dgrbhvarl;
-                    float Dgrbvvaru2=(dgintv[idx])+(dgintv[idx-v1])+(dgintv[idx-v2]), Dgrbvvard2=(dgintv[idx])+(dgintv[idx+v1])+(dgintv[idx+v2]);
-                    float Dgrbhvarl2=(dginth[idx])+(dginth[idx-1])+(dginth[idx-2]), Dgrbhvarr2=(dginth[idx])+(dginth[idx+1])+(dginth[idx+2]);
-                    float vcdvar1=epssq+vwt*Dgrbvvard2+(1.f-vwt)*Dgrbvvaru2, hcdvar1=epssq+hwt*Dgrbhvarr2+(1.f-hwt)*Dgrbhvarl2;
-                    float varwt=hcdvar/(vcdvar+hcdvar), diffwt=hcdvar1/(vcdvar1+hcdvar1);
-                    hvwt[idx>>1] = ((0.5f-varwt)*(0.5f-diffwt)>0.f && fabsf(0.5f-diffwt)<fabsf(0.5f-varwt)) ? varwt : diffwt;
+                // Fill inner part
+                for (int rr = rrmin; rr < rrmax; rr++) {
+                    int row = rr + top;
+                    int cc = ccmin;
+                    for (; cc < ccmax; cc++) {
+                        int indx1 = rr * TS + cc;
+                        int c = fc_rt(row, cc + left);
+                        float val = (float)raw_buffer_.image[row * width_ + (cc + left)][c] * scale;
+                        cfa[indx1] = val;
+                        rgbgreen[indx1] = val;
+                    }
                 }
                 
-                float* nyqutest = reinterpret_cast<float*>(Dgrbsq1p); // Share buffer
-                for (int rr=6; rr<rr1-6; rr++) for (int cc=6+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2){
-                    nyqutest[idx>>1]=(gaussodd[0]*cddiffsq[idx]+gaussodd[1]*(cddiffsq[idx-m1]+cddiffsq[idx+p1]+cddiffsq[idx-p1]+cddiffsq[idx+m1])+gaussodd[2]*(cddiffsq[idx-v2]+cddiffsq[idx-2]+cddiffsq[idx+2]+cddiffsq[idx+v2])+gaussodd[3]*(cddiffsq[idx-m2]+cddiffsq[idx+p2]+cddiffsq[idx-p2]+cddiffsq[idx+m2]))-(gaussgrad[0]*delhvsqsum[idx]+gaussgrad[1]*(delhvsqsum[idx-v1]+delhvsqsum[idx+1]+delhvsqsum[idx-1]+delhvsqsum[idx+v1])+gaussgrad[2]*(delhvsqsum[idx-m1]+delhvsqsum[idx+p1]+delhvsqsum[idx-p1]+delhvsqsum[idx+m1])+gaussgrad[3]*(delhvsqsum[idx-v2]+delhvsqsum[idx-2]+delhvsqsum[idx+2]+delhvsqsum[idx+v2])+gaussgrad[4]*(delhvsqsum[idx-v2-1]+delhvsqsum[idx-v2+1]+delhvsqsum[idx-TS-2]+delhvsqsum[idx-TS+2]+delhvsqsum[idx+TS-2]+delhvsqsum[idx+TS+2]+delhvsqsum[idx+v2-1]+delhvsqsum[idx+v2+1])+gaussgrad[5]*(delhvsqsum[idx-m2]+delhvsqsum[idx+p2]+delhvsqsum[idx-p2]+delhvsqsum[idx+m2]));
+                // Fill lower border
+                if (rrmax < rr1) {
+                    for (int rr = 0; rr < 16; rr++) {
+                         for (int cc = ccmin; cc < ccmax; cc++) {
+                            int safe_row = std::max(0, std::min((int)height_ - 1, (int)height_ - rr - 2));
+                            int safe_col = std::max(0, std::min((int)width_ - 1, left + cc));
+                            int c = fc_rt(safe_row, safe_col);
+                            float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                            cfa[(rrmax + rr) * TS + cc] = val;
+                            rgbgreen[(rrmax + rr) * TS + cc] = val;
+                        }
+                    }
+                }
+                // Fill left/right borders and corners (scalar is fine for these)
+                if (ccmin > 0) {
+                    for (int rr = rrmin; rr < rrmax; rr++) {
+                        for (int cc = 0; cc < 16; cc++) {
+                            int row = rr + top;
+                            int safe_row = std::max(0, std::min((int)height_ - 1, row));
+                            int safe_col = std::max(0, std::min((int)width_ - 1, 32 - cc + left));
+                            int c = fc_rt(safe_row, safe_col);
+                            float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                            cfa[rr * TS + cc] = val;
+                            rgbgreen[rr * TS + cc] = val;
+                        }
+                    }
+                }
+                if (ccmax < cc1) {
+                    for (int rr = rrmin; rr < rrmax; rr++) {
+                        for (int cc = 0; cc < 16; cc++) {
+                             int safe_row = std::max(0, std::min((int)height_ - 1, top + rr));
+                             int safe_col = std::max(0, std::min((int)width_ - 1, (int)width_ - cc - 2));
+                             int c = fc_rt(safe_row, safe_col);
+                             float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                             cfa[rr * TS + ccmax + cc] = val;
+                             rgbgreen[rr * TS + ccmax + cc] = val;
+                        }
+                    }
+                }
+                // ... corners ...
+
+                // === Start of RawTherapee AMaZE Algorithm Stages ===
+                
+                // STAGE 1: Horizontal and vertical gradients
+                for (int rr = 2; rr < rr1 - 2; rr++) {
+                    for (int cc = 2, idx = rr*TS+cc; cc < cc1 - 2; cc++, idx++) {
+                        float delh = fabsf(cfa[idx+1]-cfa[idx-1]);
+                        float delv = fabsf(cfa[idx+v1]-cfa[idx-v1]);
+                        dirwts0[idx] = eps+fabsf(cfa[idx+v2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-v2])+delv;
+                        dirwts1[idx] = eps+fabsf(cfa[idx+2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-2])+delh;
+                        delhvsqsum[idx] = SQR(delh)+SQR(delv);
+                    }
+                }
+
+                // STAGE 2: Interpolate vertical and horizontal colour differences
+                for (int rr = 4; rr < rr1 - 4; rr++) {
+                    for (int cc = 4, idx=rr*TS+cc; cc < cc1 - 4; cc++, idx++) {
+                        int sgn = (fc_rt(rr,cc)&1) ? -1 : 1;
+                        float cru = cfa[idx-v1]*(dirwts0[idx-v2]+dirwts0[idx]) / (dirwts0[idx-v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx-v2]));
+                        float crd = cfa[idx+v1]*(dirwts0[idx+v2]+dirwts0[idx]) / (dirwts0[idx+v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx+v2]));
+                        float crl = cfa[idx-1]*(dirwts1[idx-2]+dirwts1[idx]) / (dirwts1[idx-2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx-2]));
+                        float crr = cfa[idx+1]*(dirwts1[idx+2]+dirwts1[idx]) / (dirwts1[idx+2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx+2]));
+                        float guha=cfa[idx-v1]+xdiv2f(cfa[idx]-cfa[idx-v2]);
+                        float gdha=cfa[idx+v1]+xdiv2f(cfa[idx]-cfa[idx+v2]);
+                        float glha=cfa[idx-1]+xdiv2f(cfa[idx]-cfa[idx-2]);
+                        float grha=cfa[idx+1]+xdiv2f(cfa[idx]-cfa[idx+2]);
+                        float guar = fabsf(1.f-cru)<arthresh ? cfa[idx]*cru : guha;
+                        float gdar = fabsf(1.f-crd)<arthresh ? cfa[idx]*crd : gdha;
+                        float glar = fabsf(1.f-crl)<arthresh ? cfa[idx]*crl : glha;
+                        float grar = fabsf(1.f-crr)<arthresh ? cfa[idx]*crr : grha;
+                        float hwt=dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]);
+                        float vwt=dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
+                        float Gintvha = vwt*gdha+(1.f-vwt)*guha;
+                        float Ginthha = hwt*grha+(1.f-hwt)*glha;
+                        vcdalt[idx] = sgn*(Gintvha-cfa[idx]); 
+                        hcdalt[idx] = sgn*(Ginthha-cfa[idx]);
+                        if(cfa[idx]>clip_pt8 || Gintvha>clip_pt8 || Ginthha>clip_pt8) {
+                            vcd[idx] = vcdalt[idx]; hcd[idx] = hcdalt[idx];
+                            guar=guha; gdar=gdha; glar=glha; grar=grha;
+                        } else {
+                            vcd[idx] = sgn*(vwt*gdar+(1.f-vwt)*guar-cfa[idx]);
+                            hcd[idx] = sgn*(hwt*grar+(1.f-hwt)*glar-cfa[idx]);
+                        }
+                        dgintv[idx] = std::min(SQR(guha-gdha), SQR(guar-gdar));
+                        dginth[idx] = std::min(SQR(glha-grha), SQR(glar-grar));
+                    }
                 }
                 
+                // STAGE 3: Variance calculation and interpolation bounding
+                for (int rr = 4; rr < rr1 - 4; rr++) {
+                    for (int cc = 4, idx = rr*TS+cc; cc < cc1-4; cc++, idx++) {
+                        float hcdvar = 3.f*(SQR(hcd[idx-2])+SQR(hcd[idx])+SQR(hcd[idx+2]))-SQR(hcd[idx-2]+hcd[idx]+hcd[idx+2]);
+                        float hcdaltvar = 3.f*(SQR(hcdalt[idx-2])+SQR(hcdalt[idx])+SQR(hcdalt[idx+2]))-SQR(hcdalt[idx-2]+hcdalt[idx]+hcdalt[idx+2]);
+                        float vcdvar = 3.f*(SQR(vcd[idx-v2])+SQR(vcd[idx])+SQR(vcd[idx+v2]))-SQR(vcd[idx-v2]+vcd[idx]+vcd[idx+v2]);
+                        float vcdaltvar = 3.f*(SQR(vcdalt[idx-v2])+SQR(vcdalt[idx])+SQR(vcdalt[idx+v2]))-SQR(vcdalt[idx-v2]+vcdalt[idx]+vcdalt[idx+v2]);
+                        if(hcdaltvar < hcdvar) hcd[idx] = hcdalt[idx];
+                        if(vcdaltvar < vcdvar) vcd[idx] = vcdalt[idx];
+                        float Gintv, Ginth;
+                        if(fc_rt(rr,cc)&1) {
+                            Ginth=-hcd[idx]+cfa[idx]; Gintv=-vcd[idx]+cfa[idx];
+                            if(hcd[idx]>0){if(3.f*hcd[idx]>(Ginth+cfa[idx]))hcd[idx]=-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx];else{float hwt2=1.f-3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx]);}}
+                            if(vcd[idx]>0){if(3.f*vcd[idx]>(Gintv+cfa[idx]))vcd[idx]=-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx];else{float vwt2=1.f-3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx]);}}
+                        } else {
+                            Ginth=hcd[idx]+cfa[idx]; Gintv=vcd[idx]+cfa[idx];
+                            if(hcd[idx]<0){if(3.f*hcd[idx]<-(Ginth+cfa[idx]))hcd[idx]=median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx];else{float hwt2=1.f+3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);}}
+                            if(vcd[idx]<0){if(3.f*vcd[idx]<-(Gintv+cfa[idx]))vcd[idx]=median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx];else{float vwt2=1.f+3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);}}
+                        }
+                        if(Ginth > clip_pt) hcd[idx] = (fc_rt(rr,cc)&1?-1:1) * (median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);
+                        if(Gintv > clip_pt) vcd[idx] = (fc_rt(rr,cc)&1?-1:1) * (median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);
+                        cddiffsq[idx] = SQR(vcd[idx]-hcd[idx]);
+                    }
+                }
+
+                // STAGE 4 & 5: Directional variance, Texture analysis & Nyquist test calculation
+                for (int rr=6; rr<rr1-6; rr++) {
+                    for (int cc=6+(fc_rt(rr,2)&1), idx=rr*TS+cc; cc<cc1-6; cc+=2, idx+=2) {
+                        float uave = vcd[idx]+vcd[idx-v1]+vcd[idx-v2]+vcd[idx-v3];
+                        float dave = vcd[idx]+vcd[idx+v1]+vcd[idx+v2]+vcd[idx+v3];
+                        float lave = hcd[idx]+hcd[idx-1]+hcd[idx-2]+hcd[idx-3];
+                        float rave = hcd[idx]+hcd[idx+1]+hcd[idx+2]+hcd[idx+3];
+                        float Dgrbvvaru = SQR(vcd[idx]-uave)+SQR(vcd[idx-v1]-uave)+SQR(vcd[idx-v2]-uave)+SQR(vcd[idx-v3]-uave);
+                        float Dgrbvvard = SQR(vcd[idx]-dave)+SQR(vcd[idx+v1]-dave)+SQR(vcd[idx+v2]-dave)+SQR(vcd[idx+v3]-dave);
+                        float Dgrbhvarl = SQR(hcd[idx]-lave)+SQR(hcd[idx-1]-lave)+SQR(hcd[idx-2]-lave)+SQR(hcd[idx-3]-lave);
+                        float Dgrbhvarr = SQR(hcd[idx]-rave)+SQR(hcd[idx+1]-rave)+SQR(hcd[idx+2]-rave)+SQR(hcd[idx+3]-rave);
+                        float hwt = dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]);
+                        float vwt = dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
+                        float vcdvar = epssq+vwt*Dgrbvvard+(1.f-vwt)*Dgrbvvaru;
+                        float hcdvar = epssq+hwt*Dgrbhvarr+(1.f-hwt)*Dgrbhvarl;
+                        float Dgrbvvaru2 = dgintv[idx]+dgintv[idx-v1]+dgintv[idx-v2];
+                        float Dgrbvvard2 = dgintv[idx]+dgintv[idx+v1]+dgintv[idx+v2];
+                        float Dgrbhvarl2 = dginth[idx]+dginth[idx-1]+dginth[idx-2];
+                        float Dgrbhvarr2 = dginth[idx]+dginth[idx+1]+dginth[idx+2];
+                        float vcdvar1 = epssq+vwt*Dgrbvvard2+(1.f-vwt)*Dgrbvvaru2;
+                        float hcdvar1 = epssq+hwt*Dgrbhvarr2+(1.f-hwt)*Dgrbhvarl2;
+                        float varwt = hcdvar/(vcdvar+hcdvar);
+                        float diffwt = hcdvar1/(vcdvar1+hcdvar1);
+                        hvwt[idx>>1] = ((0.5f-varwt)*(0.5f-diffwt)>0.f && fabsf(0.5f-diffwt)<fabsf(0.5f-varwt)) ? varwt : diffwt;
+                    }
+                }
+                for (int rr=6; rr<rr1-6; rr++) {
+                    for (int cc=6+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2){
+                        nyqutest[idx>>1]=(gaussodd[0]*cddiffsq[idx]+gaussodd[1]*(cddiffsq[idx-m1]+cddiffsq[idx+p1]+cddiffsq[idx-p1]+cddiffsq[idx+m1])+gaussodd[2]*(cddiffsq[idx-v2]+cddiffsq[idx-2]+cddiffsq[idx+2]+cddiffsq[idx+v2])+gaussodd[3]*(cddiffsq[idx-m2]+cddiffsq[idx+p2]+cddiffsq[idx-p2]+cddiffsq[idx+m2]))-(gaussgrad[0]*delhvsqsum[idx]+gaussgrad[1]*(delhvsqsum[idx-v1]+delhvsqsum[idx+1]+delhvsqsum[idx-1]+delhvsqsum[idx+v1])+gaussgrad[2]*(delhvsqsum[idx-m1]+delhvsqsum[idx+p1]+delhvsqsum[idx-p1]+delhvsqsum[idx+m1])+gaussgrad[3]*(delhvsqsum[idx-v2]+delhvsqsum[idx-2]+delhvsqsum[idx+2]+delhvsqsum[idx+v2])+gaussgrad[4]*(delhvsqsum[idx-v2-1]+delhvsqsum[idx-v2+1]+delhvsqsum[idx-TS-2]+delhvsqsum[idx-TS+2]+delhvsqsum[idx+TS-2]+delhvsqsum[idx+TS+2]+delhvsqsum[idx+v2-1]+delhvsqsum[idx+v2+1])+gaussgrad[5]*(delhvsqsum[idx-m2]+delhvsqsum[idx+p2]+delhvsqsum[idx-p2]+delhvsqsum[idx+m2]));
+                    }
+                }
                 bool doNyquist = false;
-                for (int rr = 6; rr < rr1-6; rr++) for (int cc=6+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2) if(nyqutest[idx>>1]>0.f) {nyquist[idx>>1]=1; doNyquist=true;}
+                memset(nyquist, 0, sizeof(unsigned char) * TS * TSH);
+                for (int rr = 6; rr < rr1-6; rr++) for (int cc=6+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2) if(nyqutest[idx>>1]>0.f) {nyquist[idx>>1]=1; doNyquist=true;}
+
+                // STAGE 6: Nyquist processing & Green interpolation
                 if(doNyquist) {
                     memset(nyquist2, 0, sizeof(unsigned char)*TS*TSH);
-                    for (int rr=8; rr<rr1-8; rr++) for (int cc=8+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) {
-                        unsigned int nqsum=(nyquist[(idx-v2)>>1]+nyquist[(idx-m1)>>1]+nyquist[(idx+p1)>>1]+nyquist[(idx-2)>>1]+nyquist[(idx+2)>>1]+nyquist[(idx-p1)>>1]+nyquist[(idx+m1)>>1]+nyquist[(idx+v2)>>1]);
-                        nyquist2[idx>>1]= nqsum>4?1:(nqsum<4?0:nyquist[idx>>1]);
-                    }
-                    for (int rr=8; rr<rr1-8; rr++) for (int cc=8+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]) {
-                        float sumcfa=0,sumh=0,sumv=0,sumsqh=0,sumsqv=0,areawt=0;
-                        for(int i=-6;i<7;i+=2) for(int j=-6;j<7;j+=2) { int idx1=idx+i*TS+j; if(idx1>=0 && idx1 <TS*TS && nyquist2[idx1>>1]) {
-                            float cfatemplate=cfa[idx1]; sumcfa+=cfatemplate; sumh+=(cfa[idx1-1]+cfa[idx1+1]); sumv+=(cfa[idx1-v1]+cfa[idx1+v1]);
-                            sumsqh+=SQR(cfatemplate-cfa[idx1-1])+SQR(cfatemplate-cfa[idx1+1]); sumsqv+=SQR(cfatemplate-cfa[idx1-v1])+SQR(cfatemplate-cfa[idx1+v1]); areawt+=1;
-                        }}
-                        sumh=sumcfa-0.5f*sumh; sumv=sumcfa-0.5f*sumv; areawt*=0.5f;
-                        float hcdvar2=epssq+fabsf(areawt*sumsqh-sumh*sumh), vcdvar2=epssq+fabsf(areawt*sumsqv-sumv*sumv); hvwt[idx>>1]=hcdvar2/(vcdvar2+hcdvar2);
-                    }
-                }
-
-                float* Dgrb0 = vcdalt; s_hv* Dgrb2_ptr = reinterpret_cast<s_hv*>(Dgrbsq1m);
-                for (int rr=8; rr<rr1-8; rr++) for (int cc=8+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2){
-                    float hvwtalt=0.25f*(hvwt[(idx-m1)>>1]+hvwt[(idx+p1)>>1]+hvwt[(idx-p1)>>1]+hvwt[(idx+m1)>>1]);
-                    hvwt[idx>>1] = fabsf(0.5f-hvwt[idx>>1])<fabsf(0.5f-hvwtalt)?hvwtalt:hvwt[idx>>1];
-                    Dgrb0[idx>>1] = hvwt[idx>>1]*vcd[idx]+(1.f-hvwt[idx>>1])*hcd[idx];
-                    rgbgreen[idx] = cfa[idx]+Dgrb0[idx>>1];
-                    Dgrb2_ptr[idx>>1].h=nyquist2[idx>>1]?SQR(rgbgreen[idx]-0.5f*(rgbgreen[idx-1]+rgbgreen[idx+1])):0.f;
-                    Dgrb2_ptr[idx>>1].v=nyquist2[idx>>1]?SQR(rgbgreen[idx]-0.5f*(rgbgreen[idx-v1]+rgbgreen[idx+v1])):0.f;
-                }
-                
-                if(doNyquist) for(int rr=8; rr<rr1-8; rr++) for(int cc=8+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]){
-                    float gvarh=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].h+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].h+Dgrb2_ptr[(idx+p1)>>1].h+Dgrb2_ptr[(idx-p1)>>1].h+Dgrb2_ptr[(idx+m1)>>1].h)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].h+Dgrb2_ptr[(idx-2)>>1].h+Dgrb2_ptr[(idx+2)>>1].h+Dgrb2_ptr[(idx+v2)>>1].h)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].h+Dgrb2_ptr[(idx+p2)>>1].h+Dgrb2_ptr[(idx-p2)>>1].h+Dgrb2_ptr[(idx+m2)>>1].h));
-                    float gvarv=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].v+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].v+Dgrb2_ptr[(idx+p1)>>1].v+Dgrb2_ptr[(idx-p1)>>1].v+Dgrb2_ptr[(idx+m1)>>1].v)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].v+Dgrb2_ptr[(idx-2)>>1].v+Dgrb2_ptr[(idx+2)>>1].v+Dgrb2_ptr[(idx+v2)>>1].v)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].v+Dgrb2_ptr[(idx+p2)>>1].v+Dgrb2_ptr[(idx-p2)>>1].v+Dgrb2_ptr[(idx+m2)>>1].v));
-                    Dgrb0[idx>>1]=(hcd[idx]*gvarv+vcd[idx]*gvarh)/(gvarv+gvarh); rgbgreen[idx]=cfa[idx]+Dgrb0[idx>>1];
-                }
-
-                float* delp=Dgrbsq1p, *delm=Dgrbsq1m;
-                for (int rr=6; rr<rr1-6; rr++) for(int cc=6,idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2){
-                    int idx1 = idx>>1;
-                    if(FC(rr,cc)&1){ Dgrbsq1p[idx1]=SQR(cfa[idx+1]-cfa[idx+1-p1])+SQR(cfa[idx+1]-cfa[idx+1+p1]); Dgrbsq1m[idx1]=SQR(cfa[idx+1]-cfa[idx+1-m1])+SQR(cfa[idx+1]-cfa[idx+1+m1]); delp[idx1]=fabsf(cfa[idx+1+p1]-cfa[idx+1-p1]); delm[idx1]=fabsf(cfa[idx+1+m1]-cfa[idx+1-m1]);}
-                    else { Dgrbsq1p[idx1]=SQR(cfa[idx]-cfa[idx-p1])+SQR(cfa[idx]-cfa[idx+p1]); Dgrbsq1m[idx1]=SQR(cfa[idx]-cfa[idx-m1])+SQR(cfa[idx]-cfa[idx+m1]); delp[idx1]=fabsf(cfa[idx+p1]-cfa[idx-p1]); delm[idx1]=fabsf(cfa[idx+m1]-cfa[idx-m1]);}
-                }
-
-                float* rbm=vcd, *rbp=hcd, *rbint=dirwts0, *pmwt=dirwts1;
-                for (int rr=8; rr<rr1-8; rr++) for(int cc=8+(FC(rr,2)&1),idx=rr*TS+cc,idx1=idx>>1; cc<cc1-8; cc+=2,idx+=2,idx1++){
-                    float crse=2.f*cfa[idx+m1]/(eps+cfa[idx]+cfa[idx+m2]), rbse=fabsf(1.f-crse)<arthresh?cfa[idx]*crse:cfa[idx+m1]+0.5f*(cfa[idx]-cfa[idx+m2]);
-                    float crnw=2.f*cfa[idx-m1]/(eps+cfa[idx]+cfa[idx-m2]), rbnw=fabsf(1.f-crnw)<arthresh?cfa[idx]*crnw:cfa[idx-m1]+0.5f*(cfa[idx]-cfa[idx-m2]);
-                    float crne=2.f*cfa[idx+p1]/(eps+cfa[idx]+cfa[idx+p2]), rbne=fabsf(1.f-crne)<arthresh?cfa[idx]*crne:cfa[idx+p1]+0.5f*(cfa[idx]-cfa[idx+p2]);
-                    float crsw=2.f*cfa[idx-p1]/(eps+cfa[idx]+cfa[idx-p2]), rbsw=fabsf(1.f-crsw)<arthresh?cfa[idx]*crsw:cfa[idx-p1]+0.5f*(cfa[idx]-cfa[idx-p2]);
-                    float wtse=eps+delm[idx1]+delm[(idx+m1)>>1]+delm[(idx+m2)>>1], wtnw=eps+delm[idx1]+delm[(idx-m1)>>1]+delm[(idx-m2)>>1];
-                    float wtne=eps+delp[idx1]+delp[(idx+p1)>>1]+delp[(idx+p2)>>1], wtsw=eps+delp[idx1]+delp[(idx-p1)>>1]+delp[(idx-p2)>>1];
-                    rbm[idx1]=(wtse*rbnw+wtnw*rbse)/(wtse+wtnw); rbp[idx1]=(wtne*rbsw+wtsw*rbne)/(wtne+wtsw);
-                    if(rbp[idx1]<cfa[idx]){if(2.f*rbp[idx1]<cfa[idx])rbp[idx1]=median(rbp[idx1],cfa[idx-p1],cfa[idx+p1]);else{float pwt=2.f*(cfa[idx]-rbp[idx1])/(eps+rbp[idx1]+cfa[idx]);rbp[idx1]=pwt*rbp[idx1]+(1.f-pwt)*median(rbp[idx1],cfa[idx-p1],cfa[idx+p1]);}}
-                    if(rbm[idx1]<cfa[idx]){if(2.f*rbm[idx1]<cfa[idx])rbm[idx1]=median(rbm[idx1],cfa[idx-m1],cfa[idx+m1]);else{float mwt=2.f*(cfa[idx]-rbm[idx1])/(eps+rbm[idx1]+cfa[idx]);rbm[idx1]=mwt*rbm[idx1]+(1.f-mwt)*median(rbm[idx1],cfa[idx-m1],cfa[idx+m1]);}}
-                    if(rbp[idx1]>clip_pt)rbp[idx1]=median(rbp[idx1],cfa[idx-p1],cfa[idx+p1]); if(rbm[idx1]>clip_pt)rbm[idx1]=median(rbm[idx1],cfa[idx-m1],cfa[idx+m1]);
-                    float rbvarm=epssq+(gausseven[0]*(Dgrbsq1m[(idx-v1)>>1]+Dgrbsq1m[(idx-1)>>1]+Dgrbsq1m[(idx+1)>>1]+Dgrbsq1m[(idx+v1)>>1])+gausseven[1]*(Dgrbsq1m[(idx-v2-1)>>1]+Dgrbsq1m[(idx-v2+1)>>1]+Dgrbsq1m[(idx-2-v1)>>1]+Dgrbsq1m[(idx+2-v1)>>1]+Dgrbsq1m[(idx-2+v1)>>1]+Dgrbsq1m[(idx+2+v1)>>1]+Dgrbsq1m[(idx+v2-1)>>1]+Dgrbsq1m[(idx+v2+1)>>1]));
-                    float rbvarp=epssq+(gausseven[0]*(Dgrbsq1p[(idx-v1)>>1]+Dgrbsq1p[(idx-1)>>1]+Dgrbsq1p[(idx+1)>>1]+Dgrbsq1p[(idx+v1)>>1])+gausseven[1]*(Dgrbsq1p[(idx-v2-1)>>1]+Dgrbsq1p[(idx-v2+1)>>1]+Dgrbsq1p[(idx-2-v1)>>1]+Dgrbsq1p[(idx+2-v1)>>1]+Dgrbsq1p[(idx-2+v1)>>1]+Dgrbsq1p[(idx+2+v1)>>1]+Dgrbsq1p[(idx+v2-1)>>1]+Dgrbsq1p[(idx+v2+1)>>1]));
-                    pmwt[idx1]=rbvarm/(rbvarp+rbvarm);
-                }
-
-                for (int rr=10; rr<rr1-10; rr++) for(int cc=10+(FC(rr,2)&1),idx=rr*TS+cc,idx1=idx>>1; cc<cc1-10; cc+=2,idx+=2,idx1++){
-                    float pmwtalt=0.25f*(pmwt[(idx-m1)>>1]+pmwt[(idx+p1)>>1]+pmwt[(idx-p1)>>1]+pmwt[(idx+m1)>>1]);
-                    if(fabsf(0.5f-pmwt[idx1])<fabsf(0.5f-pmwtalt))pmwt[idx1]=pmwtalt;
-                    rbint[idx1]=0.5f*(cfa[idx]+rbm[idx1]*(1.f-pmwt[idx1])+rbp[idx1]*pmwt[idx1]);
-                }
-
-                for (int rr=12; rr<rr1-12; rr++) for(int cc=12+(FC(rr,2)&1),idx=rr*TS+cc,idx1=idx>>1; cc<cc1-12; cc+=2,idx+=2,idx1++){
-                    if(fabsf(0.5f-pmwt[idx1])>=fabsf(0.5f-hvwt[idx1]))continue;
-                    float cru=cfa[idx-v1]*2.f/(eps+rbint[idx1]+rbint[(idx-v1)>>1]),crd=cfa[idx+v1]*2.f/(eps+rbint[idx1]+rbint[(idx+v1)>>1]);
-                    float crl=cfa[idx-1]*2.f/(eps+rbint[idx1]+rbint[(idx-1)>>1]),crr=cfa[idx+1]*2.f/(eps+rbint[idx1]+rbint[(idx+1)>>1]);
-                    float gu=fabsf(1.f-cru)<arthresh?rbint[idx1]*cru:cfa[idx-v1]+0.5f*(rbint[idx1]-rbint[(idx-v1)>>1]);
-                    float gd=fabsf(1.f-crd)<arthresh?rbint[idx1]*crd:cfa[idx+v1]+0.5f*(rbint[idx1]-rbint[(idx+v1)>>1]);
-                    float gl=fabsf(1.f-crl)<arthresh?rbint[idx1]*crl:cfa[idx-1]+0.5f*(rbint[idx1]-rbint[(idx-1)>>1]);
-                    float gr=fabsf(1.f-crr)<arthresh?rbint[idx1]*crr:cfa[idx+1]+0.5f*(rbint[idx1]-rbint[(idx+1)>>1]);
-                    float Gintv=(dirwts0[idx-v1]*gd+dirwts0[idx+v1]*gu)/(dirwts0[idx+v1]+dirwts0[idx-v1]);
-                    float Ginth=(dirwts1[idx-1]*gr+dirwts1[idx+1]*gl)/(dirwts1[idx-1]+dirwts1[idx+1]);
-                    if(Gintv<rbint[idx1]){if(2.f*Gintv<rbint[idx1])Gintv=median(Gintv,cfa[idx-v1],cfa[idx+v1]);else{float vwt2=2.f*(rbint[idx1]-Gintv)/(eps+Gintv+rbint[idx1]);Gintv=vwt2*Gintv+(1.f-vwt2)*median(Gintv,cfa[idx-v1],cfa[idx+v1]);}}
-                    if(Ginth<rbint[idx1]){if(2.f*Ginth<rbint[idx1])Ginth=median(Ginth,cfa[idx-1],cfa[idx+1]);else{float hwt2=2.f*(rbint[idx1]-Ginth)/(eps+Ginth+rbint[idx1]);Ginth=hwt2*Ginth+(1.f-hwt2)*median(Ginth,cfa[idx-1],cfa[idx+1]);}}
-                    if(Ginth>clip_pt)Ginth=median(Ginth,cfa[idx-1],cfa[idx+1]); if(Gintv>clip_pt)Gintv=median(Gintv,cfa[idx-v1],cfa[idx+v1]);
-                    rgbgreen[idx]=Ginth*(1.f-hvwt[idx1])+Gintv*hvwt[idx1]; Dgrb0[idx1]=rgbgreen[idx]-cfa[idx];
-                }
-                
-                float* Dgrb1=hcdalt;
-                for(int rr=13-ey; rr<rr1-12; rr+=2) for(int cc=13-ex,idx=rr*TS+cc; cc<cc1-12; cc+=2,idx+=2){Dgrb1[idx>>1]=Dgrb0[idx>>1]; Dgrb0[idx>>1]=0;}
-                for(int rr=14; rr<rr1-14; rr++) for(int cc=14+(FC(rr,2)&1),idx=rr*TS+cc; cc<cc1-14; cc+=2,idx+=2){
-                    int c=1-FC(rr,cc)/2;
-                    float* Dgrb_c = c ? Dgrb1 : Dgrb0;
-                    float wtnw=1.f/(eps+fabsf(Dgrb_c[((idx-m1)>>1)]-Dgrb_c[((idx+m1)>>1)])+fabsf(Dgrb_c[((idx-m1)>>1)]-Dgrb_c[((idx-m3)>>1)])+fabsf(Dgrb_c[((idx+m1)>>1)]-Dgrb_c[((idx-m3)>>1)]));
-                    float wtne=1.f/(eps+fabsf(Dgrb_c[((idx+p1)>>1)]-Dgrb_c[((idx-p1)>>1)])+fabsf(Dgrb_c[((idx+p1)>>1)]-Dgrb_c[((idx+p3)>>1)])+fabsf(Dgrb_c[((idx-p1)>>1)]-Dgrb_c[((idx+p3)>>1)]));
-                    float wtsw=1.f/(eps+fabsf(Dgrb_c[((idx-p1)>>1)]-Dgrb_c[((idx+p1)>>1)])+fabsf(Dgrb_c[((idx-p1)>>1)]-Dgrb_c[((idx+m3)>>1)])+fabsf(Dgrb_c[((idx+p1)>>1)]-Dgrb_c[((idx-p3)>>1)]));
-                    float wtse=1.f/(eps+fabsf(Dgrb_c[((idx+m1)>>1)]-Dgrb_c[((idx-m1)>>1)])+fabsf(Dgrb_c[((idx+m1)>>1)]-Dgrb_c[((idx-p3)>>1)])+fabsf(Dgrb_c[((idx-m1)>>1)]-Dgrb_c[((idx+m3)>>1)]));
-                    Dgrb_c[idx>>1]=(wtnw*(1.325f*Dgrb_c[((idx-m1)>>1)]-0.175f*Dgrb_c[((idx-m3)>>1)]-0.075f*Dgrb_c[((idx-m1-2)>>1)]-0.075f*Dgrb_c[((idx-m1-v2)>>1)])+wtne*(1.325f*Dgrb_c[((idx+p1)>>1)]-0.175f*Dgrb_c[((idx+p3)>>1)]-0.075f*Dgrb_c[((idx+p1+2)>>1)]-0.075f*Dgrb_c[((idx+p1+v2)>>1)])+wtsw*(1.325f*Dgrb_c[((idx-p1)>>1)]-0.175f*Dgrb_c[((idx-p3)>>1)]-0.075f*Dgrb_c[((idx-p1-2)>>1)]-0.075f*Dgrb_c[((idx-p1-v2)>>1)])+wtse*(1.325f*Dgrb_c[((idx+m1)>>1)]-0.175f*Dgrb_c[((idx+m3)>>1)]-0.075f*Dgrb_c[((idx+m1+2)>>1)]-0.075f*Dgrb_c[((idx+m1+v2)>>1)]))/(wtnw+wtne+wtsw+wtse);
-                }
-
-                for (int rr = 16; rr < rr1 - 16; rr++) {
-                    int row = rr + top; if (row < 0 || row >= (int)height_) continue;
-                    for (int cc = 16; cc < cc1-16; cc++) {
-                        int col = cc + left; if (col < 0 || col >= (int)width_) continue;
-                        int out_idx = row*width_+col, tile_idx=rr*TS+cc;
-                        int c_site=FC(row,col);
-                        float r, g, b;
-                        if(c_site&1){
-                            g=cfa[tile_idx];
-                            float wsum = hvwt[((tile_idx-v1)>>1)] + (1.f-hvwt[((tile_idx+1)>>1)]) + (1.f-hvwt[((tile_idx-1)>>1)]) + hvwt[((tile_idx+v1)>>1)];
-                            if (wsum > 1e-6f) {
-                                r = g - (hvwt[((tile_idx-v1)>>1)]*Dgrb0[((tile_idx-v1)>>1)]+(1.f-hvwt[((tile_idx+1)>>1)])*Dgrb0[((tile_idx+1)>>1)]+(1.f-hvwt[((tile_idx-1)>>1)])*Dgrb0[((tile_idx-1)>>1)]+hvwt[((tile_idx+v1)>>1)]*Dgrb0[((tile_idx+v1)>>1)])/wsum;
-                                b = g - (hvwt[((tile_idx-v1)>>1)]*Dgrb1[((tile_idx-v1)>>1)]+(1.f-hvwt[((tile_idx+1)>>1)])*Dgrb1[((tile_idx+1)>>1)]+(1.f-hvwt[((tile_idx-1)>>1)])*Dgrb1[((tile_idx-1)>>1)]+hvwt[((tile_idx+v1)>>1)]*Dgrb1[((tile_idx+v1)>>1)])/wsum;
-                            } else { r = b = g; }
-                        } else {
-                            g=rgbgreen[tile_idx];
-                            if(c_site==0){r=cfa[tile_idx];b=g-Dgrb1[tile_idx>>1];}
-                            else{b=cfa[tile_idx];r=g-Dgrb0[tile_idx>>1];}
+                    for (int rr=8; rr<rr1-8; rr++) {
+                        for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) {
+                            unsigned int nqsum=(nyquist[(idx-v2)>>1]+nyquist[(idx-m1)>>1]+nyquist[(idx+p1)>>1]+nyquist[(idx-2)>>1]+nyquist[(idx+2)>>1]+nyquist[(idx-p1)>>1]+nyquist[(idx+m1)>>1]+nyquist[(idx+v2)>>1]);
+                            nyquist2[idx>>1]= nqsum>4?1:(nqsum<4?0:nyquist[idx>>1]);
                         }
-                        rgb_buffer_.image[out_idx][0] = CLIP_U16(r*65535.f);
-                        rgb_buffer_.image[out_idx][1] = CLIP_U16(g*65535.f);
-                        rgb_buffer_.image[out_idx][2] = CLIP_U16(b*65535.f);
-                        rgb_buffer_.image[out_idx][3] = rgb_buffer_.image[out_idx][1];
+                    }
+                    for (int rr=8; rr<rr1-8; rr++) {
+                        for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]) {
+                            float sumcfa=0,sumh=0,sumv=0,sumsqh=0,sumsqv=0,areawt=0;
+                            for(int i=-6;i<7;i+=2) for(int j=-6;j<7;j+=2) {
+                                int idx1=idx+i*TS+j;
+                                if ( (idx1 >= 0) && (idx1 < TS*TS) && nyquist2[idx1>>1]) {
+                                    float cfatemplate=cfa[idx1]; sumcfa+=cfatemplate; sumh+=(cfa[idx1-1]+cfa[idx1+1]); sumv+=(cfa[idx1-v1]+cfa[idx1+v1]);
+                                    sumsqh+=SQR(cfatemplate-cfa[idx1-1])+SQR(cfatemplate-cfa[idx1+1]); sumsqv+=SQR(cfatemplate-cfa[idx1-v1])+SQR(cfatemplate-cfa[idx1+v1]); areawt+=1;
+                                }
+                            }
+                            sumh=sumcfa-xdiv2f(sumh); sumv=sumcfa-xdiv2f(sumv); areawt=xdiv2f(areawt);
+                            float hcdvar2=epssq+fabsf(areawt*sumsqh-sumh*sumh), vcdvar2=epssq+fabsf(areawt*sumsqv-sumv*sumv);
+                            hvwt[idx>>1]=hcdvar2/(vcdvar2+hcdvar2);
+                        }
+                    }
+                }
+                float* Dgrb0 = vcdalt; 
+                s_hv* Dgrb2_ptr = reinterpret_cast<s_hv*>(Dgrbsq1m);
+                for (int rr=8; rr<rr1-8; rr++) {
+                    for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2){
+                        float hvwtalt=0.25f*(hvwt[(idx-m1)>>1]+hvwt[(idx+p1)>>1]+hvwt[(idx-p1)>>1]+hvwt[(idx+m1)>>1]);
+                        hvwt[idx>>1] = fabsf(0.5f-hvwt[idx>>1])<fabsf(0.5f-hvwtalt) ? hvwtalt : hvwt[idx>>1];
+                        Dgrb0[idx>>1] = hvwt[idx>>1]*vcd[idx] + (1.f-hvwt[idx>>1])*hcd[idx];
+                        rgbgreen[idx] = cfa[idx] + Dgrb0[idx>>1];
+                        Dgrb2_ptr[idx>>1].h = nyquist2[idx>>1] ? SQR(rgbgreen[idx]-xdiv2f(rgbgreen[idx-1]+rgbgreen[idx+1])) : 0.f;
+                        Dgrb2_ptr[idx>>1].v = nyquist2[idx>>1] ? SQR(rgbgreen[idx]-xdiv2f(rgbgreen[idx-v1]+rgbgreen[idx+v1])) : 0.f;
+                    }
+                }
+                if(doNyquist) {
+                    for(int rr=8; rr<rr1-8; rr++) {
+                        for(int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]){
+                            float gvarh=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].h+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].h+Dgrb2_ptr[(idx+p1)>>1].h+Dgrb2_ptr[(idx-p1)>>1].h+Dgrb2_ptr[(idx+m1)>>1].h)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].h+Dgrb2_ptr[(idx-2)>>1].h+Dgrb2_ptr[(idx+2)>>1].h+Dgrb2_ptr[(idx+v2)>>1].h)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].h+Dgrb2_ptr[(idx+p2)>>1].h+Dgrb2_ptr[(idx-p2)>>1].h+Dgrb2_ptr[(idx+m2)>>1].h));
+                            float gvarv=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].v+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].v+Dgrb2_ptr[(idx+p1)>>1].v+Dgrb2_ptr[(idx-p1)>>1].v+Dgrb2_ptr[(idx+m1)>>1].v)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].v+Dgrb2_ptr[(idx-2)>>1].v+Dgrb2_ptr[(idx+2)>>1].v+Dgrb2_ptr[(idx+v2)>>1].v)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].v+Dgrb2_ptr[(idx+p2)>>1].v+Dgrb2_ptr[(idx-p2)>>1].v+Dgrb2_ptr[(idx+m2)>>1].v));
+                            Dgrb0[idx>>1]=(hcd[idx]*gvarv+vcd[idx]*gvarh)/(gvarv+gvarh);
+                            rgbgreen[idx]=cfa[idx]+Dgrb0[idx>>1];
+                        }
+                    }
+                }
+
+                // STAGE 7: Red/Blue gradient preprocessing
+                float* delp = cddiffsq;
+                float* delm = reinterpret_cast<float*>(reinterpret_cast<char*>(delp) + sizeof(float) * TS * TSH);
+                for (int rr = 6; rr < rr1 - 6; rr++) {
+                    if ((fc_rt(rr, 2) & 1) == 0) {
+                        for (int cc = 6, idx = rr * TS + cc; cc < cc1 - 6; cc += 2, idx += 2) {
+                            delp[idx >> 1] = fabsf(cfa[idx + p1] - cfa[idx - p1]);
+                            delm[idx >> 1] = fabsf(cfa[idx + m1] - cfa[idx - m1]);
+                            Dgrbsq1p[idx >> 1] = SQR(cfa[idx + 1] - cfa[idx + 1 - p1]) + SQR(cfa[idx + 1] - cfa[idx + 1 + p1]);
+                            Dgrbsq1m[idx >> 1] = SQR(cfa[idx + 1] - cfa[idx + 1 - m1]) + SQR(cfa[idx + 1] - cfa[idx + 1 + m1]);
+                        }
+                    } else {
+                        for (int cc = 6, idx = rr * TS + cc; cc < cc1 - 6; cc += 2, idx += 2) {
+                            Dgrbsq1p[idx >> 1] = SQR(cfa[idx] - cfa[idx - p1]) + SQR(cfa[idx] - cfa[idx + p1]);
+                            Dgrbsq1m[idx >> 1] = SQR(cfa[idx] - cfa[idx - m1]) + SQR(cfa[idx] - cfa[idx + m1]);
+                            delp[idx >> 1] = fabsf(cfa[idx + 1 + p1] - cfa[idx + 1 - p1]);
+                            delm[idx >> 1] = fabsf(cfa[idx + 1 + m1] - cfa[idx + 1 - m1]);
+                        }
+                    }
+                }
+                
+                // STAGE 8: Red/Blue color ratio interpolation (Diagonal)
+                float* rbm = vcd;
+                float* rbp = hcdalt;
+                float* pmwt = dirwts1;
+                for (int rr = 8; rr < rr1 - 8; rr++) {
+                    for (int cc = 8 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 8; cc += 2, idx += 2, idx1++) {
+                        float crse = xmul2f(cfa[idx + m1]) / (eps + cfa[idx] + cfa[idx + m2]);
+                        float crnw = xmul2f(cfa[idx - m1]) / (eps + cfa[idx] + cfa[idx - m2]);
+                        float crne = xmul2f(cfa[idx + p1]) / (eps + cfa[idx] + cfa[idx + p2]);
+                        float crsw = xmul2f(cfa[idx - p1]) / (eps + cfa[idx] + cfa[idx - p2]);
+                        float rbse = fabsf(1.f - crse) < arthresh ? cfa[idx] * crse : (cfa[idx + m1]) + xdiv2f(cfa[idx] - cfa[idx + m2]);
+                        float rbnw = fabsf(1.f - crnw) < arthresh ? cfa[idx] * crnw : (cfa[idx - m1]) + xdiv2f(cfa[idx] - cfa[idx - m2]);
+                        float rbne = fabsf(1.f - crne) < arthresh ? cfa[idx] * crne : (cfa[idx + p1]) + xdiv2f(cfa[idx] - cfa[idx + p2]);
+                        float rbsw = fabsf(1.f - crsw) < arthresh ? cfa[idx] * crsw : (cfa[idx - p1]) + xdiv2f(cfa[idx] - cfa[idx - p2]);
+                        float wtse = eps + delm[idx1] + delm[(idx + m1) >> 1] + delm[(idx + m2) >> 1];
+                        float wtnw = eps + delm[idx1] + delm[(idx - m1) >> 1] + delm[(idx - m2) >> 1];
+                        float wtne = eps + delp[idx1] + delp[(idx + p1) >> 1] + delp[(idx + p2) >> 1];
+                        float wtsw = eps + delp[idx1] + delp[(idx - p1) >> 1] + delp[(idx - p2) >> 1];
+                        rbm[idx1] = (wtse * rbnw + wtnw * rbse) / (wtse + wtnw);
+                        rbp[idx1] = (wtne * rbsw + wtsw * rbne) / (wtne + wtsw);
+                        if (rbp[idx1] < cfa[idx]) { if (xmul2f(rbp[idx1]) < cfa[idx]) rbp[idx1] = median(rbp[idx1] , cfa[idx - p1], cfa[idx + p1]); else { float pwt = xmul2f(cfa[idx] - rbp[idx1]) / (eps + rbp[idx1] + cfa[idx]); rbp[idx1] = pwt * rbp[idx1] + (1.f - pwt) * median(rbp[idx1], cfa[idx - p1], cfa[idx + p1]); } }
+                        if (rbm[idx1] < cfa[idx]) { if (xmul2f(rbm[idx1]) < cfa[idx]) rbm[idx1] = median(rbm[idx1] , cfa[idx - m1], cfa[idx + m1]); else { float mwt = xmul2f(cfa[idx] - rbm[idx1]) / (eps + rbm[idx1] + cfa[idx]); rbm[idx1] = mwt * rbm[idx1] + (1.f - mwt) * median(rbm[idx1], cfa[idx - m1], cfa[idx + m1]); } }
+                        if (rbp[idx1] > clip_pt) rbp[idx1] = median(rbp[idx1], cfa[idx - p1], cfa[idx + p1]);
+                        if (rbm[idx1] > clip_pt) rbm[idx1] = median(rbm[idx1], cfa[idx - m1], cfa[idx + m1]);
+                        float rbvarm = epssq + (gausseven[0] * (Dgrbsq1m[(idx - v1) >> 1] + Dgrbsq1m[(idx - 1) >> 1] + Dgrbsq1m[(idx + 1) >> 1] + Dgrbsq1m[(idx + v1) >> 1]) + gausseven[1] * (Dgrbsq1m[(idx - v2 - 1) >> 1] + Dgrbsq1m[(idx - v2 + 1) >> 1] + Dgrbsq1m[(idx - 2 - v1) >> 1] + Dgrbsq1m[(idx + 2 - v1) >> 1] + Dgrbsq1m[(idx - 2 + v1) >> 1] + Dgrbsq1m[(idx + 2 + v1) >> 1] + Dgrbsq1m[(idx + v2 - 1) >> 1] + Dgrbsq1m[(idx + v2 + 1) >> 1]));
+                        float rbvarp = epssq + (gausseven[0] * (Dgrbsq1p[(idx - v1) >> 1] + Dgrbsq1p[(idx - 1) >> 1] + Dgrbsq1p[(idx + 1) >> 1] + Dgrbsq1p[(idx + v1) >> 1]) + gausseven[1] * (Dgrbsq1p[(idx - v2 - 1) >> 1] + Dgrbsq1p[(idx - v2 + 1) >> 1] + Dgrbsq1p[(idx - 2 - v1) >> 1] + Dgrbsq1p[(idx + 2 - v1) >> 1] + Dgrbsq1p[(idx - 2 + v1) >> 1] + Dgrbsq1p[(idx + 2 + v1) >> 1] + Dgrbsq1p[(idx + v2 - 1) >> 1] + Dgrbsq1p[(idx + v2 + 1) >> 1]));
+                        pmwt[idx1] = rbvarm / (rbvarp + rbvarm);
+                    }
+                }
+
+                // STAGE 9: Final Green interpolation and Chrominance interpolation
+                float* rbint = delhvsqsum;
+                for (int rr = 10; rr < rr1 - 10; rr++) {
+                    for (int cc = 10 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 10; cc += 2, idx += 2, idx1++) {
+                        float pmwtalt = 0.25f * (pmwt[(idx - m1) >> 1] + pmwt[(idx + p1) >> 1] + pmwt[(idx - p1) >> 1] + pmwt[(idx + m1) >> 1]);
+                        if (fabsf(0.5f - pmwt[idx1]) < fabsf(0.5f - pmwtalt)) pmwt[idx1] = pmwtalt;
+                        rbint[idx1] = xdiv2f(cfa[idx] + rbm[idx1] * (1.f - pmwt[idx1]) + rbp[idx1] * pmwt[idx1]);
+                    }
+                }
+                for (int rr = 12; rr < rr1 - 12; rr++) {
+                    for (int cc = 12 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 12; cc += 2, idx += 2, idx1++) {
+                        if (fabsf(0.5f - pmwt[idx1]) >= fabsf(0.5f - hvwt[idx1])) continue;
+                        float cru = xmul2f(cfa[idx-v1])/(eps+rbint[idx1]+rbint[idx1-v1]);
+                        float crd = xmul2f(cfa[idx+v1])/(eps+rbint[idx1]+rbint[idx1+v1]);
+                        float crl = xmul2f(cfa[idx-1])/(eps+rbint[idx1]+rbint[idx1-1]);
+                        float crr = xmul2f(cfa[idx+1])/(eps+rbint[idx1]+rbint[idx1+1]);
+                        float gu = fabsf(1.f - cru) < arthresh ? rbint[idx1] * cru : cfa[idx-v1] + xdiv2f(rbint[idx1] - rbint[idx1-v1]);
+                        float gd = fabsf(1.f - crd) < arthresh ? rbint[idx1] * crd : cfa[idx+v1] + xdiv2f(rbint[idx1] - rbint[idx1+v1]);
+                        float gl = fabsf(1.f - crl) < arthresh ? rbint[idx1] * crl : cfa[idx-1] + xdiv2f(rbint[idx1] - rbint[idx1-1]);
+                        float gr = fabsf(1.f - crr) < arthresh ? rbint[idx1] * crr : cfa[idx+1] + xdiv2f(rbint[idx1] - rbint[idx1+1]);
+                        float Gintv = (dirwts0[idx - v1] * gd + dirwts0[idx + v1] * gu) / (dirwts0[idx + v1] + dirwts0[idx - v1]);
+                        float Ginth = (dirwts1[idx - 1] * gr + dirwts1[idx + 1] * gl) / (dirwts1[idx - 1] + dirwts1[idx + 1]);
+                        if (Gintv < rbint[idx1]) { if (xmul2f(Gintv) < rbint[idx1]) Gintv = median(Gintv, cfa[idx - v1], cfa[idx + v1]); else { float vwt2 = xmul2f(rbint[idx1] - Gintv) / (eps + Gintv + rbint[idx1]); Gintv = vwt2 * Gintv + (1.f - vwt2) * median(Gintv, cfa[idx - v1], cfa[idx + v1]); } }
+                        if (Ginth < rbint[idx1]) { if (xmul2f(Ginth) < rbint[idx1]) Ginth = median(Ginth, cfa[idx - 1], cfa[idx + 1]); else { float hwt2 = xmul2f(rbint[idx1] - Ginth) / (eps + Ginth + rbint[idx1]); Ginth = hwt2 * Ginth + (1.f - hwt2) * median(Ginth, cfa[idx - 1], cfa[idx + 1]); } }
+                        if (Ginth > clip_pt) Ginth = median(Ginth, cfa[idx - 1], cfa[idx + 1]);
+                        if (Gintv > clip_pt) Gintv = median(Gintv, cfa[idx - v1], cfa[idx + v1]);
+                        rgbgreen[idx] = Ginth * (1.f - hvwt[idx1]) + Gintv * hvwt[idx1];
+                        Dgrb0[idx1] = rgbgreen[idx] - cfa[idx];
+                    }
+                }
+                float* Dgrb1 = hcd;
+                
+                // DEBUG: Dgrb1初期化の詳細確認
+                static bool debug_printed = false;
+                if (!debug_printed) {
+                    std::cout << "🔍 CPU Dgrb1初期化: ey=" << ey << ", rr1=" << rr1 << ", ex=" << ex << ", cc1=" << cc1 << std::endl;
+                    debug_printed = true;
+                }
+                
+                for (int rr = 13 - ey; rr < rr1 - 12; rr += 2) {
+                    for (int idx1 = (rr * TS + 13 - ex) >> 1; idx1 < (rr * TS + cc1 - 12) >> 1; idx1++) {
+                        // DEBUG: 実際の処理範囲の確認
+                        if (idx1 >= 960 && idx1 <= 1130) {  // GPU比較範囲
+                            std::cout << "🔢 CPU Dgrb1[" << idx1 << "] = " << Dgrb0[idx1] << " (rr=" << rr << ")" << std::endl;
+                        }
+                        Dgrb1[idx1] = Dgrb0[idx1];
+                        Dgrb0[idx1] = 0;
+                    }
+                }
+                for (int rr = 14; rr < rr1 - 14; rr++) {
+                    for (int cc = 14 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc; cc < cc1 - 14; cc += 2, idx += 2) {
+                        // In RawTherapee, R=0, B=2. c becomes 1 for R-sites, 0 for B-sites
+                        int c = 1 - fc_rt(rr, cc) / 2;
+                        // Dgrb0 is for G-R, Dgrb1 is for G-B. But the interpolation logic uses the *other* color's buffer.
+                        float* Dgrb_c = c ? Dgrb1 : Dgrb0;
+                        float wtnw = 1.f / (eps + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx + m1) >> 1]) + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx - m3) >> 1]) + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - m3) >> 1]));
+                        float wtne = 1.f / (eps + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx - p1) >> 1]) + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx + p3) >> 1]) + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + p3) >> 1]));
+                        float wtsw = 1.f / (eps + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + p1) >> 1]) + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + m3) >> 1]) + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx - p3) >> 1]));
+                        float wtse = 1.f / (eps + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - m1) >> 1]) + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - p3) >> 1]) + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx + m3) >> 1]));
+                        // The buffer to *write to* is the original color's buffer.
+                        Dgrb_c = c ? Dgrb1 : Dgrb0;
+                        Dgrb_c[idx >> 1] = (wtnw * (1.325f * Dgrb_c[(idx - m1) >> 1] - 0.175f * Dgrb_c[(idx - m3) >> 1] - 0.075f * (Dgrb_c[(idx - m1 - 2) >> 1] + Dgrb_c[(idx - m1 - v2) >> 1])) +
+                                        wtne * (1.325f * Dgrb_c[(idx + p1) >> 1] - 0.175f * Dgrb_c[(idx + p3) >> 1] - 0.075f * (Dgrb_c[(idx + p1 + 2) >> 1] + Dgrb_c[(idx + p1 + v2) >> 1])) +
+                                        wtsw * (1.325f * Dgrb_c[(idx - p1) >> 1] - 0.175f * Dgrb_c[(idx - p3) >> 1] - 0.075f * (Dgrb_c[(idx - p1 - 2) >> 1] + Dgrb_c[(idx - p1 - v2) >> 1])) +
+                                        wtse * (1.325f * Dgrb_c[(idx + m1) >> 1] - 0.175f * Dgrb_c[(idx + m3) >> 1] - 0.075f * (Dgrb_c[(idx + m1 + 2) >> 1] + Dgrb_c[(idx + m1 + v2) >> 1]))) / (wtnw + wtne + wtsw + wtse);
+                    }
+                }
+                
+                // === STAGE 10: Final Output Composition (BUG FIXED) ===
+                for (int rr = 16; rr < rr1 - 16; rr++) {
+                    int row = rr + top; 
+                    if (row < 0 || row >= (int)height_) continue;
+                    for (int cc = 16; cc < cc1 - 16; cc++) {
+                        int col = cc + left; 
+                        if (col < 0 || col >= (int)width_) continue;
+                        
+                        int out_idx = row * width_ + col;
+                        int tile_idx = rr * TS + cc;
+                        
+                        float r, g, b;
+
+                        // ★★★ BUG FIX #2 ★★★
+                        // Use a direct and robust check for the G-site.
+                        if (fc_rt(row, col) == 1) { // G site
+                            g = cfa[tile_idx];
+                            float wsum_inv = 1.0f / (hvwt[(tile_idx - v1) >> 1] + 2.f - hvwt[(tile_idx + 1) >> 1] - hvwt[(tile_idx - 1) >> 1] + hvwt[(tile_idx + v1) >> 1]);                            float r_diff = (hvwt[(tile_idx-v1)>>1]*Dgrb0[(tile_idx-v1)>>1] + (1.f-hvwt[(tile_idx+1)>>1])*Dgrb0[(tile_idx+1)>>1] + (1.f-hvwt[(tile_idx-1)>>1])*Dgrb0[(tile_idx-1)>>1] + hvwt[(tile_idx+v1)>>1]*Dgrb0[(tile_idx+v1)>>1]) * wsum_inv;
+                            float b_diff = (hvwt[(tile_idx-v1)>>1]*Dgrb1[(tile_idx-v1)>>1] + (1.f-hvwt[(tile_idx+1)>>1])*Dgrb1[(tile_idx+1)>>1] + (1.f-hvwt[(tile_idx-1)>>1])*Dgrb1[(tile_idx-1)>>1] + hvwt[(tile_idx+v1)>>1]*Dgrb1[(tile_idx+v1)>>1]) * wsum_inv;
+                            r = g - r_diff;
+                            b = g - b_diff;
+                            // DEBUG: G-site処理の値確認
+                            if (row < 5 && col < 5) {
+                                std::cout << "🟢 CPU G-site (" << row << "," << col << "): g=" << g << ", r_diff=" << r_diff << ", b_diff=" << b_diff << ", r=" << r << ", b=" << b << std::endl;
+                            }
+                        } else { // R or B site
+                            g = rgbgreen[tile_idx];
+                            // ネイティブの色(cfa)を使わず、Dgrb0とDgrb1から両方の色を計算する
+                            r = g - Dgrb0[tile_idx >> 1];
+                            b = g - Dgrb1[tile_idx >> 1];
+                            // DEBUG: R/B-site処理の値確認
+                            if (row < 5 && col < 5) {
+                                int idx_half = tile_idx >> 1;
+                                std::cout << "🔴🔵 CPU R/B-site (" << row << "," << col << "): g=" << g << ", Dgrb0[" << idx_half << "]=" << Dgrb0[idx_half] << ", Dgrb1[" << idx_half << "]=" << Dgrb1[idx_half] << ", r=" << r << ", b=" << b << std::endl;
+                            }
+                        }
+                        rgb_buffer_.image[out_idx][0] = std::max(0.f, r);
+                        rgb_buffer_.image[out_idx][1] = std::max(0.f, g);
+                        rgb_buffer_.image[out_idx][2] = std::max(0.f, b);
                     }
                 }
             }
@@ -1320,61 +1533,35 @@ public:
 
 } // anonymous namespace
 
-// `CPUAccelerator`クラス内のメソッドをこれに置き換える
-bool CPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBuffer& rgb_buffer, uint32_t filters) {
-#ifdef __APPLE__
+
+bool CPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, const float (&cam_mul)[4], uint16_t maximum_value) {
     if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid() ||
         raw_buffer.width != rgb_buffer.width || raw_buffer.height != rgb_buffer.height) {
         std::cerr << "❌ AMaZE Demosaic (RT Port): Invalid buffers or initialization state." << std::endl;
         return false;
     }
 
-    std::cout << "🔧 Starting AMaZE demosaic (Full RawTherapee Port)..." << std::endl;
-    
-    // ✨境界補間を後に移動✨: デモザイク処理前はスキップ
-    // std::cout << "🔧 Applying border interpolation for AMaZE (2px border)..." << std::endl;
-    // border_interpolate(raw_buffer, filters, 2);
-    
     auto start_time = std::chrono::high_resolution_clock::now();
-
-    // CPUAccelerator::demosaic_bayer_amaze の冒頭に追加
-    std::cout << "DEBUG: Bayer `filters` value is: " << filters << std::endl;
-    std::cout << "DEBUG: Dumping top-left 4x4 pixel grid..." << std::endl;
-    for (int r = 0; r < 4; ++r) {
-        for (int c = 0; c < 4; ++c) {
-            int color_code = fcol_bayer(r, c, filters);
-            const char* color_name[] = {"R", "G1", "B", "G2"};
-            
-            uint16_t* p = raw_buffer.image[r * raw_buffer.width + c];
-            std::cout << "Pos(" << r << "," << c << ") -> FC=" << color_code 
-                    << " (" << color_name[color_code] << ")"
-                    << " | Data=[R:" << p[0] << ", G:" << p[1] << ", B:" << p[2] << "]" 
-                    << std::endl;
-        }
-    }
-
+    std::cout << "🔧 Starting AMaZE demosaic (Full RawTherapee Port with Hybrid Optimization)..." << std::endl;
+    
     try {
-        AMaZE_Processor_RT amaze_proc(raw_buffer, rgb_buffer, filters);
+        AMaZE_Processor_RT amaze_proc(raw_buffer, rgb_buffer, filters, cam_mul, maximum_value);
         amaze_proc.run();
     } catch (const std::exception& e) {
         std::cerr << "❌ An exception occurred during AMaZE processing: " << e.what() << std::endl;
         return false;
     }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
+    
+    auto end_time = std::chrono::high_resolution_clock::now();    
     std::chrono::duration<double> diff = end_time - start_time;
     last_processing_time_ = diff.count();
+    
     std::cout << "✅ AMaZE demosaic completed successfully in " << last_processing_time_ << " seconds." << std::endl;
     
-    // ✨デモザイク後境界補間✨: 最終処理で境界を修正
-    std::cout << "🔧 Post-demosaic border interpolation for AMaZE (2px border)..." << std::endl;
-    border_interpolate(raw_buffer, filters, 2);
+    std::cout << "🔧 Post-demosaic border interpolation for AMaZE..." << std::endl;
+    border_interpolate(rgb_buffer, filters, 4);
     
     return true;
-#else
-    std::cerr << "❌ AMaZE demosaic is currently only supported on Apple platforms in this context." << std::endl;
-    return false;
-#endif
 }
 
 //===================================================================
@@ -1385,37 +1572,28 @@ namespace { // このファイル内でのみ使用
 
 class XTrans_Processor {
 private:
-    // XYZ from RGB conversion matrix
-    static constexpr float xyz_rgb[3][3] = {
-        { 0.412453f, 0.357580f, 0.180423f },
-        { 0.212671f, 0.715160f, 0.072169f },
-        { 0.019334f, 0.119193f, 0.950227f }
-    };
-    static constexpr float d65_white[3] = { 0.950456f, 1.0f, 1.088754f };
-    
     const ImageBuffer& raw_buffer_;
-    ImageBuffer& rgb_buffer_;
+    ImageBufferFloat& rgb_buffer_;
     const char (&xtrans_)[6][6];
     const float (&color_matrix_)[3][4];
     uint32_t width_, height_;
+    const uint16_t maximum_value_;
     
     // Utility functions
-    inline int fcol_xtrans(int row, int col) const {
-        return xtrans_[(row) % 6][(col) % 6];
+    inline int fcol_xtrans_(int row, int col) const {
+        return fcol_xtrans(row, col, xtrans_);
     }
     
-    inline float SQR(float x) const { return x * x; }
-    
-    static inline uint16_t CLIP(int x) {
+    inline uint16_t CLIP(int x) const {
         if (x < 0) return 0;
-        if (x > 65535) return 65535;
+        if (x > maximum_value_) return maximum_value_;
         return static_cast<uint16_t>(x);
     }
 
 public:
-    XTrans_Processor(const ImageBuffer& raw, ImageBuffer& rgb, const char (&xtrans)[6][6], const float (&color_matrix)[3][4])
+    XTrans_Processor(const ImageBuffer& raw, ImageBufferFloat& rgb, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t max_val)
         : raw_buffer_(raw), rgb_buffer_(rgb), xtrans_(xtrans), color_matrix_(color_matrix),
-          width_(raw.width), height_(raw.height) {}
+          width_(raw.width), height_(raw.height), maximum_value_(max_val) {}
     
     // 3-pass high quality demosaic
     void run_3pass() {
@@ -1462,7 +1640,6 @@ public:
             {0.25f, 0.5f, 0.25f}
         };
         
-        #pragma omp parallel for schedule(dynamic, 16)
         for (int row = 1; row < (int)height_ - 1; ++row) {
             for (int col = 1; col < (int)width_ - 1; ++col) {
                 float sum[3] = {0.0f, 0.0f, 0.0f};
@@ -1473,22 +1650,22 @@ public:
                         int src_row = row + v;
                         int src_col = col + h;
                         int src_idx = src_row * width_ + src_col;
-                        int src_color = fcol_xtrans(src_row, src_col);
+                        int src_color = fcol_xtrans_(src_row, src_col);
                         
-                        float raw_val = (float)raw_buffer_.image[src_idx][src_color] / 65535.0f;
+                        float raw_val = (float)raw_buffer_.image[src_idx][src_color] / (float)maximum_value_;
                         sum[src_color] += raw_val * weight[v + 1][h + 1];
                     }
                 }
                 
                 int out_idx = row * width_ + col;
-                int pixel_color = fcol_xtrans(row, col);
+                int pixel_color = fcol_xtrans_(row, col);
                 float rgb[3];
                 
                 // RawTherapee's exact color interpolation logic
                 switch(pixel_color) {
                 case 0: // red pixel
                     {
-                        rgb[0] = (float)raw_buffer_.image[out_idx][0] / 65535.0f; // Current red
+                        rgb[0] = (float)raw_buffer_.image[out_idx][0] / (float)maximum_value_; // Current red
                         rgb[1] = sum[1] * 0.5f;  // Green interpolation
                         rgb[2] = sum[2];         // Blue interpolation
                     }
@@ -1496,11 +1673,11 @@ public:
                     
                 case 1: // green pixel
                     {
-                        rgb[1] = (float)raw_buffer_.image[out_idx][1] / 65535.0f; // Current green
+                        rgb[1] = (float)raw_buffer_.image[out_idx][1] / (float)maximum_value_; // Current green
                         
                         // Check if this is a solitary green pixel
-                        int left_color = fcol_xtrans(row, col - 1);
-                        int right_color = fcol_xtrans(row, col + 1);
+                        int left_color = fcol_xtrans_(row, col - 1);
+                        int right_color = fcol_xtrans_(row, col + 1);
                         
                         if (left_color == right_color) {
                             // Solitary green pixel: exactly two direct red and blue neighbors
@@ -1518,16 +1695,16 @@ public:
                     {
                         rgb[0] = sum[0];         // Red interpolation
                         rgb[1] = sum[1] * 0.5f;  // Green interpolation
-                        rgb[2] = (float)raw_buffer_.image[out_idx][2] / 65535.0f; // Current blue
+                        rgb[2] = (float)raw_buffer_.image[out_idx][2] / (float)maximum_value_; // Current blue
                     }
                     break;
                 }
                 
                 // Set output values
-                rgb_buffer_.image[out_idx][0] = CLIP((int)(rgb[0] * 65535.0f + 0.5f));
-                rgb_buffer_.image[out_idx][1] = CLIP((int)(rgb[1] * 65535.0f + 0.5f));
-                rgb_buffer_.image[out_idx][2] = CLIP((int)(rgb[2] * 65535.0f + 0.5f));
-                rgb_buffer_.image[out_idx][3] = rgb_buffer_.image[out_idx][1]; // G2 = G1
+                rgb_buffer_.image[out_idx][0] = rgb[0]; // Float正規化 (0.0-1.0)
+                rgb_buffer_.image[out_idx][1] = rgb[1]; // Float正規化 (0.0-1.0)
+                rgb_buffer_.image[out_idx][2] = rgb[2]; // Float正規化 (0.0-1.0)
+                // ImageBufferFloat has only 3 channels (RGB), no need for G2
             }
         }
         
@@ -1542,7 +1719,7 @@ private:
                 xyz_cam[i][j] = 0.0f;
                 for (int k = 0; k < 3; k++) {
                     // ✨RawTherapee互換修正✨: D65白点正規化を適用（マゼンタ被り修正）
-                    xyz_cam[i][j] += xyz_rgb[i][k] * color_matrix_[k][j] / d65_white[i];
+                    xyz_cam[i][j] += xyz_rgb[i][k] * color_matrix_[k][j] / d50_white[i];
                 }
             }
         }
@@ -1553,13 +1730,13 @@ private:
         // Find position of solitary green pixels in XTrans pattern
         for (int row = 0; row < 6; row++) {
             for (int col = 0; col < 6; col++) {
-                if (fcol_xtrans(row, col) == 1) {
+                if (fcol_xtrans_(row, col) == 1) {
                     bool solitary = true;
                     // Check if this green pixel has green neighbors
                     for (int dr = -1; dr <= 1; dr++) {
                         for (int dc = -1; dc <= 1; dc++) {
                             if (dr == 0 && dc == 0) continue;
-                            if (fcol_xtrans((row + dr + 6) % 6, (col + dc + 6) % 6) == 1) {
+                            if (fcol_xtrans_((row + dr + 6) % 6, (col + dc + 6) % 6) == 1) {
                                 solitary = false;
                                 break;
                             }
@@ -1601,9 +1778,9 @@ private:
                         for (int x = std::max(0, col - 1), h = (col == 0 ? 0 : -1); 
                              x <= std::min(col + 1, (int)width_ - 1); x++, h++) {
                             
-                            int f = fcol_xtrans(y, x);
+                            int f = fcol_xtrans_(y, x);
                             int src_idx = y * width_ + x;
-                            float raw_val = (float)raw_buffer_.image[src_idx][f] / 65535.0f;
+                            float raw_val = (float)raw_buffer_.image[src_idx][f] / (float)maximum_value_;
                             float w = weight[v + 1][h + 1];
                             
                             sum[f] += raw_val * w;
@@ -1612,46 +1789,44 @@ private:
                     }
                     
                     int dst_idx = row * width_ + col;
-                    int pixel_color = fcol_xtrans(row, col);
+                    int pixel_color = fcol_xtrans_(row, col);
                     
                     // RawTherapee's exact interpolation logic
                     switch(pixel_color) {
                     case 0: // Red pixel
                         {
-                            float raw_val = (float)raw_buffer_.image[dst_idx][0] / 65535.0f;
-                            rgb_buffer_.image[dst_idx][0] = CLIP((int)(raw_val * 65535.0f + 0.5f));
-                            rgb_buffer_.image[dst_idx][1] = CLIP((int)((sum[1] / sum[4]) * 65535.0f + 0.5f));
-                            rgb_buffer_.image[dst_idx][2] = CLIP((int)((sum[2] / sum[5]) * 65535.0f + 0.5f));
+                            float raw_val = (float)raw_buffer_.image[dst_idx][0] / (float)maximum_value_;
+                            rgb_buffer_.image[dst_idx][0] = raw_val;
+                            rgb_buffer_.image[dst_idx][1] = sum[1] / sum[4];
+                            rgb_buffer_.image[dst_idx][2] = sum[2] / sum[5];
                         }
                         break;
                         
                     case 1: // Green pixel
                         {
-                            float raw_val = (float)raw_buffer_.image[dst_idx][1] / 65535.0f;
+                            float raw_val = (float)raw_buffer_.image[dst_idx][1] / (float)maximum_value_;
                             if (sum[3] == 0.0f) {
                                 // Corner case: only green pixels in 2x2 area
-                                rgb_buffer_.image[dst_idx][0] = CLIP((int)(raw_val * 65535.0f + 0.5f));
-                                rgb_buffer_.image[dst_idx][1] = CLIP((int)(raw_val * 65535.0f + 0.5f));
-                                rgb_buffer_.image[dst_idx][2] = CLIP((int)(raw_val * 65535.0f + 0.5f));
+                                rgb_buffer_.image[dst_idx][0] = raw_val;
+                                rgb_buffer_.image[dst_idx][1] = raw_val;
+                                rgb_buffer_.image[dst_idx][2] = raw_val;
                             } else {
-                                rgb_buffer_.image[dst_idx][0] = CLIP((int)((sum[0] / sum[3]) * 65535.0f + 0.5f));
-                                rgb_buffer_.image[dst_idx][1] = CLIP((int)(raw_val * 65535.0f + 0.5f));
-                                rgb_buffer_.image[dst_idx][2] = CLIP((int)((sum[2] / sum[5]) * 65535.0f + 0.5f));
+                                rgb_buffer_.image[dst_idx][0] = (sum[0] / sum[3]);
+                                rgb_buffer_.image[dst_idx][1] = raw_val;
+                                rgb_buffer_.image[dst_idx][2] = (sum[2] / sum[5]);
                             }
                         }
                         break;
                         
                     case 2: // Blue pixel
                         {
-                            float raw_val = (float)raw_buffer_.image[dst_idx][2] / 65535.0f;
-                            rgb_buffer_.image[dst_idx][0] = CLIP((int)((sum[0] / sum[3]) * 65535.0f + 0.5f));
-                            rgb_buffer_.image[dst_idx][1] = CLIP((int)((sum[1] / sum[4]) * 65535.0f + 0.5f));
-                            rgb_buffer_.image[dst_idx][2] = CLIP((int)(raw_val * 65535.0f + 0.5f));
+                            float raw_val = (float)raw_buffer_.image[dst_idx][2] / (float)maximum_value_;
+                            rgb_buffer_.image[dst_idx][0] = (sum[0] / sum[3]);
+                            rgb_buffer_.image[dst_idx][1] = (sum[1] / sum[4]);
+                            rgb_buffer_.image[dst_idx][2] = raw_val;
                         }
                         break;
-                    }
-                    
-                    rgb_buffer_.image[dst_idx][3] = rgb_buffer_.image[dst_idx][1]; // G2 = G1
+                    }                    
                 }
             }
         }
@@ -1702,11 +1877,11 @@ private:
                 if (row >= 0 && row < (int)height_ && col >= 0 && col < (int)width_) {
                     int tile_idx = (row - top) * ts + (col - left);
                     int raw_idx = row * width_ + col;
-                    int color = fcol_xtrans(row, col);
+                    int color = fcol_xtrans_(row, col);
                     
                     // Initialize all channels to 0, set only the appropriate color
                     rgb[tile_idx][0] = rgb[tile_idx][1] = rgb[tile_idx][2] = 0.0f;
-                    rgb[tile_idx][color] = (float)raw_buffer_.image[raw_idx][color] / 65535.0f;
+                    rgb[tile_idx][color] = (float)raw_buffer_.image[raw_idx][color] / (float)maximum_value_;
                 }
             }
         }
@@ -1724,7 +1899,7 @@ private:
             const float kappa = 24389.0f / 27.0f;
             
             for (int i = 0; i < 0x14000; i++) {
-                double r = i / 65535.0;
+                double r = i / (double)maximum_value_;
                 cbrt_lut[i] = r > eps ? std::cbrt(r) : (kappa * r + 16.0) / 116.0;
             }
             lut_initialized = true;
@@ -1780,7 +1955,7 @@ private:
             for (int col = left + 2; col < right - 2; col++) {
                 int tile_idx = (row - top) * ts + (col - left);
                 
-                if (fcol_xtrans(row, col) != 1) { // Not green pixel
+                if (fcol_xtrans_(row, col) != 1) { // Not green pixel
                     float sum = 0.0f;
                     int count = 0;
                     
@@ -1789,7 +1964,7 @@ private:
                         for (int dc = -2; dc <= 2; dc++) {
                             int nr = row + dr, nc = col + dc;
                             if (nr >= 0 && nr < (int)height_ && nc >= 0 && nc < (int)width_) {
-                                if (fcol_xtrans(nr, nc) == 1) {
+                                if (fcol_xtrans_(nr, nc) == 1) {
                                     int n_tile_idx = (nr - top) * ts + (nc - left);
                                     if (n_tile_idx >= 0 && n_tile_idx < ts * ts) {
                                         sum += rgb[n_tile_idx][1];
@@ -1813,7 +1988,7 @@ private:
         for (int row = top + 2; row < bottom - 2; row++) {
             for (int col = left + 2; col < right - 2; col++) {
                 int tile_idx = (row - top) * ts + (col - left);
-                int color = fcol_xtrans(row, col);
+                int color = fcol_xtrans_(row, col);
                 
                 // Interpolate missing color channels using LAB guidance
                 for (int c = 0; c < 3; c++) {
@@ -1891,10 +2066,10 @@ private:
                 int out_idx = row * width_ + col;
                 
                 // Simple copy without blending - RawTherapee approach
-                rgb_buffer_.image[out_idx][0] = CLIP((int)(rgb[tile_idx][0] * 65535.0f + 0.5f));
-                rgb_buffer_.image[out_idx][1] = CLIP((int)(rgb[tile_idx][1] * 65535.0f + 0.5f));
-                rgb_buffer_.image[out_idx][2] = CLIP((int)(rgb[tile_idx][2] * 65535.0f + 0.5f));
-                rgb_buffer_.image[out_idx][3] = rgb_buffer_.image[out_idx][1]; // G2 = G1
+                rgb_buffer_.image[out_idx][0] = rgb[tile_idx][0];
+                rgb_buffer_.image[out_idx][1] = rgb[tile_idx][1];
+                rgb_buffer_.image[out_idx][2] = rgb[tile_idx][2];
+                // ImageBufferFloat has only 3 channels (RGB), no need for G2
             }
         }
     }
@@ -1902,71 +2077,75 @@ private:
 
 } // anonymous namespace
 
-bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageBuffer& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4]) {
-#ifdef __APPLE__
+bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+
     if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         return false;
     }
     
-    XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix);
+    XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
     processor.run_3pass();
     return true;
-#else
-    return false;
-#endif
 }
 
-bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBuffer& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4]) {
-#ifdef __APPLE__
+bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+
     if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         return false;
     }
     
-    XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix);
+    XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
     processor.run_1pass();
     return true;
-#else
-    return false;
-#endif
 }
 
 
-bool CPUAccelerator::apply_white_balance(const ImageBufferFloat32& rgb_input,
-                                            ImageBufferFloat32& rgb_output,
-                                            const float wb_multipliers[4]) {
-#if defined(__aarch64__) && defined(__ARM_NEON)
-    if (!initialized_ || !rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
+bool CPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
+                                        ImageBufferFloat& rgb_output,
+                                        const float wb_multipliers[4]) {
+
+    if (!initialized_) return false;
+
+    // 引数チェック
+    if (!rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
         std::cerr << "❌ Invalid or mismatched buffers for white balance" << std::endl;
         return false;
     }
-    std::cout << "🎯 White Balance (Accelerate/vDSP): multipliers [R=" << wb_multipliers[0] 
-              << ", G=" << wb_multipliers[1] << ", B=" << wb_multipliers[2] << "]" << std::endl;
-    
+
     const vDSP_Length pixel_count = rgb_input.width * rgb_input.height;
-    
-    if (rgb_input.data != rgb_output.data) {
-        std::memcpy(rgb_output.data, rgb_input.data, pixel_count * 3 * sizeof(float));
+
+    // バッファが違ったらコピー
+    if (rgb_input.image != rgb_output.image) {
+        std::memcpy(rgb_output.image, rgb_input.image, pixel_count * 3 * sizeof(float));
     }
     
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    std::cout << "🎯 White Balance (Accelerate/vDSP): multipliers [R=" << wb_multipliers[0] 
+              << ", G=" << wb_multipliers[1] << ", B=" << wb_multipliers[2] << "]" << std::endl;
+        
     // ✨ vDSP を使った超高速ホワイトバランス適用
-    vDSP_vsmul(rgb_output.data + 0, 3, &wb_multipliers[0], rgb_output.data + 0, 3, pixel_count);
-    vDSP_vsmul(rgb_output.data + 1, 3, &wb_multipliers[1], rgb_output.data + 1, 3, pixel_count);
-    vDSP_vsmul(rgb_output.data + 2, 3, &wb_multipliers[2], rgb_output.data + 2, 3, pixel_count);
+    float* data = &rgb_output.image[0][0]; // 連続メモリアクセス用
+    vDSP_vsmul(data + 0, 3, &wb_multipliers[0], data + 0, 3, pixel_count);
+    vDSP_vsmul(data + 1, 3, &wb_multipliers[1], data + 1, 3, pixel_count);
+    vDSP_vsmul(data + 2, 3, &wb_multipliers[2], data + 2, 3, pixel_count);
 
-    float zero = 0.0f, one = 1.0f;
-    vDSP_vclip(rgb_output.data, 1, &zero, &one, rgb_output.data, 1, pixel_count * 3);
+    // ✨ vDSP を使ったクリッピング（0.0-1.0 範囲に制限）
+    //float zero = 0.0f, one = 1.0f;
+    //vDSP_vclip(data, 1, &zero, &one, data, 1, pixel_count * 3);
     
     std::cout << "✅ White balance applied successfully using vDSP" << std::endl;
     return true;
 #else
     // Apple Silicon 以外のためのフォールバック実装
-    // (省略) ...
     return false;
 #endif
 }
 
-bool CPUAccelerator::convert_color_space(const ImageBufferFloat32& rgb_input, ImageBufferFloat32& rgb_output, const float transform[3][4]) {
+bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, const float transform[3][4]) {
+
     if (!initialized_) return false;
+
+    // 引数チェック
     if (!rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
         std::cerr << "❌ Invalid or mismatched buffers for color space conversion" << std::endl;
         return false;
@@ -1974,8 +2153,8 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat32& rgb_input, Im
     std::cout << "🎯 Camera matrix-based color space conversion" << std::endl;
     const size_t pixel_count = rgb_input.width * rgb_input.height;
     for (size_t i = 0; i < pixel_count; i++) {
-        const float* in = &rgb_input.data[i * 3];
-        float* out = &rgb_output.data[i * 3];
+        const float* in = rgb_input.image[i];
+        float* out = rgb_output.image[i];
         out[0] = fmaxf(0.0f, fminf(1.0f, transform[0][0] * in[0] + transform[0][1] * in[1] + transform[0][2] * in[2] + transform[0][3]));
         out[1] = fmaxf(0.0f, fminf(1.0f, transform[1][0] * in[0] + transform[1][1] * in[1] + transform[1][2] * in[2] + transform[1][3]));
         out[2] = fmaxf(0.0f, fminf(1.0f, transform[2][0] * in[0] + transform[2][1] * in[1] + transform[2][2] * in[2] + transform[2][3]));
@@ -1984,46 +2163,46 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat32& rgb_input, Im
     return true;
 }
 
-bool CPUAccelerator::gamma_correct(const ImageBufferFloat32& rgb_input, ImageBufferFloat32& rgb_output, float gamma_power, float gamma_slope, int output_color_space) {
-#ifdef __APPLE__
+bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, float gamma_power, float gamma_slope, int output_color_space) {
+
     if (!initialized_) return false;
+
+    // 引数チェック
     if (!rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
         std::cerr << "❌ Invalid or mismatched buffers for gamma correction" << std::endl;
         return false;
     }
-    if (output_color_space == 0 || output_color_space == 5) {
+
+    // バッファが違ったらコピー
+    if (rgb_input.image != rgb_output.image) {
+        std::memcpy(rgb_output.image, rgb_input.image, rgb_input.width * rgb_input.height * 3 * sizeof(float));
+    }
+
+    if (output_color_space == (int)ColorSpace::Raw || output_color_space == (int)ColorSpace::XYZ) {
         std::cout << "🔄 Gamma correction skipped for linear color space " << output_color_space << " (Raw/XYZ)" << std::endl;
-        if (rgb_input.data != rgb_output.data) {
-            std::memcpy(rgb_output.data, rgb_input.data, rgb_input.width * rgb_input.height * 3 * sizeof(float));
-        }
         return true;
     }
+
     std::cout << "🎯 Gamma Correction: color_space=" << output_color_space << ", γ=" << gamma_power << ", slope=" << gamma_slope << std::endl;
-    if (rgb_input.data != rgb_output.data) {
-        std::memcpy(rgb_output.data, rgb_input.data, rgb_input.width * rgb_input.height * 3 * sizeof(float));
-    }
     for (size_t i = 0; i < rgb_input.width * rgb_input.height; i++) {
-        float* pixel = &rgb_output.data[i * 3];
+        float* pixel = rgb_output.image[i];
         for (int c = 0; c < 3; c++) {
             float linear_value = pixel[c], gamma_corrected;
             switch (output_color_space) {
-                case 1: case 7: gamma_corrected = apply_srgb_gamma_encode(linear_value); break;
-                case 2: case 3: gamma_corrected = apply_pure_power_gamma_encode(linear_value, 2.2f); break;
-                case 4:         gamma_corrected = apply_pure_power_gamma_encode(linear_value, 1.8f); break;
-                case 6:         gamma_corrected = apply_aces_gamma_encode(linear_value); break;
-                case 8:         gamma_corrected = apply_rec2020_gamma_encode(linear_value); break;
-                default:
-                    gamma_corrected = (linear_value < 1.0f / gamma_slope) ? linear_value * gamma_slope : std::pow(linear_value, 1.0f / gamma_power);
-                    break;
+            case 1: case 7: gamma_corrected = apply_srgb_gamma_encode(linear_value); break;
+            case 2: case 3: gamma_corrected = apply_pure_power_gamma_encode(linear_value, 2.2f); break;
+            case 4:         gamma_corrected = apply_pure_power_gamma_encode(linear_value, 1.8f); break;
+            case 6:         gamma_corrected = apply_aces_gamma_encode(linear_value); break;
+            case 8:         gamma_corrected = apply_rec2020_gamma_encode(linear_value); break;
+            default:
+                gamma_corrected = (linear_value < 1.0f / gamma_slope) ? linear_value * gamma_slope : std::pow(linear_value, 1.0f / gamma_power);
+                break;
             }
-            pixel[c] = std::max(0.0f, std::min(1.0f, gamma_corrected));
+            pixel[c] = gamma_corrected;
         }
     }
     std::cout << "✅ Gamma correction applied successfully" << std::endl;
     return true;
-#else
-    return false;
-#endif
 }
 
 double CPUAccelerator::get_last_processing_time() const { return last_processing_time_; }
@@ -2064,10 +2243,10 @@ float CPUAccelerator::apply_aces_gamma_encode(float v) const {
 }
 
 
-void CPUAccelerator::border_interpolate(const ImageBuffer& raw_buffer, uint32_t filters, int border_int) {
-    const size_t width = raw_buffer.width, height = raw_buffer.height;
+void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint32_t filters, int border_int) {
+    const size_t width = rgb_buffer.width, height = rgb_buffer.height;
     const int border = border_int;
-    uint16_t (*image)[4] = raw_buffer.image;
+    float (*image)[3] = rgb_buffer.image;
     std::cout << "🔧 LibRaw-exact border interpolation: border=" << border << " pixels" << std::endl;
     
     // ✨LibRaw完全移植✨: 元のLibRaw border_interpolate を正確に再現
@@ -2080,7 +2259,7 @@ void CPUAccelerator::border_interpolate(const ImageBuffer& raw_buffer, uint32_t 
             }
             
             // sum配列: [R, G, B, G2, R_count, G_count, B_count, G2_count]
-            unsigned sum[8] = {0};
+            float sum[8] = {0};
             
             // 3x3近傍を走査（LibRaw方式）
             for (size_t y = (row > 0) ? row - 1 : 0; y < row + 2 && y < height; y++) {
@@ -2098,7 +2277,7 @@ void CPUAccelerator::border_interpolate(const ImageBuffer& raw_buffer, uint32_t 
             int f = fcol_bayer(row, col, filters);
             
             // 非ネイティブ色のみを補間（LibRaw方式）
-            for (int c = 0; c < 4; c++) {
+            for (int c = 0; c < 3; c++) {
                 if (c != f && sum[c + 4] > 0) {
                     image[row * width + col][c] = sum[c] / sum[c + 4];
                 }

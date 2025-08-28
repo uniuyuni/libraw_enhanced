@@ -47,18 +47,18 @@ if _CORE_AVAILABLE:
     try:
         CPUAccelerator = _core.CPUAccelerator
         Accelerator = _core.Accelerator
-        ImageBufferFloat32 = _core.ImageBufferFloat32
+        ImageBufferFloat = _core.ImageBufferFloat
         ProcessingParams = _core.ProcessingParams
     except AttributeError:
         # These classes might not be available in all builds
         CPUAccelerator = None
         Accelerator = None
-        ImageBufferFloat32 = None
+        ImageBufferFloat = None
         ProcessingParams = None
 else:
     CPUAccelerator = None
     Accelerator = None
-    ImageBufferFloat32 = None
+    ImageBufferFloat = None
     ProcessingParams = None
 
 # Constants and enums
@@ -118,7 +118,7 @@ def get_platform_info():
             build_info = _core.get_build_info()
             info.update(build_info)
             
-            info["metal_available"] = _core.is_metal_available()
+            info["metal_available"] = _core.is_gpu_available()
             info["apple_silicon"] = _core.is_apple_silicon()
             
             if info["metal_available"]:
@@ -141,15 +141,20 @@ def is_apple_silicon():
     import platform
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
-def is_metal_available():
+def is_gpu_available():
     """Metal加速の可用性チェック"""
     if _CORE_AVAILABLE:
         try:
-            return _core.is_metal_available()
+            return _core.is_gpu_available()
         except AttributeError:
             pass
     
     return False
+
+# Backward compatibility
+def is_metal_available():
+    """Metal加速の可用性チェック (is_gpu_availableの別名)"""
+    return is_gpu_available()
 
 def get_version_info():
     """バージョン情報の取得"""
@@ -176,12 +181,13 @@ __all__ = [
     # Core classes (low-level API)
     "CPUAccelerator",
     "Accelerator", 
-    "ImageBufferFloat32",
+    "ImageBufferFloat",
     "ProcessingParams",
     
     # Platform detection  
     "is_apple_silicon",
-    "is_metal_available", 
+    "is_gpu_available",
+    "is_metal_available",  # Backward compatibility 
     "get_platform_info",
     "get_version_info",
     
@@ -220,7 +226,7 @@ def _initialize_package():
         return
     
     # Apple Silicon特有の最適化情報
-    if is_apple_silicon() and is_metal_available():
+    if is_apple_silicon() and is_gpu_available():
         # デバッグモード以外では非表示
         import os
         if os.environ.get("LIBRAW_ENHANCED_DEBUG"):

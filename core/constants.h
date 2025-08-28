@@ -43,41 +43,5 @@ enum class ColorSpace : int {
 };
 
 
-// Human-readable algorithm names
-inline const char* get_algorithm_name(DemosaicAlgorithm algo) {
-    switch (algo) {
-        case DemosaicAlgorithm::Linear: return "Linear";
-        case DemosaicAlgorithm::VNG: return "VNG";
-        case DemosaicAlgorithm::PPG: return "PPG";
-        case DemosaicAlgorithm::AHD: return "AHD";
-        case DemosaicAlgorithm::DCB: return "DCB";
-        case DemosaicAlgorithm::ModifiedAHD: return "ModifiedAHD";
-        case DemosaicAlgorithm::AFD: return "AFD";
-        case DemosaicAlgorithm::VCD: return "VCD";
-        case DemosaicAlgorithm::MixedVCDModifiedAHD: return "MixedVCDModifiedAHD";
-        case DemosaicAlgorithm::LMMSE: return "LMMSE";
-        case DemosaicAlgorithm::AMaZE: return "AMaZE";
-        case DemosaicAlgorithm::DHT: return "DHT";
-        case DemosaicAlgorithm::AAHD: return "AAHD";
-        case DemosaicAlgorithm::Adaptive: return "Adaptive";
-        case DemosaicAlgorithm::MLEnhanced: return "MLEnhanced";
-        default: return "Unknown";
-    }
-}
-
-inline const char* get_colorspace_name(ColorSpace cs) {
-    switch (cs) {
-        case ColorSpace::Raw: return "Raw";
-        case ColorSpace::sRGB: return "sRGB";
-        case ColorSpace::AdobeRGB: return "AdobeRGB";
-        case ColorSpace::WideGamutRGB: return "WideGamutRGB";
-        case ColorSpace::ProPhotoRGB: return "ProPhotoRGB";
-        case ColorSpace::XYZ: return "XYZ";
-        case ColorSpace::ACES: return "ACES";
-        case ColorSpace::P3D65: return "P3D65";
-        case ColorSpace::Rec2020: return "Rec2020";
-        default: return "Unknown";
-    }
-}
 
 } // namespace libraw_enhanced

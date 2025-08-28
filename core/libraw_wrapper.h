@@ -111,8 +111,8 @@ public:
 #ifdef METAL_ACCELERATION_AVAILABLE
     // Metal関連メソッド（実装はlibraw_wrapper.cppで定義）
     void set_processing_params(const ProcessingParams& params);
-    void enable_metal_acceleration(bool enable);
-    bool is_metal_available() const;
+    void enable_gpu_acceleration(bool enable);
+    bool is_gpu_available() const;
     std::string get_metal_device_info() const;
     
     // REMOVED: void enable_custom_pipeline(bool enable); - unused custom pipeline feature
@@ -184,7 +184,7 @@ ProcessingParams create_params_from_rawpy_args(
 
 // Platform detection functions
 bool is_apple_silicon();
-bool is_metal_available();
+// REMOVED: bool is_gpu_available(); - use LibRawWrapper::is_gpu_available() instead
 std::vector<std::string> get_metal_device_list();
 
 #endif

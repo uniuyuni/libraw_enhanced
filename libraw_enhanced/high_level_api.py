@@ -170,6 +170,7 @@ class RawImage:
                    
                    # LibRaw Enhanced extensions
                    metal_acceleration: bool = True,
+                   use_gpu_acceleration: Optional[bool] = None,
                    custom_pipeline = None) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
@@ -231,6 +232,7 @@ class RawImage:
             
             # LibRaw Enhanced extensions
             metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
+            use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
             custom_pipeline: Custom processing pipeline (future)
             
         Returns:
@@ -244,6 +246,9 @@ class RawImage:
         
         # Build processing parameters from all rawpy-compatible parameters
         from .constants import DemosaicAlgorithm
+        
+        # Handle GPU acceleration parameters (allow use_gpu_acceleration to override)
+        gpu_acceleration = use_gpu_acceleration if use_gpu_acceleration is not None else metal_acceleration
         
         # Create parameters structure (assuming it will be passed to C++ layer)
         params = {
@@ -301,7 +306,8 @@ class RawImage:
             'bad_pixels_path': bad_pixels_path if bad_pixels_path is not None else '',
             
             # LibRaw Enhanced extensions
-            'metal_acceleration': metal_acceleration,
+            'metal_acceleration': gpu_acceleration,
+            'use_gpu_acceleration': gpu_acceleration,
         }
         
         # Handle custom pipeline 
@@ -482,12 +488,12 @@ class RawImage:
         Returns:
             dict: 最適化機能の利用可能性
         """
-        from . import is_metal_available
+        from . import is_gpu_available
         
         return {
-            'metal_available': is_metal_available(),
+            'metal_available': is_gpu_available(),
             'accelerate_available': True,  # Accelerate framework is always available on macOS
-            'apple_silicon': is_metal_available(),
+            'apple_silicon': is_gpu_available(),
         }
     
     def __repr__(self):
