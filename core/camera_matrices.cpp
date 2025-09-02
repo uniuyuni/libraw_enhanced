@@ -83,12 +83,52 @@ public:
                         cam_xyz_double[i][j] = (double)libraw_instance.imgdata.color.cam_xyz[i][j];
                     }
                 }
-                
+
+/*
+                // transform white point
+                static constexpr double transform_wp_from_d65[][3][3] = {
+                    {
+                        {1.0, 0.0, 0.0},
+                        {0.0, 1.0, 0.0},
+                        {0.0, 0.0, 1.0}
+                    },                
+                    // D65 to D50 (Bradford変換)
+                    {
+                        {1.0478112, 0.0228866, -0.0501270},
+                        {0.0295424, 0.9904844, -0.0170491},
+                        {-0.0092345, 0.0150436, 0.7521316}
+                    },
+                    // D65 to D60 (Bradford変換)
+                    {
+                        {1.0130340, 0.0061053, -0.0149710},
+                        {0.0076983, 0.9981650, -0.0050320},
+                        {-0.0028413, 0.0046851, 0.9245070}
+                    },
+                };
+                static constexpr int color_space_wp[] = {
+                    0, 0, 0, 1, 1, 0, 2, 0, 0,
+                };
+                if (output_color_space < 9) {
+                    int tn = color_space_wp[output_color_space];
+
+                    double temp[4][3];
+                    memcpy(temp, cam_xyz_double, sizeof(temp));
+                    
+                    for (int i = 0; i < 4; i++) {
+                        for (int j = 0; j < 3; j++) {
+                            cam_xyz_double[i][j] = 0;
+                            for (int k = 0; k < 3; k++) {
+                                cam_xyz_double[i][j] += temp[i][k] * transform_wp_from_d65[tn][k][j];
+                            }
+                        }
+                    }
+                }
+*/                
                 // Now use LibRaw's cam_xyz_coeff to compute rgb_cam properly
                 // This is the correct LibRaw pipeline that handles color science properly
                 cam_xyz_coeff(result.transform, cam_xyz_double, 3);
                 
-                // Apply output color space conversion if not sRGB
+                // Apply output color space conversion if not raw
                 if (output_color_space != 1) {
                     apply_output_colorspace_transform(result.transform, output_color_space);
                 }
@@ -156,7 +196,7 @@ private:
         double cam_rgb[4][3], inverse[4][3], num;
         int i, j, k;
 
-        // Multiply out XYZ colorspace  
+        // Multiply out XYZ colorspace         
         for (i = 0; i < colors && i < 4; i++) {
             for (j = 0; j < 3; j++) {
                 cam_rgb[i][j] = 0.0;

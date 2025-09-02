@@ -1,4 +1,6 @@
+
 #include "libraw_wrapper.h"
+#include "constants.h"
 #include <iostream>
 #include <memory>
 #include <chrono>
@@ -44,7 +46,9 @@ public:
     ushort* custom_rgb_buffer = nullptr;  // Custom RGB buffer for GPU processing
 #endif
 
+    //===============================================================
     // 高精度タイマーユーティリティ
+    //===============================================================
     std::chrono::high_resolution_clock::time_point timer_start;
     
     void start_timer() {
@@ -57,7 +61,9 @@ public:
         return duration.count() / 1000000.0;  // 秒単位で返す
     }
     
+    //===============================================================
     // LibRaw-compatible black level correction (internal function)
+    //===============================================================
     void apply_black_level_correction(ImageBuffer& raw_buffer) {
         std::cout << "📋 Apply black level subtraction: " << processor.imgdata.color.black << std::endl;
         
@@ -135,7 +141,9 @@ public:
         std::cout << "✅ Black level subtraction completed for " << total_pixels << " pixels" << std::endl;
     }
 
+    //===============================================================
     // LibRaw-compatible green matching (internal function)
+    //===============================================================
     void apply_green_matching(ImageBuffer& raw_buffer, uint32_t filters) {
         std::cout << "📋 Apply green matching for G1/G2 equilibration" << std::endl;
         
@@ -219,7 +227,125 @@ public:
         std::cout << "✅ Green matching completed: processed " << processed_pixels << " G2 pixels" << std::endl;
     }
 
+    //===============================================================
+    // CFA-aware white balance (experimental pre-demosaic implementation)
+    //===============================================================
+    enum class CFAType { BAYER, XTRANS };
+    
+    // Main CFA-aware white balance function
+    void apply_white_balance_to_cfa_data(
+        ImageBuffer& raw_buffer, 
+        const float wb_multipliers[4], 
+        uint32_t filters,
+        const char xtrans[6][6],
+        CFAType cfa_type,
+        float sensor_maximum
+    ) {
+        std::cout << "🧪 EXPERIMENTAL: Applying CFA-aware white balance (pre-demosaic)" << std::endl;
+        std::cout << "   - CFA Type: " << (cfa_type == CFAType::BAYER ? "Bayer" : "X-Trans") << std::endl;
+        std::cout << "   - Sensor Maximum: " << sensor_maximum << std::endl;
+        std::cout << "   - WB Multipliers: [" << wb_multipliers[0] << ", " << wb_multipliers[1] 
+                  << ", " << wb_multipliers[2] << ", " << wb_multipliers[3] << "]" << std::endl;
+        
+        if (cfa_type == CFAType::BAYER) {
+            apply_wb_bayer(raw_buffer, wb_multipliers, filters, sensor_maximum);
+        } else {
+            apply_wb_xtrans(raw_buffer, wb_multipliers, xtrans, sensor_maximum);
+        }
+        
+        std::cout << "✅ CFA-aware white balance completed" << std::endl;
+    }
+    
+    // Bayer CFA white balance implementation
+    void apply_wb_bayer(
+        ImageBuffer& raw_buffer,
+        const float wb_multipliers[4],
+        uint32_t filters,
+        float sensor_maximum
+    ) {
+        std::cout << "🔧 Applying Bayer CFA white balance..." << std::endl;
+        
+        const size_t total_pixels = raw_buffer.width * raw_buffer.height;
+        size_t processed_pixels = 0;
+        
+        // Process each pixel in the raw buffer
+        for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
+            int row = pixel_idx / raw_buffer.width;
+            int col = pixel_idx % raw_buffer.width;
+            
+            // Get color channel for this pixel position using LibRaw's fcol logic
+            int color_channel = (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
+            
+            // Apply white balance multiplier to the native color channel
+            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
+            if (original_value > 0) {  // Skip black pixels
+                float adjusted_value = original_value * wb_multipliers[color_channel];
+                
+                // Clamp to sensor maximum
+                if (adjusted_value > sensor_maximum) {
+                    adjusted_value = sensor_maximum;
+                }
+                
+                raw_buffer.image[pixel_idx][color_channel] = static_cast<uint16_t>(adjusted_value);
+                
+                // Special handling for G2 channel (channel 3) - copy to G1 if it's G2 pixel
+                if (color_channel == 3) {
+                    // This is a G2 pixel, also update the G1 channel for averaging
+                    float g1_adjusted = original_value * wb_multipliers[1];  // Use G1 multiplier
+                    if (g1_adjusted > sensor_maximum) {
+                        g1_adjusted = sensor_maximum;
+                    }
+                    raw_buffer.image[pixel_idx][1] = static_cast<uint16_t>(g1_adjusted);
+                }
+                
+                processed_pixels++;
+            }
+        }
+        
+        std::cout << "✅ Bayer WB processed " << processed_pixels << " pixels" << std::endl;
+    }
+    
+    // X-Trans CFA white balance implementation
+    void apply_wb_xtrans(
+        ImageBuffer& raw_buffer,
+        const float wb_multipliers[4],
+        const char xtrans[6][6],
+        float sensor_maximum
+    ) {
+        std::cout << "🔧 Applying X-Trans CFA white balance..." << std::endl;
+        
+        const size_t total_pixels = raw_buffer.width * raw_buffer.height;
+        size_t processed_pixels = 0;
+        
+        // Process each pixel in the raw buffer
+        for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
+            int row = pixel_idx / raw_buffer.width;
+            int col = pixel_idx % raw_buffer.width;
+            
+            // Get color channel using X-Trans pattern
+            int color_channel = xtrans[row % 6][col % 6];
+            
+            // Apply white balance multiplier to the native color channel
+            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
+            if (original_value > 0) {  // Skip black pixels
+                float adjusted_value = original_value * wb_multipliers[color_channel];
+                
+                // Clamp to sensor maximum
+                if (adjusted_value > sensor_maximum) {
+                    adjusted_value = sensor_maximum;
+                }
+                
+                raw_buffer.image[pixel_idx][color_channel] = static_cast<uint16_t>(adjusted_value);
+                processed_pixels++;
+            }
+        }
+        
+        std::cout << "✅ X-Trans WB processed " << processed_pixels << " pixels" << std::endl;
+    }
+
+    //===============================================================
     // LibRaw-compatible adjust_maximum implementation
+    //===============================================================
     void adjust_maximum(const ImageBuffer& raw_buffer, float threshold) {
         std::cout << "📋 Apply adjust_maximum for dynamic maximum value adjustment (threshold: " << threshold << ")" << std::endl;
         
@@ -277,7 +403,9 @@ public:
         }
     }
 
-    // Main RAW to RGB processing pipeline (unified float32 processing)
+    //===============================================================
+    // Main RAW to RGB processing pipeline
+    //===============================================================
     bool process_raw_to_rgb(ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const ProcessingParams& params) {
         std::cout << "🎯 Starting unified RAW→RGB processing pipeline" << std::endl;
         std::cout << "📋 Parameters: demosaic=" << params.demosaic_algorithm << std::endl;
@@ -302,28 +430,6 @@ public:
         char (&xtrans)[6][6] = processor.imgdata.idata.xtrans;        
         std::cout << "🔍 Filters value: " << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
 
-        // XTransパターンの詳細表示（XTransセンサーの場合のみ）
-        if (filters == FILTERS_XTRANS) {
-            std::cout << "🔍 XTrans Pattern from LibRaw:" << std::endl;
-            for (int i = 0; i < 6; i++) {
-                std::cout << "   Row " << i << ": ";
-                for (int j = 0; j < 6; j++) {
-                    std::cout << static_cast<int>(xtrans[i][j]) << " ";
-                }
-                std::cout << std::endl;
-            }
-            
-            // get_xtrans_color関数のテスト
-            std::cout << "🔍 get_xtrans_color function test:" << std::endl;
-            for (int i = 0; i < 6; i++) {
-                std::cout << "   Row " << i << ": ";
-                for (int j = 0; j < 6; j++) {
-                    int color = get_xtrans_color(i, j);
-                    std::cout << color << " ";
-                }
-                std::cout << std::endl;
-            }
-        }
         /*
         if (filters > 0xff) {
             for (uint32_t row = 0; row < raw_buffer.height; ++row) {
@@ -347,6 +453,47 @@ public:
         // Apply green matching for Bayer sensors (after black level, before demosaic)
         apply_green_matching(raw_buffer, filters);
 
+        // EXPERIMENTAL: Apply CFA-aware white balance before demosaic
+        std::cout << "🧪 EXPERIMENTAL: Applying pre-demosaic white balance..." << std::endl;
+        
+        // Calculate white balance multipliers (same logic as original)
+        float effective_wb[4];
+        if (params.use_camera_wb && processor.imgdata.color.cam_mul[1] > 0) {
+            float dmin = *std::min_element(std::begin(processor.imgdata.color.cam_mul), std::end(processor.imgdata.color.cam_mul) - 1);
+            effective_wb[0] = processor.imgdata.color.cam_mul[0] / dmin;
+            effective_wb[1] = processor.imgdata.color.cam_mul[1] / dmin;
+            effective_wb[2] = processor.imgdata.color.cam_mul[2] / dmin;
+            effective_wb[3] = processor.imgdata.color.cam_mul[3] / dmin;
+            std::cout << "📷 Using camera WB from EXIF (max-normalized cam_mul):" << std::endl;
+        } else if (params.use_auto_wb && processor.imgdata.color.pre_mul[1] > 0) {
+            float dmin = *std::min_element(std::begin(processor.imgdata.color.pre_mul), std::end(processor.imgdata.color.pre_mul) - 1);
+            effective_wb[0] = processor.imgdata.color.pre_mul[0] / dmin;
+            effective_wb[1] = processor.imgdata.color.pre_mul[1] / dmin;
+            effective_wb[2] = processor.imgdata.color.pre_mul[2] / dmin;
+            effective_wb[3] = processor.imgdata.color.pre_mul[3] / dmin;
+            std::cout << "📷 Using computed WB from LibRaw (max-normalized pre_mul):" << std::endl;
+        } else {
+            // Use user-specified white balance or default
+            effective_wb[0] = params.user_wb[0];
+            effective_wb[1] = params.user_wb[1];
+            effective_wb[2] = params.user_wb[2];
+            effective_wb[3] = params.user_wb[3];
+            std::cout << "👤 Using user/default WB:" << std::endl;
+        }
+        
+        // Determine CFA type and apply appropriate WB processing
+        CFAType cfa_type = (filters == FILTERS_XTRANS) ? CFAType::XTRANS : CFAType::BAYER;
+        float sensor_max = static_cast<float>(processor.imgdata.color.maximum);
+        
+        apply_white_balance_to_cfa_data(
+            raw_buffer, 
+            effective_wb, 
+            filters, 
+            xtrans, 
+            cfa_type, 
+            sensor_max
+        );
+
         // Step 2: Apply pre-interpolation processing
         std::cout << "🔧 Applying pre-interpolation processing..." << std::endl;
         bool pre_success = accelerator->pre_interpolate(raw_buffer, filters, xtrans, params.half_size);
@@ -362,20 +509,12 @@ public:
         std::cout << "📷 Camera: " << camera_make << " " << camera_model << std::endl;
         
         // Get camera-specific color transformation matrix
-        ColorTransformMatrix camera_matrix = compute_camera_transform(camera_make, camera_model, 0);
+        ColorTransformMatrix camera_matrix = compute_camera_transform(camera_make, camera_model, (int)ColorSpace::XYZ);
         if(!camera_matrix.valid) {
             std::cout << "⚠️ Camera not in database, using fallback matrix" << std::endl;
             // Use fallback identity-like matrix for unknown cameras
             camera_matrix.set_default();
         }
-        /*
-        // Step 4: Create ImageBufferFloat for demosaic output
-        ImageBufferFloat rgb_float;
-        rgb_float.width = raw_buffer.width;
-        rgb_float.height = raw_buffer.height;
-        rgb_float.channels = 3;
-        rgb_float.image = new float[demosaic_output.width * demosaic_output.height][3];
-        */
 
         // Step 5: Demosaic processing (unified CPU/GPU selection via accelerator)
         // Phase 5: Pass LibRaw cam_mul for dynamic initialGain calculation and maximum_value for precise normalization
@@ -387,7 +526,9 @@ public:
         }
 
 
+        // EXPERIMENTAL: White balance moved to pre-demosaic (COMMENTED OUT)
         // Step 6: Apply white balance to RAW data (float32 interface)        
+/*        
         float effective_wb[4];
         if (params.use_camera_wb && processor.imgdata.color.cam_mul[1] > 0) {
             float dmin = *std::min_element(std::begin(processor.imgdata.color.cam_mul), std::end(processor.imgdata.color.cam_mul) - 1);
@@ -420,6 +561,7 @@ public:
             // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
+*/        
 
         // Get camera-specific color transformation matrix
         camera_matrix = compute_camera_transform(camera_make, camera_model, params.output_color_space);        
@@ -469,7 +611,9 @@ public:
         return true;
     }
 
+    //===============================================================
     // LibRaw raw2image_ex equivalent implementation (excluding subtract_black)
+    //===============================================================
     int convert_raw_to_image() {
         std::cout << "🔧 Converting raw data to image..." << std::endl;
         

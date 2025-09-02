@@ -13,8 +13,7 @@
 
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
-// ✨ NEONヘッダーのインクルード条件を __ARM_NEON のみに変更
-#if defined(__aarch64__) && defined(__ARM_NEON)
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 #endif
@@ -548,9 +547,9 @@ void AAHD_Processor::combine_image() {
             size_t img_off = i * raw_buffer_.width + j;
             int d = (ndir[moff] & VER) ? 1 : 0;
             
-            rgb_buffer_.image[img_off][0] = (float)rgb_ahd[d][moff][0] / (float)maximum_value_;
-            rgb_buffer_.image[img_off][1] = (float)rgb_ahd[d][moff][1] / (float)maximum_value_;
-            rgb_buffer_.image[img_off][2] = (float)rgb_ahd[d][moff][2] / (float)maximum_value_;
+            rgb_buffer_.image[img_off][0] = (float)rgb_ahd[d][moff][0] / maximum_value_;
+            rgb_buffer_.image[img_off][1] = (float)rgb_ahd[d][moff][1] / maximum_value_;
+            rgb_buffer_.image[img_off][2] = (float)rgb_ahd[d][moff][2] / maximum_value_;
         }
     }
     std::cout << "✅ AAHD processing completed" << std::endl;
@@ -1140,7 +1139,7 @@ public:
                 int ccmax = (right > (int)width_) ? (int)width_ - left : cc1;
 
                 // === Tile Initialization with 16-pixel border ===
-                const float scale = 1.0f / (float)maximum_value_;
+                const float scale = 1.0f / maximum_value_;
                 
                 // Fill upper border
                 if (rrmin > 0) {
@@ -1568,65 +1567,1003 @@ bool CPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
 // XTrans Demosaicing - RawTherapee Complete Port
 //===================================================================
 
-namespace { // このファイル内でのみ使用
+namespace {
+
+//#define LIM(x, mn, mx) std::max((mn), std::min((mx), (x)))
+#define CLIP(x) (x)
+#define RGB_BUFFER(r, c, f) rgb_buffer_.image[(r) * width_ + (c)][f]
 
 class XTrans_Processor {
 private:
-    const ImageBuffer& raw_buffer_;
-    ImageBufferFloat& rgb_buffer_;
+    const libraw_enhanced::ImageBuffer& raw_buffer_;
+    libraw_enhanced::ImageBufferFloat& rgb_buffer_;
     const char (&xtrans_)[6][6];
     const float (&color_matrix_)[3][4];
     uint32_t width_, height_;
-    const uint16_t maximum_value_;
-    
-    // Utility functions
+    const float maximum_value_;
+
+    struct s_minmaxgreen {
+        float min;
+        float max;
+    };
+
     inline int fcol_xtrans_(int row, int col) const {
         return fcol_xtrans(row, col, xtrans_);
     }
+
+    inline int isgreen_(int row, int col) {
+        return (xtrans_[(row) % 3][(col) % 3] & 1);
+    }
+
+    inline float raw_buffer(int row, int col) const {
+        int f = fcol_xtrans_(row, col);
+        return static_cast<float>(raw_buffer_.image[row * width_ + col][f]) / maximum_value_;
+    }
+
+    inline float raw_buffer_hex(int row, int col, short hex) const {
+        int pos = row * width_ + col + hex;
+        int f = fcol_xtrans_(pos / width_, pos % width_);
+        return static_cast<float>(raw_buffer_.image[pos][f]) / maximum_value_;
+    }
     
-    inline uint16_t CLIP(int x) const {
-        if (x < 0) return 0;
-        if (x > maximum_value_) return maximum_value_;
-        return static_cast<uint16_t>(x);
+    void cielab2(const float (*rgb)[3], float* l, float* a, float* b, 
+                const int width, const int height, const int labWidth, 
+                const float xyz_cam[3][3]) 
+    {
+        static constexpr double eps = 216.0f / 24389.0f;
+        static constexpr double kappa = 24389.0f / 27.0f;
+        static constexpr int table_size = 1<<16;
+        
+        // cbrtテーブルの初期化（スレッドセーフな初期化）
+        static const std::vector<float> cbrt = [] {
+            std::vector<float> table(table_size);
+            for (int i = 0; i < table_size; ++i) {
+                double r = i / static_cast<double>(table_size - 1);
+                table[i] = static_cast<float>(r > eps ? std::cbrt(r) : (kappa * r + 16.0f) / 116.0f);
+            }
+            return table;
+        }();
+
+        if (!rgb) return; // テーブル初期化のみ実行
+
+        for (int i = 0; i < height; ++i) {
+            for (int j = 0; j < labWidth; ++j) {
+                // RGBからXYZへの変換
+                float xyz[3] = {0.0f, 0.0f, 0.0f};
+                for (int c = 0; c < 3; ++c) {
+                    float val = rgb[i * width + j][c];
+                    xyz[0] += xyz_cam[0][c] * val;
+                    xyz[1] += xyz_cam[1][c] * val;
+                    xyz[2] += xyz_cam[2][c] * val;
+                }
+
+                // XYZ値を0.0-1.0にクリップしてテーブルアクセス
+                auto clamp = [](float v) { 
+                    return std::max(0.0f, std::min(1.0f, v)); 
+                };
+                int idx0 = static_cast<int>(clamp(xyz[0]) * (table_size - 1));
+                int idx1 = static_cast<int>(clamp(xyz[1]) * (table_size - 1));
+                int idx2 = static_cast<int>(clamp(xyz[2]) * (table_size - 1));
+
+                // L*a*b*値の計算
+                const int idx = i * labWidth + j;
+                l[idx] = 116.0f * cbrt[idx1] - 16.0f;
+                a[idx] = 500.0f * (cbrt[idx0] - cbrt[idx1]);
+                b[idx] = 200.0f * (cbrt[idx1] - cbrt[idx2]);
+            }
+        }
+    }
+
+    void cielab3(const float (*rgb)[3], float* l, float* a, float* b, 
+                const int width, const int height, const int labWidth, 
+                const float xyz_cam[3][3]) 
+    {
+        static constexpr float eps = 216.0f / 24389.0f;
+        static constexpr float kappa = 24389.0f / 27.0f;
+        
+        // XYZからLabへの変換関数
+        auto xyz_to_lab = [](float x, float y, float z) -> std::tuple<float, float, float> {
+            // 値を安全な範囲にクリップ
+            auto clamp = [](float v) { return std::max(0.0f, std::min(1.0f, v)); };
+            x = clamp(x);
+            y = clamp(y);
+            z = clamp(z);
+            
+            // Lab変換
+            auto f = [](float t) -> float {
+                return t > eps ? std::cbrt(t) : (kappa * t + 16.0f) / 116.0f;
+            };
+            
+            float fx = f(x);
+            float fy = f(y);
+            float fz = f(z);
+            
+            float L = 116.0f * fy - 16.0f;
+            float a_val = 500.0f * (fx - fy);
+            float b_val = 200.0f * (fy - fz);
+            
+            return {L, a_val, b_val};
+        };
+
+        if (!rgb) return; // テーブルがないので何もしない
+
+        for (int i = 0; i < height; ++i) {
+            for (int j = 0; j < labWidth; ++j) {
+                // RGBからXYZへの変換
+                float xyz[3] = {0.0f, 0.0f, 0.0f};
+                for (int c = 0; c < 3; ++c) {
+                    float val = rgb[i * width + j][c];
+                    xyz[0] += xyz_cam[0][c] * val;
+                    xyz[1] += xyz_cam[1][c] * val;
+                    xyz[2] += xyz_cam[2][c] * val;
+                }
+
+                // XYZからLabへの直接計算
+                auto [L_val, a_val, b_val] = xyz_to_lab(xyz[0], xyz[1], xyz[2]);
+                
+                const int idx = i * labWidth + j;
+                l[idx] = L_val;
+                a[idx] = a_val;
+                b[idx] = b_val;
+            }
+        }
+    }
+    void xtrans_border_interpolate(int border)
+    {
+        const float weight[3][3] = {
+            {0.25f, 0.5f, 0.25f},
+            {0.5f,  0.f,  0.5f},
+            {0.25f, 0.5f, 0.25f}
+        };
+
+        for (int row = 0; row < (int)height_; row++) {
+            for (int col = 0; col < (int)width_; col++) {
+                if (col == border && row >= border && row < (int)height_ - border) {
+                    col = width_ - border;
+                }
+
+                float sum[6] = {0.f};
+
+                for (int y = std::max(0, row - 1), v = row == 0 ? 0 : -1; y <= std::min(row + 1, (int)height_ - 1); y++, v++) {
+                    for (int x = std::max(0, col - 1), h = col == 0 ? 0 : -1; x <= std::min(col + 1, (int)width_ - 1); x++, h++) {
+                        int f = fcol_xtrans_(y, x);
+                        sum[f] += raw_buffer(y, x) * weight[v + 1][h + 1];
+                        sum[f + 3] += weight[v + 1][h + 1];
+                    }
+                }
+
+                switch(fcol_xtrans_(row, col)) {
+                case 0:
+                    RGB_BUFFER(row, col, 0) = raw_buffer(row, col);
+                    RGB_BUFFER(row, col, 1) = (sum[1] / sum[4]);
+                    RGB_BUFFER(row, col, 2) = (sum[2] / sum[5]);
+                    break;
+
+                case 1:
+                    if(sum[3] == 0.f) { // at the 4 corner pixels it can happen, that we have only green pixels in 2x2 area
+                        RGB_BUFFER(row, col, 0) = RGB_BUFFER(row, col, 1) = RGB_BUFFER(row, col, 2) = raw_buffer(row, col);
+                    } else {
+                        RGB_BUFFER(row, col, 0) = (sum[0] / sum[3]);
+                        RGB_BUFFER(row, col, 1) = raw_buffer(row, col);
+                        RGB_BUFFER(row, col, 2) = (sum[2] / sum[5]);
+                    }
+
+                    break;
+
+                case 2:
+                    RGB_BUFFER(row, col, 0) = (sum[0] / sum[3]);
+                    RGB_BUFFER(row, col, 1) = (sum[1] / sum[4]);
+                    RGB_BUFFER(row, col, 2) = raw_buffer(row, col);
+                }
+            }
+        }
     }
 
 public:
-    XTrans_Processor(const ImageBuffer& raw, ImageBufferFloat& rgb, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t max_val)
+    XTrans_Processor(const libraw_enhanced::ImageBuffer& raw, libraw_enhanced::ImageBufferFloat& rgb, 
+                    const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t max_val)
         : raw_buffer_(raw), rgb_buffer_(rgb), xtrans_(xtrans), color_matrix_(color_matrix),
-          width_(raw.width), height_(raw.height), maximum_value_(max_val) {}
-    
-    // 3-pass high quality demosaic
+            width_(raw.width), height_(raw.height), maximum_value_((float)max_val){
+    }
+
     void run_3pass() {
-        std::cout << "🔧 Starting 3-pass XTrans demosaic (high quality)..." << std::endl;
+        std::cout << "🔧 Starting 3-pass XTrans demosaic..." << std::endl;
+
+        constexpr int ts = 114;
         
-        constexpr int ts = 114;      // Tile Size
-        
-        // Pattern arrays for 3-pass algorithm
         constexpr short orth[12] = { 1, 0, 0, 1, -1, 0, 0, -1, 1, 0, 0, 1 };
-        constexpr short patt[2][16] = { 
+        constexpr short patt[2][16] = {
             { 0, 1, 0, -1, 2, 0, -1, 0, 1, 1, 1, -1, 0, 0, 0, 0 },
             { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 }
         };
         constexpr short dir[4] = { 1, ts, ts + 1, ts - 1 };
         
-        // Calculate color transformation matrix
         float xyz_cam[3][3];
-        compute_xyz_cam_matrix(xyz_cam);
-        
-        // Find solitary green pixels position
+
+/*
+        constexpr float xyz_rgb[3][3] = {
+            { 0.412453f, 0.357580f, 0.180423f },
+            { 0.212671f, 0.715160f, 0.072169f },
+            { 0.019334f, 0.119193f, 0.950227f }
+        };
+
+        constexpr float d65_white[3] = { 0.950456f, 1.0f, 1.088754f };
+
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                xyz_cam[i][j] = 0.0f;
+                for (int k = 0; k < 3; k++) {
+                    xyz_cam[i][j] += xyz_rgb[i][k] * color_matrix_[k][j] / d65_white[i];
+                }
+            }
+        }
+*/
+
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                xyz_cam[i][j] = color_matrix_[i][j];
+            }
+        }
+
+        /* Map a green hexagon around each non-green pixel and vice versa:  */
         ushort sgrow = 0, sgcol = 0;
-        find_solitary_green_pixels(sgrow, sgcol);
-        
-        // Multi-pass tile processing
-        process_tiles_3pass(xyz_cam, orth, patt, dir, ts, sgrow, sgcol);
-        
-        // Border interpolation after main demosaicing (RawTherapee uses passes > 1 ? 8 : 11)
+        short allhex[2][3][3][8];
+        {
+            int gint, d, h, v, ng, row, col;
+
+            for (row = 0; row < 3; row++) {
+                for (col = 0; col < 3; col++) {
+                    gint = isgreen_(row, col);
+
+                    for (ng = d = 0; d < 10; d += 2) {
+                        if (isgreen_(row + orth[d] + 6, col + orth[d + 2] + 6)) {
+                            ng = 0;
+                        } else {
+                            ng++;
+                        }
+
+                        if (ng == 4) {
+                            // if there are four non-green pixels adjacent in cardinal
+                            // directions, this is the solitary green pixel
+                            sgrow = row;
+                            sgcol = col;
+                        }
+
+                        if (ng == gint + 1) {
+                            for (int c = 0; c < 8; c++) {
+                                v = orth[d] * patt[gint][c * 2] + orth[d + 1] * patt[gint][c * 2 + 1];
+                                h = orth[d + 2] * patt[gint][c * 2] + orth[d + 3] * patt[gint][c * 2 + 1];
+                                allhex[0][row][col][c ^ (gint * 2 & d)] = h + v * width_;
+                                allhex[1][row][col][c ^ (gint * 2 & d)] = h + v * ts;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const int passes = 3;
+        const int ndir = 4 << (passes > 1);
+        cielab2 (nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr);
+
+        int RightShift[3];
+
+        for(int row = 0; row < 3; row++) {
+            // count number of green pixels in three cols
+            int greencount = 0;
+
+            for(int col = 0; col < 3; col++) {
+                greencount += isgreen_(row, col);
+            }
+
+            RightShift[row] = (greencount == 2);
+        }
+
+        std::vector<float> rgb_buffer_tile(ndir * ts * ts * 3);
+        std::vector<float> lab_buffer_tile(3 * (ts - 8) * (ts - 8));
+        std::vector<float> drv_buffer_tile(ndir * (ts - 10) * (ts - 10));
+        std::vector<uint8_t> homo_buffer_tile(ndir * ts * ts);
+        std::vector<uint8_t> homosum_buffer_tile(ndir * ts * ts);
+        std::vector<uint8_t> homosummax_buffer_tile(ts * ts);
+        std::vector<s_minmaxgreen> greenminmax_buffer_tile(ts * ts / 2);
+
+        auto rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
+        auto lab = reinterpret_cast<float(*)[ts - 8][ts - 8]>(lab_buffer_tile.data());
+        auto drv = reinterpret_cast<float(*)[ts - 10][ts - 10]>(drv_buffer_tile.data());
+        auto homo = reinterpret_cast<uint8_t(*)[ts][ts]>(homo_buffer_tile.data());
+        auto homosum = reinterpret_cast<uint8_t(*)[ts][ts]>(homosum_buffer_tile.data());
+        auto homosummax = reinterpret_cast<uint8_t(*)[ts]>(homosummax_buffer_tile.data());
+        auto greenminmaxtile = reinterpret_cast<s_minmaxgreen(*)[ts / 2]>(greenminmax_buffer_tile.data());
+
+        //std::cout << "[DEBUG] X-Trans tile loop begin" << std::endl;
+        for (int top = 3; top < (int)height_ - 19; top += ts - 16) {
+            for (int left = 3; left < (int)width_ - 19; left += ts - 16) {
+                int mrow = std::min (top + ts, (int)height_ - 3);
+                int mcol = std::min (left + ts, (int)width_ - 3);
+
+                /* Set greenmin and greenmax to the minimum and maximum allowed values: */
+                for (int row = top; row < mrow; row++) {
+                    // find first non-green pixel
+                    int leftstart = left;
+
+                    for(; leftstart < mcol; leftstart++)
+                        if(!isgreen_(row, leftstart)) {
+                            break;
+                        }
+
+                    int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
+
+                    float minval = std::numeric_limits<float>::max();
+                    float maxval = 0.f;
+
+                    if(coloffset == 3) {
+                        short *hex = allhex[0][row % 3][leftstart % 3];
+
+                        for (int col = leftstart; col < mcol; col += coloffset) {
+                            minval = std::numeric_limits<float>::max();
+                            maxval = 0.f;
+
+                            for(int c = 0; c < 6; c++) {
+                                float val = raw_buffer_hex(row, col, hex[c]);
+
+                                minval = minval < val ? minval : val;
+                                maxval = maxval > val ? maxval : val;
+                            }
+
+                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                        }
+                    } else {
+                        int col = leftstart;
+
+                        if(coloffset == 2) {
+                            minval = std::numeric_limits<float>::max();
+                            maxval = 0.f;
+                            short *hex = allhex[0][row % 3][col % 3];
+
+                            for(int c = 0; c < 6; c++) {
+                                float val = raw_buffer_hex(row, col, hex[c]);
+
+                                minval = minval < val ? minval : val;
+                                maxval = maxval > val ? maxval : val;
+                            }
+
+                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                            col += 2;
+                        }
+
+                        short *hex = allhex[0][row % 3][col % 3];
+
+                        for (; col < mcol - 1; col += 3) {
+                            minval = std::numeric_limits<float>::max();
+                            maxval = 0.f;
+
+                            for(int c = 0; c < 6; c++) {
+                                float val = raw_buffer_hex(row, col, hex[c]);
+
+                                minval = minval < val ? minval : val;
+                                maxval = maxval > val ? maxval : val;
+                            }
+
+                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                            greenminmaxtile[row - top][(col + 1 - left) >> 1].min = minval;
+                            greenminmaxtile[row - top][(col + 1 - left) >> 1].max = maxval;
+                        }
+
+                        if(col < mcol) {
+                            minval = std::numeric_limits<float>::max();
+                            maxval = 0.f;
+
+                            for(int c = 0; c < 6; c++) {
+                                float val = raw_buffer_hex(row, col, hex[c]);
+
+                                minval = minval < val ? minval : val;
+                                maxval = maxval > val ? maxval : val;
+                            }
+
+                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                        }
+                    }
+                }
+
+                memset(rgb, 0, ts * ts * 3 * sizeof(float));
+
+                for (int row = top; row < mrow; row++)
+                    for (int col = left; col < mcol; col++) {
+                        rgb[0][row - top][col - left][fcol_xtrans_(row, col)] = raw_buffer(row, col);
+                    }
+
+                for(int c = 0; c < 3; c++) {
+                    memcpy (rgb[c + 1], rgb[0], sizeof * rgb);
+                }
+
+                /* Interpolate green horizontally, vertically, and along both diagonals: */
+                // std::cout << "[DEBUG] Interpolate green horizontally, vertically, and along both diagonals:" << std::endl;
+                for (int row = top; row < mrow; row++) {
+                    // find first non-green pixel
+                    int leftstart = left;
+
+                    for(; leftstart < mcol; leftstart++)
+                        if(!isgreen_(row, leftstart)) {
+                            break;
+                        }
+
+                    int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
+
+                    if(coloffset == 3) {
+                        short *hex = allhex[0][row % 3][leftstart % 3];
+
+                        for (int col = leftstart; col < mcol; col += coloffset) {
+                            float color[4];
+                            color[0] = 0.6796875f * (raw_buffer_hex(row, col, hex[1]) + raw_buffer_hex(row, col, hex[0])) -
+                                       0.1796875f * (raw_buffer_hex(row, col, 2 * hex[1]) + raw_buffer_hex(row, col, 2 * hex[0]));
+                            color[1] = 0.87109375f * raw_buffer_hex(row, col, hex[3]) + raw_buffer_hex(row, col, hex[2]) * 0.12890625f +
+                                       0.359375f * (raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, -hex[2]));
+
+                            for(int c = 0; c < 2; c++)
+                                color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c]) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c]) + 0.12890625f *
+                                               (2.f * raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, 3 * hex[4 + c]) - raw_buffer_hex(row, col, -3 * hex[4 + c]));
+
+                            for(int c = 0; c < 4; c++) {
+                                rgb[c][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
+                            }
+                        }
+                    } else {
+                        short *hexmod[2];
+                        hexmod[0] = allhex[0][row % 3][leftstart % 3];
+                        hexmod[1] = allhex[0][row % 3][(leftstart + coloffset) % 3];
+
+                        for (int col = leftstart, hexindex = 0; col < mcol; col += coloffset, coloffset ^= 3, hexindex ^= 1) {
+                            short *hex = hexmod[hexindex];
+                            float color[4];
+                            color[0] = 0.6796875f * (raw_buffer_hex(row, col, hex[1]) + raw_buffer_hex(row, col, hex[0])) -
+                                       0.1796875f * (raw_buffer_hex(row, col, 2 * hex[1]) + raw_buffer_hex(row, col, 2 * hex[0]));
+                            color[1] = 0.87109375f *  raw_buffer_hex(row, col, hex[3]) + raw_buffer_hex(row, col, hex[2]) * 0.12890625f +
+                                       0.359375f * (raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, -hex[2]));
+
+                            for(int c = 0; c < 2; c++)
+                                color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c]) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c]) + 0.12890625f *
+                                               (2.f * raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, 3 * hex[4 + c]) - raw_buffer_hex(row, col, -3 * hex[4 + c]));
+
+                            for(int c = 0; c < 4; c++) {
+                                rgb[c ^ 1][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
+                            }
+                        }
+                    }
+                }
+
+                for (int pass = 0; pass < passes; pass++) {
+                    if (pass == 1) {
+                        memcpy (rgb += 4, rgb_buffer_tile.data(), 4 * sizeof * rgb);
+                    }
+
+                    /* Recalculate green from interpolated values of closer pixels: */
+                    //std::cout << "[DEBUG] Recalculate green from interpolated values of closer pixels: " << std::endl;
+                    if (pass) {
+                        for (int row = top + 2; row < mrow - 2; row++) {
+                            int leftstart = left + 2;
+
+                            for(; leftstart < mcol - 2; leftstart++)
+                                if(!isgreen_(row, leftstart)) {
+                                    break;
+                                }
+
+                            int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
+
+                            if(coloffset == 3) {
+                                int f = fcol_xtrans_(row, leftstart);
+                                short *hex = allhex[1][row % 3][leftstart % 3];
+
+                                for (int col = leftstart; col < mcol - 2; col += coloffset, f ^= 2) {
+                                    for (int d = 3; d < 6; d++) {
+                                        float (*rix)[3] = &rgb[(d - 2)][row - top][col - left];
+                                        float val = 0.33333333f * (rix[-2 * hex[d]][1] + 2 * (rix[hex[d]][1] - rix[hex[d]][f])
+                                                                   - rix[-2 * hex[d]][f]) + rix[0][f];
+                                        rix[0][1] = LIM(val, greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
+                                    }
+                                }
+                            } else {
+                                int f = fcol_xtrans_(row, leftstart);
+                                short *hexmod[2];
+                                hexmod[0] = allhex[1][row % 3][leftstart % 3];
+                                hexmod[1] = allhex[1][row % 3][(leftstart + coloffset) % 3];
+
+                                for (int col = leftstart, hexindex = 0; col < mcol - 2; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2), hexindex ^= 1 ) {
+                                    short *hex = hexmod[hexindex];
+
+                                    for (int d = 3; d < 6; d++) {
+                                        float (*rix)[3] = &rgb[(d - 2) ^ 1][row - top][col - left];
+                                        float val = 0.33333333f * (rix[-2 * hex[d]][1] + 2 * (rix[hex[d]][1] - rix[hex[d]][f])
+                                                                   - rix[-2 * hex[d]][f]) + rix[0][f];
+                                        rix[0][1] = LIM(val, greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    /* Interpolate red and blue values for solitary green pixels:   */
+                    //std::cout << "[DEBUG] Interpolate red and blue values for solitary green pixels:" << std::endl;
+                    int sgstartcol = (left - sgcol + 4) / 3 * 3 + sgcol;
+                    float color[3][6];
+
+                    for (int row = (top - sgrow + 4) / 3 * 3 + sgrow; row < mrow - 2; row += 3) {
+                        for (int col = sgstartcol, h = fcol_xtrans_(row, col + 1); col < mcol - 2; col += 3, h ^= 2) {
+                            float (*rix)[3] = &rgb[0][row - top][col - left];
+                            float diff[6] = {0.f};
+
+                            for (int i = 1, d = 0; d < 6; d++, i ^= ts ^ 1, h ^= 2) {
+                                for (int c = 0; c < 2; c++, h ^= 2) {
+                                    float g = rix[0][1] + rix[0][1] - rix[i << c][1] - rix[-i << c][1];
+                                    color[h][d] = g + rix[i << c][h] + rix[-i << c][h];
+
+                                    if (d > 1)
+                                        diff[d] += SQR (rix[i << c][1] - rix[-i << c][1]
+                                                        - rix[i << c][h] + rix[-i << c][h]) + SQR(g);
+                                }
+
+                                if (d > 2 && (d & 1))    // 3, 5
+                                    if (diff[d - 1] < diff[d])
+                                        for(int c = 0; c < 2; c++) {
+                                            color[c * 2][d] = color[c * 2][d - 1];
+                                        }
+
+                                if ((d & 1) || d < 2) { // d: 0, 1, 3, 5
+                                    for(int c = 0; c < 2; c++) {
+                                        rix[0][c * 2] = CLIP(0.5f * color[c * 2][d]);
+                                    }
+
+                                    rix += ts * ts;
+                                }
+                            }
+                        }
+                    }
+
+                    /* Interpolate red for blue pixels and vice versa:      */
+                    //std::cout << "[DEBUG] Interpolate red for blue pixels and vice versa: " << std::endl;
+                    for (int row = top + 3; row < mrow - 3; row++) {
+                        int leftstart = left + 3;
+
+                        for(; leftstart < mcol - 1; leftstart++)
+                            if(!isgreen_(row, leftstart)) {
+                                break;
+                            }
+
+                        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1);
+                        int c = ((row - sgrow) % 3) ? ts : 1;
+                        int h = 3 * (c ^ ts ^ 1);
+
+                        if(coloffset == 3) {
+                            int f = 2 - fcol_xtrans_(row, leftstart);
+
+                            for (int col = leftstart; col < mcol - 3; col += coloffset, f ^= 2) {
+                                float (*rix)[3] = &rgb[0][row - top][col - left];
+
+                                for (int d = 0; d < 4; d++, rix += ts * ts) {
+                                    int i = d > 1 || ((d ^ c) & 1) ||
+                                            ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+
+                                    rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
+                                }
+                            }
+                        } else {
+                            coloffset = fcol_xtrans_(row, leftstart + 1) == 1 ? 2 : 1;
+                            int f = 2 - fcol_xtrans_(row, leftstart);
+
+                            for (int col = leftstart; col < mcol - 3; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2) ) {
+                                float (*rix)[3] = &rgb[0][row - top][col - left];
+
+                                for (int d = 0; d < 4; d++, rix += ts * ts) {
+                                    int i = d > 1 || ((d ^ c) & 1) ||
+                                            ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+
+                                    rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
+                                }
+                            }
+                        }
+                    }
+
+                    /* Fill in red and blue for 2x2 blocks of green:        */
+                    //std::cout << "[DEBUG] Fill in red and blue for 2x2 blocks of green:" << std::endl;
+                    // Find first row of 2x2 green
+                    int topstart = top + 2;
+
+                    for(; topstart < mrow - 2; topstart++)
+                        if((topstart - sgrow) % 3) {
+                            break;
+                        }
+
+                    int leftstart = left + 2;
+
+                    for(; leftstart < mcol - 2; leftstart++)
+                        if((leftstart - sgcol) % 3) {
+                            break;
+                        }
+
+                    int coloffsetstart = 2 - (fcol_xtrans_(topstart, leftstart + 1) & 1);
+
+                    for (int row = topstart; row < mrow - 2; row++) {
+                        if ((row - sgrow) % 3) {
+                            short *hexmod[2];
+                            hexmod[0] = allhex[1][row % 3][leftstart % 3];
+                            hexmod[1] = allhex[1][row % 3][(leftstart + coloffsetstart) % 3];
+
+                            for (int col = leftstart, coloffset = coloffsetstart, hexindex = 0; col < mcol - 2; col += coloffset, coloffset ^= 3, hexindex ^= 1) {
+                                float (*rix)[3] = &rgb[0][row - top][col - left];
+                                short *hex = hexmod[hexindex];
+
+                                for (int d = 0; d < ndir; d += 2, rix += ts * ts) {
+                                    if (hex[d] + hex[d + 1]) {
+                                        float g = 3 * rix[0][1] - 2 * rix[hex[d]][1] - rix[hex[d + 1]][1];
+
+                                        for (int c = 0; c < 4; c += 2) {
+                                            rix[0][c] = CLIP((g + 2 * rix[hex[d]][c] + rix[hex[d + 1]][c]) * 0.33333333f);
+                                        }
+                                    } else {
+                                        float g = 2 * rix[0][1] - rix[hex[d]][1] - rix[hex[d + 1]][1];
+
+                                        for (int c = 0; c < 4; c += 2) {
+                                            rix[0][c] = CLIP((g + rix[hex[d]][c] + rix[hex[d + 1]][c]) * 0.5f);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+// end of multipass part
+
+                rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
+                mrow -= top;
+                mcol -= left;
+
+                if(false) {
+                    /* Convert to CIELab and differentiate in all directions:   */
+                    //std::cout << "[DEBUG] Convert to CIELab and differentiate in all directions:" << std::endl;
+                    // Original dcraw algorithm uses CIELab as perceptual space
+                    // (presumably coming from original AHD) and converts taking
+                    // camera matrix into account.  We use this in RT.
+                    for (int d = 0; d < ndir; d++) {
+                        cielab2(&rgb[d][4][4], &lab[0][0][0], &lab[1][0][0], &lab[2][0][0], ts, mrow - 8, ts - 8, xyz_cam);
+                        int f = dir[d & 3];
+                        f = f == 1 ? 1 : f - 8;
+
+                        for (int row = 5; row < mrow - 5; row++) {
+                            for (int col = 5; col < mcol - 5; col++) {
+                                float *l = &lab[0][row - 4][col - 4];
+                                float *a = &lab[1][row - 4][col - 4];
+                                float *b = &lab[2][row - 4][col - 4];
+
+                                float g = 2 * l[0] - l[f] - l[-f];
+                                drv[d][row - 5][col - 5] =  SQR(g)
+                                                            + SQR((2 * a[0] - a[f] - a[-f] + g * 2.1551724f))
+                                                            + SQR((2 * b[0] - b[f] - b[-f] - g * 0.86206896f));
+                            }
+                        }
+                    }
+                } else {
+                    // For 1-pass demosaic we use YPbPr which requires much
+                    // less code and is nearly indistinguishable. It assumes the
+                    // camera RGB is roughly linear.
+                    //std::cout << "[DEBUG] For 1-pass demosaic we use YPbPr which requires much" << std::endl;
+                    for (int d = 0; d < ndir; d++) {
+                        float (*yuv)[ts - 8][ts - 8] = lab; // we use the lab buffer, which has the same dimensions
+#ifdef __ARM_NEON
+                        float32x4_t zd2627v = vdupq_n_f32(0.2627f);
+                        float32x4_t zd6780v = vdupq_n_f32(0.6780f);
+                        float32x4_t zd0593v = vdupq_n_f32(0.0593f);
+                        float32x4_t zd56433v = vdupq_n_f32(0.56433f);
+                        float32x4_t zd67815v = vdupq_n_f32(0.67815f);
+#endif
+
+                        for (int row = 4; row < mrow - 4; row++) {
+                            int col = 4;
+#ifdef __ARM_NEON
+                            for (; col < mcol - 7; col += 4) {
+                                // use ITU-R BT.2020 YPbPr, which is great, but could use
+                                // a better/simpler choice? note that imageop.h provides
+                                // dt_iop_RGB_to_YCbCr which uses Rec. 601 conversion,
+                                // which appears less good with specular highlights
+
+                                // Load 4 interleaved RGB pixels
+                                float32x4x3_t rgb_pixels = vld3q_f32((const float*)&rgb[d][row][col]);
+                                float32x4_t redv = rgb_pixels.val[0];
+                                float32x4_t greenv = rgb_pixels.val[1];
+                                float32x4_t bluev = rgb_pixels.val[2];
+                                
+                                // Calculate Y component: 0.2627*R + 0.6780*G + 0.0593*B
+                                float32x4_t yv = vmulq_f32(redv, zd2627v);
+                                yv = vmlaq_f32(yv, greenv, zd6780v);
+                                yv = vmlaq_f32(yv, bluev, zd0593v);
+                                
+                                // Calculate U/Pb component: (B - Y) * 0.56433
+                                float32x4_t uv = vmulq_f32(vsubq_f32(bluev, yv), zd56433v);
+                                
+                                // Calculate V/Pr component: (R - Y) * 0.67815
+                                float32x4_t vv = vmulq_f32(vsubq_f32(redv, yv), zd67815v);
+                                
+                                // Store results
+                                vst1q_f32(&yuv[0][row - 4][col - 4], yv);
+                                vst1q_f32(&yuv[1][row - 4][col - 4], uv);
+                                vst1q_f32(&yuv[2][row - 4][col - 4], vv);
+                            }
+#endif
+                            for (; col < mcol - 4; col++) {
+                                // use ITU-R BT.2020 YPbPr, which is great, but could use
+                                // a better/simpler choice? note that imageop.h provides
+                                // dt_iop_RGB_to_YCbCr which uses Rec. 601 conversion,
+                                // which appears less good with specular highlights
+                                float y = 0.2627f * rgb[d][row][col][0] + 0.6780f * rgb[d][row][col][1] + 0.0593f * rgb[d][row][col][2];
+                                yuv[0][row - 4][col - 4] = y;
+                                yuv[1][row - 4][col - 4] = (rgb[d][row][col][2] - y) * 0.56433f;
+                                yuv[2][row - 4][col - 4] = (rgb[d][row][col][0] - y) * 0.67815f;
+                            }
+                        }
+
+                        int f = dir[d & 3];
+                        f = f == 1 ? 1 : f - 8;
+
+                        for (int row = 5; row < mrow - 5; row++) {
+                            for (int col = 5; col < mcol - 5; col++) {
+                                float *y = &yuv[0][row - 4][col - 4];
+                                float *u = &yuv[1][row - 4][col - 4];
+                                float *v = &yuv[2][row - 4][col - 4];
+                                drv[d][row - 5][col - 5] = SQR(2 * y[0] - y[f] - y[-f])
+                                                           + SQR(2 * u[0] - u[f] - u[-f])
+                                                           + SQR(2 * v[0] - v[f] - v[-f]);
+                            }
+                        }
+                    }
+                }
+
+                /* Build homogeneity maps from the derivatives:         */
+                //std::cout << "[DEBUG] Build homogeneity maps from the derivatives:" << std::endl;
+#ifdef __ARM_NEON
+                float32x4_t eightv = vdupq_n_f32(8.f);
+                float32x4_t zerov = vdupq_n_f32(0.f);
+                float32x4_t onev = vdupq_n_f32(1.f);
+#endif
+
+                for (int row = 6; row < mrow - 6; row++) {
+                    int col = 6;
+#ifdef __ARM_NEON
+                    for (; col < mcol - 9; col += 4) {
+                        float32x4_t tr1v = vminq_f32(vld1q_f32(&drv[0][row - 5][col - 5]), vld1q_f32(&drv[1][row - 5][col - 5]));
+                        float32x4_t tr2v = vminq_f32(vld1q_f32(&drv[2][row - 5][col - 5]), vld1q_f32(&drv[3][row - 5][col - 5]));
+
+                        if(ndir > 4) {
+                            float32x4_t tr3v = vminq_f32(vld1q_f32(&drv[4][row - 5][col - 5]), vld1q_f32(&drv[5][row - 5][col - 5]));
+                            float32x4_t tr4v = vminq_f32(vld1q_f32(&drv[6][row - 5][col - 5]), vld1q_f32(&drv[7][row - 5][col - 5]));
+                            tr1v = vminq_f32(tr1v, tr3v);
+                            tr1v = vminq_f32(tr1v, tr4v);
+                        }
+
+                        tr1v = vminq_f32(tr1v, tr2v);
+                        tr1v = vmulq_f32(tr1v, eightv);
+
+                        for (int d = 0; d < ndir; d++) {
+                            //uint8_t tempstore[16];
+                            float32x4_t tempv = zerov;
+
+                            for (int v = -1; v <= 1; v++) {
+                                for (int h = -1; h <= 1; h++) {
+                                    float32x4_t drv_val = vld1q_f32(&drv[d][row + v - 5][col + h - 5]);
+                                    uint32x4_t mask = vcleq_f32(drv_val, tr1v);
+                                    tempv = vaddq_f32(tempv, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(onev))));
+                                }
+                            }
+
+                            // Convert float32x4_t to int32x4_t and extract values
+                            int32x4_t temp_int = vcvtq_s32_f32(tempv);
+                            int32_t temp_arr[4];
+                            vst1q_s32(temp_arr, temp_int);
+                            
+                            homo[d][row][col] = (uint8_t)temp_arr[0];
+                            homo[d][row][col + 1] = (uint8_t)temp_arr[1];
+                            homo[d][row][col + 2] = (uint8_t)temp_arr[2];
+                            homo[d][row][col + 3] = (uint8_t)temp_arr[3];
+                        }
+                    }
+#endif
+
+                    for (; col < mcol - 6; col++) {
+                        float tr = drv[0][row - 5][col - 5] < drv[1][row - 5][col - 5] ? drv[0][row - 5][col - 5] : drv[1][row - 5][col - 5];
+
+                        for (int d = 2; d < ndir; d++) {
+                            tr = (drv[d][row - 5][col - 5] < tr ? drv[d][row - 5][col - 5] : tr);
+                        }
+
+                        tr *= 8;
+
+                        for (int d = 0; d < ndir; d++) {
+                            uint8_t temp = 0;
+
+                            for (int v = -1; v <= 1; v++) {
+                                for (int h = -1; h <= 1; h++) {
+                                    temp += (drv[d][row + v - 5][col + h - 5] <= tr ? 1 : 0);
+                                }
+                            }
+
+                            homo[d][row][col] = temp;
+                        }
+                    }
+                }
+
+                if (height_ - top < ts + 4) {
+                    mrow = height_ - top + 2;
+                }
+
+                if (width_ - left < ts + 4) {
+                    mcol = width_ - left + 2;
+                }
+
+                /* Build 5x5 sum of homogeneity maps */
+                //std::cout << "[DEBUG] Build 5x5 sum of homogeneity maps" << std::endl;
+                const int startcol = std::min(left, 8);
+
+                for(int d = 0; d < ndir; d++) {
+                    for (int row = std::min(top, 8); row < mrow - 8; row++) {
+                        int col = startcol;
+#ifdef __ARM_NEON
+                        int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
+
+                        // crunching 16 values at once is faster than summing up column sums
+                        for (; col < endcol; col += 16) {
+                            uint8x16_t v5sumv = vdupq_n_u8(0);
+
+                            for(int v = -2; v <= 2; v++) {
+                                for(int h = -2; h <= 2; h++) {
+                                    uint8x16_t homov = vld1q_u8(&homo[d][row + v][col + h]);
+                                    v5sumv = vqaddq_u8(homov, v5sumv);
+                                }
+                            }
+
+                            vst1q_u8(&homosum[d][row][col], v5sumv);
+                        }
+#endif
+
+                        if(col < mcol - 8) {
+                            int v5sum[5] = {0};
+
+                            for(int v = -2; v <= 2; v++)
+                                for(int h = -2; h <= 2; h++) {
+                                    v5sum[2 + h] += homo[d][row + v][col + h];
+                                }
+
+                            int blocksum = v5sum[0] + v5sum[1] + v5sum[2] + v5sum[3] + v5sum[4];
+                            homosum[d][row][col] = blocksum;
+                            col++;
+
+                            // now we can subtract a column of five from blocksum and get new colsum of 5
+                            for (int voffset = 0; col < mcol - 8; col++, voffset++) {
+                                int colsum = homo[d][row - 2][col + 2] + homo[d][row - 1][col + 2] + homo[d][row][col + 2] + homo[d][row + 1][col + 2] + homo[d][row + 2][col + 2];
+                                voffset = voffset == 5 ? 0 : voffset;  // faster than voffset %= 5;
+                                blocksum -= v5sum[voffset];
+                                blocksum += colsum;
+                                v5sum[voffset] = colsum;
+                                homosum[d][row][col] = blocksum;
+                            }
+                        }
+                    }
+                }
+
+
+                // calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step
+                //std::cout << "[DEBUG] calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step" << std::endl;
+#ifdef __ARM_NEON
+                uint8x16_t maskv = vdupq_n_u8(31);
+#endif
+
+                for (int row = std::min(top, 8); row < mrow - 8; row++) {
+                    int col = startcol;
+#ifdef __ARM_NEON
+                    int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
+
+                    for (; col < endcol; col += 16) {
+                        uint8x16_t maxval1 = vmaxq_u8(vld1q_u8(&homosum[0][row][col]), vld1q_u8(&homosum[1][row][col]));
+                        uint8x16_t maxval2 = vmaxq_u8(vld1q_u8(&homosum[2][row][col]), vld1q_u8(&homosum[3][row][col]));
+
+                        if(ndir > 4) {
+                            uint8x16_t maxval3 = vmaxq_u8(vld1q_u8(&homosum[4][row][col]), vld1q_u8(&homosum[5][row][col]));
+                            uint8x16_t maxval4 = vmaxq_u8(vld1q_u8(&homosum[6][row][col]), vld1q_u8(&homosum[7][row][col]));
+                            maxval1 = vmaxq_u8(maxval1, maxval3);
+                            maxval1 = vmaxq_u8(maxval1, maxval4);
+                        }
+
+                        maxval1 = vmaxq_u8(maxval1, maxval2);
+                        
+                        // NEONには8ビット単位のシフト命令がないため、16ビットに拡張してシフト
+                        uint16x8_t maxval1_high = vshll_n_u8(vget_high_u8(maxval1), 0); // 16ビットに拡張
+                        uint16x8_t maxval1_low = vshll_n_u8(vget_low_u8(maxval1), 0);   // 16ビットに拡張
+                        
+                        // 32ビットに拡張して3ビット右シフト
+                        uint32x4_t subv_high_high = vshrq_n_u32(vmovl_u16(vget_high_u16(maxval1_high)), 3);
+                        uint32x4_t subv_high_low = vshrq_n_u32(vmovl_u16(vget_low_u16(maxval1_high)), 3);
+                        uint32x4_t subv_low_high = vshrq_n_u32(vmovl_u16(vget_high_u16(maxval1_low)), 3);
+                        uint32x4_t subv_low_low = vshrq_n_u32(vmovl_u16(vget_low_u16(maxval1_low)), 3);
+                        
+                        // 32ビットから16ビットに戻す
+                        uint16x4_t subv_high_high_16 = vmovn_u32(subv_high_high);
+                        uint16x4_t subv_high_low_16 = vmovn_u32(subv_high_low);
+                        uint16x4_t subv_low_high_16 = vmovn_u32(subv_low_high);
+                        uint16x4_t subv_low_low_16 = vmovn_u32(subv_low_low);
+                        
+                        uint16x8_t subv_high = vcombine_u16(subv_high_low_16, subv_high_high_16);
+                        uint16x8_t subv_low = vcombine_u16(subv_low_low_16, subv_low_high_16);
+                        
+                        // 16ビットから8ビットに戻す
+                        uint8x16_t subv = vcombine_u8(vmovn_u16(subv_low), vmovn_u16(subv_high));
+                        
+                        // 8ビットのマスクを適用（31 = 0x1F）
+                        subv = vandq_u8(subv, maskv);
+                        
+                        // 飽和減算
+                        maxval1 = vqsubq_u8(maxval1, subv);
+                        
+                        vst1q_u8(&homosummax[row][col], maxval1);
+                    }
+#endif
+
+                    for (; col < mcol - 8; col ++) {
+                        uint8_t maxval = homosum[0][row][col];
+
+                        for(int d = 1; d < ndir; d++) {
+                            maxval = maxval < homosum[d][row][col] ? homosum[d][row][col] : maxval;
+                        }
+
+                        maxval -= maxval >> 3;
+                        homosummax[row][col] = maxval;
+                    }
+                }
+
+                /* Average the most homogeneous pixels for the final result: */
+                //std::cout << "[DEBUG] Average the most homogeneous pixels for the final result:" << std::endl;
+                uint8_t hm[8] = {};
+
+                for (int row = std::min(top, 8); row < mrow - 8; row++) {
+                    for (int col = std::min(left, 8); col < mcol - 8; col++) {
+
+                        for (int d = 0; d < 4; d++) {
+                            hm[d] = homosum[d][row][col];
+                        }
+
+                        for (int d = 4; d < ndir; d++) {
+                            hm[d] = homosum[d][row][col];
+
+                            if (hm[d - 4] < hm[d]) {
+                                hm[d - 4] = 0;
+                            } else if (hm[d - 4] > hm[d]) {
+                                hm[d] = 0;
+                            }
+                        }
+
+                        float avg[4] = {0.f, 0.f, 0.f, 0.f};
+
+                        uint8_t maxval = homosummax[row][col];
+
+                        for (int d = 0; d < ndir; d++)
+                            if (hm[d] >= maxval) {
+                                for (int c = 0; c < 3; c++) {
+                                    avg[c] += rgb[d][row][col][c];
+                                }
+                                avg[3]++;
+                            }
+
+                        RGB_BUFFER(row + top, col + left, 0) = std::max(0.f, avg[0] / avg[3]);
+                        RGB_BUFFER(row + top, col + left, 1) = std::max(0.f, avg[1] / avg[3]);
+                        RGB_BUFFER(row + top, col + left, 2) = std::max(0.f, avg[2] / avg[3]);
+                    }
+                }
+            }
+        }
+
         xtrans_border_interpolate(8);
-        
-        std::cout << "✅ 3-pass XTrans demosaic completed" << std::endl;
     }
-    
-    // 1-pass fast demosaic - RawTherapee's exact fast_xtrans_interpolate
+
+   // 1-pass fast demosaic - RawTherapee's exact fast_xtrans_interpolate
     void run_1pass() {
         std::cout << "🔧 Starting 1-pass XTrans demosaic (fast)..." << std::endl;
         
@@ -1652,7 +2589,7 @@ public:
                         int src_idx = src_row * width_ + src_col;
                         int src_color = fcol_xtrans_(src_row, src_col);
                         
-                        float raw_val = (float)raw_buffer_.image[src_idx][src_color] / (float)maximum_value_;
+                        float raw_val = (float)raw_buffer_.image[src_idx][src_color] / maximum_value_;
                         sum[src_color] += raw_val * weight[v + 1][h + 1];
                     }
                 }
@@ -1665,7 +2602,7 @@ public:
                 switch(pixel_color) {
                 case 0: // red pixel
                     {
-                        rgb[0] = (float)raw_buffer_.image[out_idx][0] / (float)maximum_value_; // Current red
+                        rgb[0] = (float)raw_buffer_.image[out_idx][0] / maximum_value_; // Current red
                         rgb[1] = sum[1] * 0.5f;  // Green interpolation
                         rgb[2] = sum[2];         // Blue interpolation
                     }
@@ -1673,7 +2610,7 @@ public:
                     
                 case 1: // green pixel
                     {
-                        rgb[1] = (float)raw_buffer_.image[out_idx][1] / (float)maximum_value_; // Current green
+                        rgb[1] = (float)raw_buffer_.image[out_idx][1] / maximum_value_; // Current green
                         
                         // Check if this is a solitary green pixel
                         int left_color = fcol_xtrans_(row, col - 1);
@@ -1695,7 +2632,7 @@ public:
                     {
                         rgb[0] = sum[0];         // Red interpolation
                         rgb[1] = sum[1] * 0.5f;  // Green interpolation
-                        rgb[2] = (float)raw_buffer_.image[out_idx][2] / (float)maximum_value_; // Current blue
+                        rgb[2] = (float)raw_buffer_.image[out_idx][2] / maximum_value_; // Current blue
                     }
                     break;
                 }
@@ -1710,392 +2647,25 @@ public:
         
         std::cout << "✅ 1-pass XTrans demosaic completed" << std::endl;
     }
-
-private:
-    void compute_xyz_cam_matrix(float xyz_cam[3][3]) {
-        // RawTherapee compatible xyz_cam matrix with D65 white point normalization
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                xyz_cam[i][j] = 0.0f;
-                for (int k = 0; k < 3; k++) {
-                    // ✨RawTherapee互換修正✨: D65白点正規化を適用（マゼンタ被り修正）
-                    xyz_cam[i][j] += xyz_rgb[i][k] * color_matrix_[k][j] / d50_white[i];
-                }
-            }
-        }
-        
-    }
-    
-    void find_solitary_green_pixels(ushort& sgrow, ushort& sgcol) {
-        // Find position of solitary green pixels in XTrans pattern
-        for (int row = 0; row < 6; row++) {
-            for (int col = 0; col < 6; col++) {
-                if (fcol_xtrans_(row, col) == 1) {
-                    bool solitary = true;
-                    // Check if this green pixel has green neighbors
-                    for (int dr = -1; dr <= 1; dr++) {
-                        for (int dc = -1; dc <= 1; dc++) {
-                            if (dr == 0 && dc == 0) continue;
-                            if (fcol_xtrans_((row + dr + 6) % 6, (col + dc + 6) % 6) == 1) {
-                                solitary = false;
-                                break;
-                            }
-                        }
-                        if (!solitary) break;
-                    }
-                    if (solitary) {
-                        sgrow = row;
-                        sgcol = col;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-    
-    void xtrans_border_interpolate(int border) {
-        // RawTherapee's exact xtransborder_interpolate algorithm
-        const float weight[3][3] = {
-            {0.25f, 0.5f, 0.25f},
-            {0.5f,  0.0f, 0.5f},
-            {0.25f, 0.5f, 0.25f}
-        };
-        
-        for (int row = 0; row < (int)height_; row++) {
-            for (int col = 0; col < (int)width_; col++) {
-                if (col == border && row >= border && row < (int)height_ - border) {
-                    col = (int)width_ - border;
-                }
-                
-                if (row < border || col < border || 
-                    row >= (int)height_ - border || col >= (int)width_ - border) {
-                    
-                    float sum[6] = {0.0f}; // [R, G, B, R_weight, G_weight, B_weight]
-                    
-                    // Calculate weighted sum like RawTherapee
-                    for (int y = std::max(0, row - 1), v = (row == 0 ? 0 : -1); 
-                         y <= std::min(row + 1, (int)height_ - 1); y++, v++) {
-                        for (int x = std::max(0, col - 1), h = (col == 0 ? 0 : -1); 
-                             x <= std::min(col + 1, (int)width_ - 1); x++, h++) {
-                            
-                            int f = fcol_xtrans_(y, x);
-                            int src_idx = y * width_ + x;
-                            float raw_val = (float)raw_buffer_.image[src_idx][f] / (float)maximum_value_;
-                            float w = weight[v + 1][h + 1];
-                            
-                            sum[f] += raw_val * w;
-                            sum[f + 3] += w;
-                        }
-                    }
-                    
-                    int dst_idx = row * width_ + col;
-                    int pixel_color = fcol_xtrans_(row, col);
-                    
-                    // RawTherapee's exact interpolation logic
-                    switch(pixel_color) {
-                    case 0: // Red pixel
-                        {
-                            float raw_val = (float)raw_buffer_.image[dst_idx][0] / (float)maximum_value_;
-                            rgb_buffer_.image[dst_idx][0] = raw_val;
-                            rgb_buffer_.image[dst_idx][1] = sum[1] / sum[4];
-                            rgb_buffer_.image[dst_idx][2] = sum[2] / sum[5];
-                        }
-                        break;
-                        
-                    case 1: // Green pixel
-                        {
-                            float raw_val = (float)raw_buffer_.image[dst_idx][1] / (float)maximum_value_;
-                            if (sum[3] == 0.0f) {
-                                // Corner case: only green pixels in 2x2 area
-                                rgb_buffer_.image[dst_idx][0] = raw_val;
-                                rgb_buffer_.image[dst_idx][1] = raw_val;
-                                rgb_buffer_.image[dst_idx][2] = raw_val;
-                            } else {
-                                rgb_buffer_.image[dst_idx][0] = (sum[0] / sum[3]);
-                                rgb_buffer_.image[dst_idx][1] = raw_val;
-                                rgb_buffer_.image[dst_idx][2] = (sum[2] / sum[5]);
-                            }
-                        }
-                        break;
-                        
-                    case 2: // Blue pixel
-                        {
-                            float raw_val = (float)raw_buffer_.image[dst_idx][2] / (float)maximum_value_;
-                            rgb_buffer_.image[dst_idx][0] = (sum[0] / sum[3]);
-                            rgb_buffer_.image[dst_idx][1] = (sum[1] / sum[4]);
-                            rgb_buffer_.image[dst_idx][2] = raw_val;
-                        }
-                        break;
-                    }                    
-                }
-            }
-        }
-    }
-    
-    void process_tiles_3pass(const float xyz_cam[3][3], const short orth[12], 
-                            const short patt[2][16], const short dir[4], 
-                            int ts, ushort sgrow, ushort sgcol) {
-        
-        const int passes = 3;
-        
-        #pragma omp parallel for schedule(dynamic, 1) collapse(2)
-        for (int top = 0; top < (int)height_; top += ts - 32) {
-            for (int left = 0; left < (int)width_; left += ts - 32) {
-                int bottom = std::min(top + ts, (int)height_);
-                int right = std::min(left + ts, (int)width_);
-                
-                // Allocate tile arrays
-                std::vector<float> rgb_data(ts * ts * 3, 0.0f);
-                std::vector<float> lab_data(ts * ts * 3, 0.0f);
-                float (*rgb)[3] = reinterpret_cast<float(*)[3]>(rgb_data.data());
-                float (*lab)[3] = reinterpret_cast<float(*)[3]>(lab_data.data());
-                
-                // Initialize tile with raw data
-                initialize_tile(rgb, top, left, bottom, right, ts);
-                
-                // Multi-pass processing
-                for (int pass = 0; pass < passes; pass++) {
-                    if (pass == 1) {
-                        // Convert RGB to LAB for pass 2
-                        convert_rgb_to_lab(rgb, lab, ts, xyz_cam);
-                    }
-                    
-                    // Process tile pass
-                    process_tile_pass(rgb, lab, top, left, bottom, right, ts, 
-                                     pass, orth, patt, dir, sgrow, sgcol);
-                }
-                
-                // Copy results back to output buffer
-                copy_tile_to_output(rgb, top, left, bottom, right, ts);
-            }
-        }
-    }
-    
-    void initialize_tile(float (*rgb)[3], int top, int left, int bottom, int right, int ts) {
-        for (int row = top; row < bottom; row++) {
-            for (int col = left; col < right; col++) {
-                if (row >= 0 && row < (int)height_ && col >= 0 && col < (int)width_) {
-                    int tile_idx = (row - top) * ts + (col - left);
-                    int raw_idx = row * width_ + col;
-                    int color = fcol_xtrans_(row, col);
-                    
-                    // Initialize all channels to 0, set only the appropriate color
-                    rgb[tile_idx][0] = rgb[tile_idx][1] = rgb[tile_idx][2] = 0.0f;
-                    rgb[tile_idx][color] = (float)raw_buffer_.image[raw_idx][color] / (float)maximum_value_;
-                }
-            }
-        }
-    }
-    
-    void convert_rgb_to_lab(float (*rgb)[3], float (*lab)[3], int ts, const float xyz_cam[3][3]) {
-        // RawTherapee's exact CIELab conversion with LUT
-        static std::vector<float> cbrt_lut;
-        static bool lut_initialized = false;
-        
-        // Initialize LUT exactly like RawTherapee (0x14000 = 81920 entries)
-        if (!lut_initialized) {
-            cbrt_lut.resize(0x14000);
-            const float eps = 216.0f / 24389.0f;
-            const float kappa = 24389.0f / 27.0f;
-            
-            for (int i = 0; i < 0x14000; i++) {
-                double r = i / (double)maximum_value_;
-                cbrt_lut[i] = r > eps ? std::cbrt(r) : (kappa * r + 16.0) / 116.0;
-            }
-            lut_initialized = true;
-        }
-        
-        for (int i = 0; i < ts * ts; i++) {
-            // Convert RGB to XYZ - RawTherapee's exact method
-            float xyz[3] = {0.5f, 0.5f, 0.5f}; // Start with 0.5 like RawTherapee
-            
-            for (int c = 0; c < 3; c++) {
-                xyz[0] += xyz_cam[0][c] * rgb[i][c];
-                xyz[1] += xyz_cam[1][c] * rgb[i][c];  
-                xyz[2] += xyz_cam[2][c] * rgb[i][c];
-            }
-            
-            // Apply LUT like RawTherapee (clamp to valid range)
-            int x_idx = std::max(0, std::min(0x13fff, (int)xyz[0]));
-            int y_idx = std::max(0, std::min(0x13fff, (int)xyz[1])); 
-            int z_idx = std::max(0, std::min(0x13fff, (int)xyz[2]));
-            
-            xyz[0] = cbrt_lut[x_idx];
-            xyz[1] = cbrt_lut[y_idx];
-            xyz[2] = cbrt_lut[z_idx];
-            
-            // Calculate Lab values - RawTherapee's exact formula
-            lab[i][0] = 116.0f * xyz[1] - 16.0f;  // L
-            lab[i][1] = 500.0f * (xyz[0] - xyz[1]); // a  
-            lab[i][2] = 200.0f * (xyz[1] - xyz[2]); // b
-        }
-    }
-    
-    void process_tile_pass(float (*rgb)[3], float (*lab)[3], int top, int left, 
-                          int bottom, int right, int ts, int pass,
-                          const short orth[12], const short patt[2][16], 
-                          const short dir[4], ushort sgrow, ushort sgcol) {
-        
-        // Pass-specific processing
-        if (pass == 0) {
-            // First pass: basic interpolation
-            interpolate_green_first_pass(rgb, top, left, bottom, right, ts);
-        } else if (pass == 1) {
-            // Second pass: use LAB for better color accuracy
-            interpolate_with_lab(rgb, lab, top, left, bottom, right, ts);
-        } else {
-            // Final pass: refinement
-            refine_interpolation(rgb, top, left, bottom, right, ts);
-        }
-    }
-    
-    void interpolate_green_first_pass(float (*rgb)[3], int top, int left, int bottom, int right, int ts) {
-        // Green channel interpolation for non-green pixels
-        for (int row = top + 2; row < bottom - 2; row++) {
-            for (int col = left + 2; col < right - 2; col++) {
-                int tile_idx = (row - top) * ts + (col - left);
-                
-                if (fcol_xtrans_(row, col) != 1) { // Not green pixel
-                    float sum = 0.0f;
-                    int count = 0;
-                    
-                    // Average nearby green pixels
-                    for (int dr = -2; dr <= 2; dr++) {
-                        for (int dc = -2; dc <= 2; dc++) {
-                            int nr = row + dr, nc = col + dc;
-                            if (nr >= 0 && nr < (int)height_ && nc >= 0 && nc < (int)width_) {
-                                if (fcol_xtrans_(nr, nc) == 1) {
-                                    int n_tile_idx = (nr - top) * ts + (nc - left);
-                                    if (n_tile_idx >= 0 && n_tile_idx < ts * ts) {
-                                        sum += rgb[n_tile_idx][1];
-                                        count++;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (count > 0) {
-                        rgb[tile_idx][1] = sum / count;
-                    }
-                }
-            }
-        }
-    }
-    
-    void interpolate_with_lab(float (*rgb)[3], float (*lab)[3], int top, int left, int bottom, int right, int ts) {
-        // Use LAB color space for better interpolation
-        // This is a simplified version - full implementation would be much more complex
-        for (int row = top + 2; row < bottom - 2; row++) {
-            for (int col = left + 2; col < right - 2; col++) {
-                int tile_idx = (row - top) * ts + (col - left);
-                int color = fcol_xtrans_(row, col);
-                
-                // Interpolate missing color channels using LAB guidance
-                for (int c = 0; c < 3; c++) {
-                    if (c != color && rgb[tile_idx][c] == 0.0f) {
-                        // Simple interpolation using nearby pixels
-                        float sum = 0.0f;
-                        int count = 0;
-                        
-                        for (int dr = -1; dr <= 1; dr++) {
-                            for (int dc = -1; dc <= 1; dc++) {
-                                if (dr == 0 && dc == 0) continue;
-                                int nr = row + dr, nc = col + dc;
-                                if (nr >= top && nr < bottom && nc >= left && nc < right) {
-                                    int n_tile_idx = (nr - top) * ts + (nc - left);
-                                    if (rgb[n_tile_idx][c] > 0.0f) {
-                                        sum += rgb[n_tile_idx][c];
-                                        count++;
-                                    }
-                                }
-                            }
-                        }
-                        if (count > 0) {
-                            rgb[tile_idx][c] = sum / count;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    void refine_interpolation(float (*rgb)[3], int top, int left, int bottom, int right, int ts) {
-        // Final refinement pass
-        for (int row = top + 1; row < bottom - 1; row++) {
-            for (int col = left + 1; col < right - 1; col++) {
-                int tile_idx = (row - top) * ts + (col - left);
-                
-                // Edge-preserving smoothing
-                for (int c = 0; c < 3; c++) {
-                    float sum = 0.0f;
-                    float weights = 0.0f;
-                    
-                    // Weighted average with edge preservation
-                    for (int dr = -1; dr <= 1; dr++) {
-                        for (int dc = -1; dc <= 1; dc++) {
-                            int nr = row + dr, nc = col + dc;
-                            if (nr >= top && nr < bottom && nc >= left && nc < right) {
-                                int n_tile_idx = (nr - top) * ts + (nc - left);
-                                float weight = 1.0f / (1.0f + std::abs(dr) + std::abs(dc));
-                                sum += rgb[n_tile_idx][c] * weight;
-                                weights += weight;
-                            }
-                        }
-                    }
-                    if (weights > 0.0f) {
-                        rgb[tile_idx][c] = sum / weights;
-                    }
-                }
-            }
-        }
-    }
-    
-    
-    void copy_tile_to_output(float (*rgb)[3], int top, int left, int bottom, int right, int ts) {
-        // RawTherapee-style tile copying - only copy the center region to avoid boundary issues
-        const int border = 8; // Don't copy border pixels to avoid tile boundary artifacts
-        
-        int copy_top = std::max(top + border, 0);
-        int copy_left = std::max(left + border, 0);
-        int copy_bottom = std::min(bottom - border, (int)height_);
-        int copy_right = std::min(right - border, (int)width_);
-        
-        for (int row = copy_top; row < copy_bottom; row++) {
-            for (int col = copy_left; col < copy_right; col++) {
-                int tile_idx = (row - top) * ts + (col - left);
-                int out_idx = row * width_ + col;
-                
-                // Simple copy without blending - RawTherapee approach
-                rgb_buffer_.image[out_idx][0] = rgb[tile_idx][0];
-                rgb_buffer_.image[out_idx][1] = rgb[tile_idx][1];
-                rgb_buffer_.image[out_idx][2] = rgb[tile_idx][2];
-                // ImageBufferFloat has only 3 channels (RGB), no need for G2
-            }
-        }
-    }
 };
 
-} // anonymous namespace
+} // namespace
 
-bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
-
-    if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
+bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+    if (!raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         return false;
     }
-    
     XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
-    processor.run_3pass();
+    processor.run_1pass();
     return true;
 }
 
-bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
-
-    if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
+bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+    if (!raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         return false;
     }
-    
     XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
-    processor.run_1pass();
+    processor.run_3pass();
     return true;
 }
 
@@ -2119,7 +2689,7 @@ bool CPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
         std::memcpy(rgb_output.image, rgb_input.image, pixel_count * 3 * sizeof(float));
     }
     
-#if defined(__aarch64__) && defined(__ARM_NEON)
+#if defined(__ARM_NEON)
     std::cout << "🎯 White Balance (Accelerate/vDSP): multipliers [R=" << wb_multipliers[0] 
               << ", G=" << wb_multipliers[1] << ", B=" << wb_multipliers[2] << "]" << std::endl;
         
@@ -2226,7 +2796,6 @@ bool CPUAccelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters
                 for (int c = 0; c < 3; c += 2)
                     image[row * width + col_start][c] = (image[row * width + col_start - 1][c] + image[row * width + col_start + 1][c]) >> 1;
     }
-    std::cout << "✅ Pre-interpolation completed" << std::endl;
     return true;
 }
 
@@ -2286,6 +2855,5 @@ void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint
     }
     std::cout << "✅ LibRaw-exact border interpolation completed" << std::endl;
 }
-
 
 } // namespace libraw_enhanced

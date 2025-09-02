@@ -30,29 +30,22 @@ typedef struct {
     uint32_t border_width;
     float maximum_value;
     char xtrans[6][6];
+    uint32_t use_cielab;     // 0=YPbPr, 1=CIELab
 } XTransParams;
 
+struct s_minmaxgreen {
+    float min;
+    float max;
+};
 typedef struct {
-    uint32_t width;
-    uint32_t height;
-    uint32_t filters;
-    uint32_t border;
-    uint32_t maximum_value;
-} BorderParams;
-
-typedef struct  {
-    uint32_t width;
-    uint32_t height;
-    uint32_t filters;
-    uint32_t nr_width;
-    uint32_t nr_height;
-    uint32_t nr_margin;
-    matrix_float3x3 yuv_cam;
-    uint32_t channel_maximum[3];
-    uint32_t channel_minimum[3];
-    uint16_t maximum_value;
-} AAHDParams;
-
+    float rgb[8][114][114][3];  // 8方向のRGBデータ
+    float lab[3][106][106];     // Labデータ (ts-8)
+    float drv[8][104][104];     // 微分データ (ts-10)
+    uint8_t homo[8][114][114];  // 均質性マップ
+    uint8_t homosum[8][114][114]; // 均質性和
+    uint8_t homosummax[114][114]; // 最大均質性
+    s_minmaxgreen greenminmax[114][57]; // greenminmaxデータ (ts x ts/2)
+} XTransTileData;
 
 typedef struct {
     uint32_t width;

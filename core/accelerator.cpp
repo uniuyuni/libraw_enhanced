@@ -155,8 +155,11 @@ bool Accelerator::demosaic_compute(const ImageBuffer& raw_buffer,
     if (filters == FILTERS_XTRANS) {
         // xtrans data
         switch (algorithm) {
-            case static_cast<int>(DemosaicAlgorithm::Linear): return demosaic_xtrans_1pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
+            case static_cast<int>(DemosaicAlgorithm::Linear): 
+                std::cout << "🔧 Calling demosaic_xtrans_1pass (fast)..." << std::endl;
+                return demosaic_xtrans_1pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
             default:
+                std::cout << "🔧 Calling demosaic_xtrans_3pass (high quality)..." << std::endl;
                 return demosaic_xtrans_3pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
         }
     } else {

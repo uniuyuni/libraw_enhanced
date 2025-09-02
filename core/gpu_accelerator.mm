@@ -36,15 +36,12 @@ public:
     
     // Bayer Demosaic Pipelines
     id<MTLComputePipelineState> bayer_linear_pipeline;
-    
-    // AMaZE Complete Pipeline (RawTherapee Full Port)
     id<MTLComputePipelineState> bayer_amaze_pipeline;
+    id<MTLComputePipelineState> bayer_border_pipeline;
 
     // X-Trans Pipelines
     id<MTLComputePipelineState> xtrans_1pass_pipeline;
-    id<MTLComputePipelineState> xtrans_3pass_pass1_pipeline;
-    id<MTLComputePipelineState> xtrans_3pass_pass2_pipeline;
-    id<MTLComputePipelineState> xtrans_3pass_pass3_pipeline;
+    id<MTLComputePipelineState> xtrans_3pass_pipeline;
     id<MTLComputePipelineState> xtrans_border_pipeline;
     
     // ImageBufferFloat processing pipelines
@@ -52,8 +49,6 @@ public:
     id<MTLComputePipelineState> convert_color_space_float_pipeline;
     id<MTLComputePipelineState> gamma_correct_float_pipeline;
     
-    // Border interpolation pipeline
-    id<MTLComputePipelineState> bayer_border_pipeline;
 #endif
     
     bool initialized;
@@ -64,15 +59,13 @@ public:
         // Initialize all pipeline states to nil
         bayer_linear_pipeline = nil;
         bayer_amaze_pipeline = nil;
+        bayer_border_pipeline = nil;
         xtrans_1pass_pipeline = nil;
-        xtrans_3pass_pass1_pipeline = nil;
-        xtrans_3pass_pass2_pipeline = nil;
-        xtrans_3pass_pass3_pipeline = nil;
+        xtrans_3pass_pipeline = nil;
         xtrans_border_pipeline = nil;
         apply_white_balance_float_pipeline = nil;
         convert_color_space_float_pipeline = nil;
         gamma_correct_float_pipeline = nil;
-        bayer_border_pipeline = nil;
 #endif
     }
 };
@@ -147,7 +140,6 @@ bool GPUAccelerator::load_shaders() {
         
         pimpl_->initialized = true;
         pimpl_->device_info = std::string([pimpl_->device.name UTF8String]) + " (GPU)";
-        std::cout << "[DEBUG] GPU Initialization SUCCESSFUL." << std::endl;
         
         return true;
     }
@@ -175,7 +167,6 @@ std::string GPUAccelerator::load_shader_file(const std::string& filename) {
     return "";
 }
 
-// ... [その他のコード] ...
 
 bool GPUAccelerator::compile_individual_shaders() {
 #ifdef __OBJC__
@@ -279,21 +270,15 @@ bool GPUAccelerator::create_compute_pipelines() {
         };
 
         // Bayer Pipelines
-        pimpl_->bayer_border_pipeline = createPipeline(@"demosaic_bayer_border");
         pimpl_->bayer_linear_pipeline = createPipeline(@"demosaic_bayer_linear");
-
-        // AMaZE Pipeline (Complete RawTherapee Port)
         pimpl_->bayer_amaze_pipeline = createPipeline(@"demosaic_bayer_amaze");
+        pimpl_->bayer_border_pipeline = createPipeline(@"demosaic_bayer_border");
 
         // X-Trans Pipelines
-        pimpl_->xtrans_border_pipeline = createPipeline(@"demosaic_xtrans_border");
         pimpl_->xtrans_1pass_pipeline = createPipeline(@"demosaic_xtrans_1pass");
+        pimpl_->xtrans_3pass_pipeline = createPipeline(@"demosaic_xtrans_3pass");
+        pimpl_->xtrans_border_pipeline = createPipeline(@"demosaic_xtrans_border");
 
-        // X-Trans 3-pass pipelines
-        pimpl_->xtrans_3pass_pass1_pipeline = createPipeline(@"demosaic_xtrans_3pass_pass1");
-        pimpl_->xtrans_3pass_pass2_pipeline = createPipeline(@"demosaic_xtrans_3pass_pass2");
-        pimpl_->xtrans_3pass_pass3_pipeline = createPipeline(@"demosaic_xtrans_3pass_pass3");
-         
         // Post-processing Pipelines
         pimpl_->apply_white_balance_float_pipeline = createPipeline(@"apply_white_balance");
         pimpl_->convert_color_space_float_pipeline = createPipeline(@"convert_color_space");
@@ -362,28 +347,26 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         
+        MTLSize grid_size = MTLSizeMake(width, height, 1);
+        MTLSize threadgroup_size = MTLSizeMake(16, 16, 1);
+
         [encoder setComputePipelineState:pimpl_->bayer_linear_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
-        [encoder setBuffer:params_buffer offset:0 atIndex:2];
-        
-        MTLSize grid_size = MTLSizeMake(width, height, 1);
-        MTLSize threadgroup_size = MTLSizeMake(16, 16, 1);
+        [encoder setBuffer:params_buffer offset:0 atIndex:2];        
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
-        
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:pimpl_->bayer_border_pipeline];
+        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
+        [encoder setBuffer:params_buffer offset:0 atIndex:1];
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
-        
-        // Copy results
-        //memcpy(&rgb_buffer.image[0][0], [rgb_metal_buffer contents], pixel_count * 3 * sizeof(float));
-        
-        // Bayer border interpolation for Linear
-        printf("[DEBUG] Calling GPU border_interpolate for Linear (filters=0x%x, border=1)\n", filters);
-        bool border_success = border_interpolate(rgb_buffer, filters, 1);
-        printf("[DEBUG] GPU border_interpolate result: %s\n", border_success ? "SUCCESS" : "FAILED");
         
         return true;
     }
@@ -422,6 +405,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         size_t total_tile_pixels_half = total_tiles * TILE_PIXELS_HALF;
 
         id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytes:raw_rgbg_data.data() length:pixel_count * sizeof(ushort4) options:MTLResourceStorageModeShared];
+        
         //id<MTLBuffer> rgb_output_buffer = [pimpl_->device newBufferWithLength:pixel_count * 3 * sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
                                                             length:pixel_count * 3 * sizeof(float) 
@@ -482,7 +466,10 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        
+
+        MTLSize grid = MTLSizeMake(tiles_x, tiles_y, 1);
+        MTLSize group = MTLSizeMake(4, 4, 1); // スレッドグループサイズを最適化        
+
         [encoder setComputePipelineState:pimpl_->bayer_amaze_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
@@ -508,27 +495,23 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         [encoder setBuffer:delm_buf offset:0 atIndex:21];
         [encoder setBuffer:Dgrb0_buf offset:0 atIndex:22]; // G-R difference buffer
         [encoder setBuffer:cfa offset:0 atIndex:23];
+        [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // Note: Dgrb1はhcd_buf (index 8) を再利用（CPU版同等: float* Dgrb1 = hcd;）
         // Note: rbm/rbp/pmwt/rbint buffers now use aliasing in Metal shader
-        
-        MTLSize grid = MTLSizeMake(tiles_x, tiles_y, 1);
-        MTLSize group = MTLSizeMake(4, 4, 1); // スレッドグループサイズを最適化        
-        [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+
+        [encoder setComputePipelineState:pimpl_->bayer_border_pipeline];
+        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
+        [encoder setBuffer:params_buffer offset:0 atIndex:1];
+        [encoder dispatchThreads:grid threadsPerThreadgroup:group];    
 
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
 
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            NSLog(@"AMaZE compute shader execution failed. Status: %lu", (unsigned long)command_buffer.status);
-            if (command_buffer.error) {
-                NSLog(@"Error: %@", command_buffer.error);
-            }
-            return false;
-        }
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
         
-        border_interpolate(rgb_buffer, filters, 4);
         return true;
     }
 #else
@@ -581,6 +564,7 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
 
         // Execute pipelines
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
+
         MTLSize grid_size = MTLSizeMake(width, height, 1);
         MTLSize threadgroup_size = MTLSizeMake(16, 16, 1);
 
@@ -591,13 +575,15 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
-        
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
         // Then do 1-pass demosaic
         [encoder setComputePipelineState:pimpl_->xtrans_1pass_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         
         [encoder endEncoding];
         [command_buffer commit];
@@ -625,193 +611,168 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
                                           const float (&color_matrix)[3][4],
                                           uint16_t maximum_value) {
 #ifdef __OBJC__
-    if (!pimpl_->initialized || !pimpl_->xtrans_3pass_pass1_pipeline) return false;
+    if (!pimpl_->initialized || !pimpl_->xtrans_3pass_pipeline) return false;
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
+
+        constexpr int ts = 114;
+        constexpr int passes = 3;
+        constexpr int ndir = 4 << (passes > 1);
         
-        // Prepare raw data
+        // 生データ準備
         std::vector<uint16_t> raw_gpu_data(pixel_count);
         for (size_t i = 0; i < pixel_count; ++i) {
             size_t r = i / width, c = i % width;
             raw_gpu_data[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
         }
         
-        // Create Metal buffers
+        // Metalバッファ作成
         id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytes:raw_gpu_data.data() 
                                                             length:pixel_count * sizeof(uint16_t) 
                                                             options:MTLResourceStorageModeShared];
         
-        //id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * 3 * sizeof(float)
-        //                                                  options:MTLResourceStorageModeShared];
         id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
                                                             length:pixel_count * 3 * sizeof(float) 
                                                             options:MTLResourceStorageModeShared 
                                                             deallocator:nil];
-         
-        id<MTLBuffer> cfa_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
         
-        id<MTLBuffer> green_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
+        // ワークスペースバッファ
+        size_t tile_count_x = (width + (ts - 16) - 1) / (ts - 16);
+        size_t tile_count_y = (height + (ts - 16) - 1) / (ts - 16);
+        size_t tile_count = tile_count_x * tile_count_y;
+                
+        // allhexデータ計算
+        short allhex_data[2][3][3][8];
+        uint16_t sgrow = 0, sgcol = 0;
         
-        id<MTLBuffer> lab_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * 3 * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
+        auto isgreen = [&](int row, int col) -> bool {
+            return (xtrans[row % 3][col % 3] & 1) != 0;
+        };
         
-        // Prepare gamma LUT (C++ side calculation)
-        std::vector<float> cbrt_lut_vec(0x14000);
-        const float eps = 216.0f / 24389.0f;
-        const float kappa = 24389.0f / 27.0f;
-        for (int i = 0; i < 0x14000; i++) {
-            double r = i / (double)maximum_value;
-            cbrt_lut_vec[i] = r > eps ? std::cbrt(r) : (kappa * r + 16.0) / 116.0;
+        constexpr short orth[12] = { 1, 0, 0, 1, -1, 0, 0, -1, 1, 0, 0, 1 };
+        constexpr short patt[2][16] = {
+            { 0, 1, 0, -1, 2, 0, -1, 0, 1, 1, 1, -1, 0, 0, 0, 0 },
+            { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 }
+        };
+        
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                int gint = isgreen(row, col) ? 1 : 0;
+                
+                for (int ng = 0, d = 0; d < 10; d += 2) {
+                    if (isgreen(row + orth[d] + 6, col + orth[d + 2] + 6)) {
+                        ng = 0;
+                    } else {
+                        ng++;
+                    }
+                    
+                    if (ng == 4) {
+                        sgrow = row;
+                        sgcol = col;
+                    }
+                    
+                    if (ng == gint + 1) {
+                        for (int c = 0; c < 8; c++) {
+                            int v = orth[d] * patt[gint][c * 2] + orth[d + 1] * patt[gint][c * 2 + 1];
+                            int h = orth[d + 2] * patt[gint][c * 2] + orth[d + 3] * patt[gint][c * 2 + 1];
+                            allhex_data[0][row][col][c ^ (gint * 2 & d)] = h + v * width;
+                            allhex_data[1][row][col][c ^ (gint * 2 & d)] = h + v * ts;
+                        }
+                    }
+                }
+            }
         }
         
-        id<MTLBuffer> cbrt_lut_buffer = [pimpl_->device newBufferWithBytes:cbrt_lut_vec.data()
-                                                            length:cbrt_lut_vec.size() * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> allhex_buffer = [pimpl_->device newBufferWithBytes:allhex_data
+                                                                  length:sizeof(allhex_data)
+                                                                 options:MTLResourceStorageModeShared];
         
-        // Prepare XTrans parameters and color matrix
+        vector_uint2 sg_coords = {sgrow, sgcol};
+        id<MTLBuffer> sg_coords_buffer = [pimpl_->device newBufferWithBytes:&sg_coords
+                                                                     length:sizeof(sg_coords)
+                                                                    options:MTLResourceStorageModeShared];
+        
+        // XYZ_CAMマトリクス準備
+        float xyz_cam[3][3];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                xyz_cam[i][j] = color_matrix[i][j];
+            }
+        }
+        id<MTLBuffer> xyz_cam_buffer = [pimpl_->device newBufferWithBytes:xyz_cam
+                                                                   length:sizeof(xyz_cam)
+                                                                  options:MTLResourceStorageModeShared];
+        
+        // cbrt LUT準備
+        constexpr int table_size = 1<<16;
+        std::vector<float> cbrt_lut_vec(table_size);
+        for (int i = 0; i < table_size; i++) {
+            double r = i / static_cast<double>(table_size - 1);
+            cbrt_lut_vec[i] = static_cast<float>(r > (216.0/24389.0) ? std::cbrt(r) : (24389.0/27.0 * r + 16.0) / 116.0);
+        }
+        id<MTLBuffer> cbrt_lut_buffer = [pimpl_->device newBufferWithBytes:cbrt_lut_vec.data()
+                                                                    length:cbrt_lut_vec.size() * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+        
+        // XTransパラメータ準備
         XTransParams params = {
             (uint32_t)width,
             (uint32_t)height,
             8u,
             (float)maximum_value,
+            {},  // xtrans will be copied below
+            0    // use_cielab = 0 (YPbPr mode by default)
         };
         std::memcpy(params.xtrans, xtrans, sizeof(params.xtrans));
         
         id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params
-                                                            length:sizeof(params)
-                                                            options:MTLResourceStorageModeShared];
+                                                                  length:sizeof(params)
+                                                                 options:MTLResourceStorageModeShared];
+
+        id<MTLBuffer> tile_data_buffer = [pimpl_->device newBufferWithLength:tile_count * sizeof(XTransTileData) options:MTLResourceStorageModePrivate];
+
+        // スレッドグループサイズ計算
+        MTLSize grid_size = MTLSizeMake(tile_count_x, tile_count_y, 1);
+        MTLSize threadgroup_size = MTLSizeMake(4, 4, 1);
         
-        // Prepare XYZ_CAM matrix
-        float xyz_cam[3][3];
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                xyz_cam[i][j] = 0.0f;
-                for (int k = 0; k < 3; k++) {
-                    xyz_cam[i][j] += xyz_rgb[i][k] * color_matrix[k][j] / d50_white[i];
-                }
-            }
-        }
-        
-        id<MTLBuffer> xyz_cam_buffer = [pimpl_->device newBufferWithBytes:xyz_cam
-                                                            length:sizeof(xyz_cam)
-                                                            options:MTLResourceStorageModeShared];
-        
-        // Execute 3-pass pipeline
+        // パイプライン実行
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
-        MTLSize grid_size = MTLSizeMake(width, height, 1);
-        MTLSize threadgroup_size = MTLSizeMake(16, 16, 1);
-        
-        // Pass 1: Green interpolation
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        [encoder setComputePipelineState:pimpl_->xtrans_3pass_pass1_pipeline];
+        
+        [encoder setComputePipelineState:pimpl_->xtrans_3pass_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
-        [encoder setBuffer:cfa_metal_buffer offset:0 atIndex:1];
-        [encoder setBuffer:green_metal_buffer offset:0 atIndex:2];
-        [encoder setBuffer:params_buffer offset:0 atIndex:3];
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
-        [encoder endEncoding];
+        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
+        [encoder setBuffer:cbrt_lut_buffer offset:0 atIndex:2];
+        [encoder setBuffer:allhex_buffer offset:0 atIndex:3];
+        [encoder setBuffer:sg_coords_buffer offset:0 atIndex:4];
+        [encoder setBuffer:xyz_cam_buffer offset:0 atIndex:5];
+        [encoder setBuffer:tile_data_buffer offset:0 atIndex:6];        
+        [encoder setBuffer:params_buffer offset:0 atIndex:7];
+        [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         
-        // Pass 2: LAB-based color interpolation
-        encoder = [command_buffer computeCommandEncoder];
-        [encoder setComputePipelineState:pimpl_->xtrans_3pass_pass2_pipeline];
-        [encoder setBuffer:cfa_metal_buffer offset:0 atIndex:0];
-        [encoder setBuffer:green_metal_buffer offset:0 atIndex:1];
-        [encoder setBuffer:lab_metal_buffer offset:0 atIndex:2];
-        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:3];
-        [encoder setBuffer:params_buffer offset:0 atIndex:4];
-        [encoder setBuffer:cbrt_lut_buffer offset:0 atIndex:5];
-        [encoder setBuffer:xyz_cam_buffer offset:0 atIndex:6];
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
-        [encoder endEncoding];
-        
-        // Pass 3: Final refinement
-        encoder = [command_buffer computeCommandEncoder];
-        [encoder setComputePipelineState:pimpl_->xtrans_3pass_pass3_pipeline];
-        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
-        [encoder setBuffer:lab_metal_buffer offset:0 atIndex:1];
-        [encoder setBuffer:params_buffer offset:0 atIndex:2];
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
-        [encoder endEncoding];
-        
-        // Pass 4: Border interpolation (New approach)
-        encoder = [command_buffer computeCommandEncoder];
+        // ボーダー補間
         [encoder setComputePipelineState:pimpl_->xtrans_border_pipeline];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:threadgroup_size];
+      
         [encoder endEncoding];
-        
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
-        
-        // Copy results
-        //memcpy(&rgb_buffer.image[0][0], [rgb_metal_buffer contents], pixel_count * 3 * sizeof(float));
-        
-        return true;
+        return command_buffer.status == MTLCommandBufferStatusCompleted;
     }
 #else
     return false;
 #endif
 }
 
-bool GPUAccelerator::border_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, int border) {
-#ifdef __OBJC__
-    printf("[DEBUG] border_interpolate called: initialized=%s, pipeline=%s\n", 
-           pimpl_->initialized ? "true" : "false",
-           pimpl_->bayer_border_pipeline ? "true" : "false");
-    
-    if (!pimpl_->initialized || !pimpl_->bayer_border_pipeline) {
-        printf("[DEBUG] border_interpolate failed: initialization check failed\n");
-        return false;
-    }
-    
-    @autoreleasepool {
-        size_t buffer_size = rgb_buffer.width * rgb_buffer.height * 3 * sizeof(float);
-        
-        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
-                                                                           length:buffer_size 
-                                                                          options:MTLResourceStorageModeShared 
-                                                                      deallocator:nil];
-        
-        BorderParams params = { (uint32_t)rgb_buffer.width, (uint32_t)rgb_buffer.height, filters, (uint32_t)border };
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params 
-                                                                 length:sizeof(params) 
-                                                                options:MTLResourceStorageModeShared];
-        
-        id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        
-        [encoder setComputePipelineState:pimpl_->bayer_border_pipeline];
-        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
-        [encoder setBuffer:params_buffer offset:0 atIndex:1];
-        
-        MTLSize grid_size = MTLSizeMake(rgb_buffer.width, rgb_buffer.height, 1);
-        MTLSize threadgroup_size = MTLSizeMake(16, 16, 1);
-        printf("[DEBUG] border_interpolate dispatching: grid=(%zu,%zu), threadgroup=(%zu,%zu)\n",
-               grid_size.width, grid_size.height, threadgroup_size.width, threadgroup_size.height);
-        
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
-        
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        
-        bool success = command_buffer.status == MTLCommandBufferStatusCompleted;
-        printf("[DEBUG] border_interpolate Metal execution: %s (status=%ld)\n", 
-               success ? "SUCCESS" : "FAILED", (long)command_buffer.status);
-        
-        return success;
-    }
-#else
-    return false;
-#endif
-}
+//===================================================================
+// Apply White Balance
+//===================================================================
 
 // ImageBufferFloat processing methods
 bool GPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, const float wb_multipliers[4]) {
@@ -865,6 +826,10 @@ bool GPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input, Imag
     return false;
 #endif
 }
+
+//===================================================================
+// Convert Color Space
+//===================================================================
 
 bool GPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, const float transform[3][4]) {
 #ifdef __OBJC__
@@ -923,6 +888,10 @@ bool GPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
     return false;
 #endif
 }
+
+//===================================================================
+// Gamma Correct
+//===================================================================
 
 bool GPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, float gamma_power, float gamma_slope, int output_color_space) {
 #ifdef __OBJC__

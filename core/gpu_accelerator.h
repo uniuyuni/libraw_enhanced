@@ -49,6 +49,12 @@ public:
                               const char (&xtrans)[6][6],
                               const float (&color_matrix)[3][4],
                               uint16_t maximum_value);
+
+    bool demosaic_xtrans_adaptive(const ImageBuffer& raw_buffer,
+                                 ImageBufferFloat& rgb_buffer,
+                                 const char (&xtrans)[6][6],
+                                 const float (&color_matrix)[3][4],
+                                 uint16_t maximum_value);
     
     // Float processing pipeline methods (used by accelerator.cpp)
     bool apply_white_balance(const ImageBufferFloat& rgb_input,
@@ -75,11 +81,9 @@ private:
     std::string load_all_shader_sources();
     bool compile_individual_shaders();
     bool create_compute_pipelines();
-       
-    // Border interpolation helper
-    bool border_interpolate(ImageBufferFloat& rgb_buffer,
-                           uint32_t filters,
-                           int border);
+    
+    // XTrans 3-pass helper functions
+    void calculate_allhex_and_sg(const char (&xtrans)[6][6], short allhex_out[2][3][3][8], uint16_t* sgrow_out, uint16_t* sgcol_out);
 };
 
 } // namespace libraw_enhanced

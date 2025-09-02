@@ -39,7 +39,7 @@ enum class ColorSpace : int {
     XYZ = 5,                    // rawpy互換値（LibRawには直接対応なし）
     ACES = 6,                   // rawpy拡張
     P3D65 = 7,                  // rawpy拡張
-    Rec2020 = 8                 // rawpy拡張
+    Rec2020 = 8,                // rawpy拡張
 };
 
 

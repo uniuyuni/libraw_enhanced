@@ -65,7 +65,13 @@ public:
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
                                 uint16_t maximum_value);
-                               
+
+    bool demosaic_xtrans_adaptive(const ImageBuffer& raw_buffer,
+                                   ImageBufferFloat& rgb_buffer,
+                                   const char (&xtrans)[6][6],
+                                   const float (&color_matrix)[3][4],
+                                   uint16_t maximum_value);
+                                                              
     // White balance methods
     bool apply_white_balance(const ImageBufferFloat& rgb_input,
                             ImageBufferFloat& rgb_output,

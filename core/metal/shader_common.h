@@ -17,6 +17,7 @@ using namespace metal;
 #include <algorithm> // Required for std::min and std::max
 #define CONSTANT const
 #define STATIC_CONSTANT static const
+using namespace std;
 #endif
 
 STATIC_CONSTANT uint32_t bayer_to3[4] = {0, 1, 2, 1}; // Maps Bayer filter to RGBG
@@ -30,7 +31,7 @@ inline uint32_t fcol_xtrans(uint32_t row, uint32_t col, CONSTANT char (&xtrans)[
 }
 
 template<typename T, typename U, typename V>
-inline constexpr T ulim_generic(T val, U upper, V lower) {
+inline T ulim_generic(T val, U upper, V lower) {
     if (val > upper) return static_cast<T>(upper);
     if (val < lower) return static_cast<T>(lower);
     return val;
@@ -42,7 +43,12 @@ inline T SQR(T x) {
 }
 
 template<typename T>
-static inline T median(T a, T b, T c) {
+inline T LIM(T val, T low, T high) {
+    return max(low, min(val, high));
+}
+
+template<typename T>
+inline T median(T a, T b, T c) {
     if (a > b) { float t = a; a = b; b = t; }
     if (b > c) { float t = b; b = c; c = t; }
     if (a > b) { float t = a; a = b; b = t; }
