@@ -1448,19 +1448,11 @@ public:
                 }
                 float* Dgrb1 = hcd;
                 
-                // DEBUG: Dgrb1初期化の詳細確認
-                static bool debug_printed = false;
-                if (!debug_printed) {
-                    std::cout << "🔍 CPU Dgrb1初期化: ey=" << ey << ", rr1=" << rr1 << ", ex=" << ex << ", cc1=" << cc1 << std::endl;
-                    debug_printed = true;
-                }
+                // Dgrb1初期化
                 
                 for (int rr = 13 - ey; rr < rr1 - 12; rr += 2) {
                     for (int idx1 = (rr * TS + 13 - ex) >> 1; idx1 < (rr * TS + cc1 - 12) >> 1; idx1++) {
-                        // DEBUG: 実際の処理範囲の確認
-                        if (idx1 >= 960 && idx1 <= 1130) {  // GPU比較範囲
-                            std::cout << "🔢 CPU Dgrb1[" << idx1 << "] = " << Dgrb0[idx1] << " (rr=" << rr << ")" << std::endl;
-                        }
+                        // 処理範囲内のコピー
                         Dgrb1[idx1] = Dgrb0[idx1];
                         Dgrb0[idx1] = 0;
                     }
@@ -1514,11 +1506,7 @@ public:
                             // ネイティブの色(cfa)を使わず、Dgrb0とDgrb1から両方の色を計算する
                             r = g - Dgrb0[tile_idx >> 1];
                             b = g - Dgrb1[tile_idx >> 1];
-                            // DEBUG: R/B-site処理の値確認
-                            if (row < 5 && col < 5) {
-                                int idx_half = tile_idx >> 1;
-                                std::cout << "🔴🔵 CPU R/B-site (" << row << "," << col << "): g=" << g << ", Dgrb0[" << idx_half << "]=" << Dgrb0[idx_half] << ", Dgrb1[" << idx_half << "]=" << Dgrb1[idx_half] << ", r=" << r << ", b=" << b << std::endl;
-                            }
+                            // R/B-site処理完了
                         }
                         rgb_buffer_.image[out_idx][0] = std::max(0.f, r);
                         rgb_buffer_.image[out_idx][1] = std::max(0.f, g);
@@ -1541,7 +1529,7 @@ bool CPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
     }
 
     auto start_time = std::chrono::high_resolution_clock::now();
-    std::cout << "🔧 Starting AMaZE demosaic (Full RawTherapee Port with Hybrid Optimization)..." << std::endl;
+    // AMaZE demosaic processing
     
     try {
         AMaZE_Processor_RT amaze_proc(raw_buffer, rgb_buffer, filters, cam_mul, maximum_value);

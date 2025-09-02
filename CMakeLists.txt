@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(libraw_enhanced VERSION 1.0.0)
 
+# デフォルトビルドタイプをReleaseに設定（パフォーマンス優先）
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+    message(STATUS "Build type not specified, defaulting to Release")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

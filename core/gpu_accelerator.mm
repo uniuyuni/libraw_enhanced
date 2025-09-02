@@ -10,6 +10,9 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #ifdef __OBJC__
@@ -131,12 +134,17 @@ bool GPUAccelerator::load_shaders() {
         }
         std::cout << "[DEBUG] Shader library loaded/compiled successfully." << std::endl;
         
+        // 既存の一括パイプライン作成をスキップ (遅延ロード方式使用)
+        /*
         std::cout << "[DEBUG] Creating compute pipelines..." << std::endl;
         if (!create_compute_pipelines()) {
             std::cout << "[DEBUG] ❌ create_compute_pipelines() FAILED" << std::endl;
             return false;
         }
         std::cout << "[DEBUG] ✅ create_compute_pipelines() SUCCESS" << std::endl;
+        */
+        
+        std::cout << "[DEBUG] ✨ Using lazy-load shader compilation for optimal performance" << std::endl;
         
         pimpl_->initialized = true;
         pimpl_->device_info = std::string([pimpl_->device.name UTF8String]) + " (GPU)";
@@ -221,10 +229,27 @@ bool GPUAccelerator::compile_individual_shaders() {
             combined_source += source + "\n\n";
         }
         
-        // メタルソースをコンパイル
+        // メタルソースをコンパイル（最適化オプション付き）
         NSString* nsSource = [NSString stringWithUTF8String:combined_source.c_str()];
         MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-        options.languageVersion = MTLLanguageVersion2_3;
+        
+        // MTLLanguageVersionの互換性対応
+        if (@available(macOS 11.0, *)) {
+            options.languageVersion = MTLLanguageVersion2_3;
+        } else {
+            options.languageVersion = MTLLanguageVersion2_0; // macOS 10.15+対応
+        }
+        
+        // 最適化オプション設定
+        options.fastMathEnabled = YES;  // 高速数学演算（精度より速度優先）
+        
+        // プリプロセッサ定義で最適化マクロを追加
+        NSMutableDictionary* preprocessorMacros = [[NSMutableDictionary alloc] init];
+        preprocessorMacros[@"METAL_OPTIMIZED"] = @"1";
+        preprocessorMacros[@"FAST_MATH"] = @"1";
+        // Apple Silicon向け最適化
+        preprocessorMacros[@"APPLE_M1_OPTIMIZED"] = @"1";
+        options.preprocessorMacros = preprocessorMacros;
         
         pimpl_->library = [pimpl_->device newLibraryWithSource:nsSource
                                                       options:options
@@ -269,20 +294,9 @@ bool GPUAccelerator::create_compute_pipelines() {
             return pipeline;
         };
 
-        // Bayer Pipelines
-        pimpl_->bayer_linear_pipeline = createPipeline(@"demosaic_bayer_linear");
-        pimpl_->bayer_amaze_pipeline = createPipeline(@"demosaic_bayer_amaze");
-        pimpl_->bayer_border_pipeline = createPipeline(@"demosaic_bayer_border");
-
-        // X-Trans Pipelines
-        pimpl_->xtrans_1pass_pipeline = createPipeline(@"demosaic_xtrans_1pass");
-        pimpl_->xtrans_3pass_pipeline = createPipeline(@"demosaic_xtrans_3pass");
-        pimpl_->xtrans_border_pipeline = createPipeline(@"demosaic_xtrans_border");
-
-        // Post-processing Pipelines
-        pimpl_->apply_white_balance_float_pipeline = createPipeline(@"apply_white_balance");
-        pimpl_->convert_color_space_float_pipeline = createPipeline(@"convert_color_space");
-        pimpl_->gamma_correct_float_pipeline = createPipeline(@"gamma_correct");
+        // 遅延ローディングシステムを使用するため、パイプラインは初期化時には作成しない
+        // 各パイプラインは get_pipeline() で必要時に作成される
+        std::cout << "[DEBUG] ✨ Pipeline lazy loading system initialized" << std::endl;
 
         return true;
     }
@@ -307,7 +321,15 @@ std::string GPUAccelerator::get_device_info() const {
 
 bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
 #ifdef __OBJC__
-    if (!pimpl_->initialized || !pimpl_->bayer_linear_pipeline) return false;
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    id<MTLComputePipelineState> bayer_linear_pipeline = get_pipeline("demosaic_bayer_linear");
+    id<MTLComputePipelineState> bayer_border_pipeline = get_pipeline("demosaic_bayer_border");
+    if (!bayer_linear_pipeline || !bayer_border_pipeline) {
+        std::cerr << "[ERROR] Failed to get bayer linear pipelines" << std::endl;
+        return false;
+    }
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
@@ -321,9 +343,10 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
         }
 
         // Create Metal buffers
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytes:raw_gpu_data.data() 
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
                                                             length:pixel_count * sizeof(uint16_t) 
-                                                            options:MTLResourceStorageModeShared];
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         //id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * 3 * sizeof(float)
         //                                                    options:MTLResourceStorageModeShared];
@@ -339,9 +362,10 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
             (float)maximum_value,
             filters,
         };
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params 
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params 
                                                             length:sizeof(params) 
-                                                            options:MTLResourceStorageModeShared];
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         // Execute pipeline
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
@@ -350,14 +374,14 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
         MTLSize grid_size = MTLSizeMake(width, height, 1);
         MTLSize threadgroup_size = MTLSizeMake(16, 16, 1);
 
-        [encoder setComputePipelineState:pimpl_->bayer_linear_pipeline];
+        [encoder setComputePipelineState:bayer_linear_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];        
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        [encoder setComputePipelineState:pimpl_->bayer_border_pipeline];
+        [encoder setComputePipelineState:bayer_border_pipeline];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:params_buffer offset:0 atIndex:1];
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
@@ -381,7 +405,15 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
 
 bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, const float (&cam_mul)[4], uint16_t maximum_value) {
 #ifdef __OBJC__
-    if (!pimpl_->initialized || !pimpl_->bayer_amaze_pipeline) return false;
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    id<MTLComputePipelineState> bayer_amaze_pipeline = get_pipeline("demosaic_bayer_amaze");
+    id<MTLComputePipelineState> bayer_border_pipeline = get_pipeline("demosaic_bayer_border");
+    if (!bayer_amaze_pipeline || !bayer_border_pipeline) {
+        std::cerr << "[ERROR] Failed to get bayer amaze/border pipelines" << std::endl;
+        return false;
+    }
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
@@ -404,7 +436,10 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         size_t total_tile_pixels = total_tiles * TILE_PIXELS;
         size_t total_tile_pixels_half = total_tiles * TILE_PIXELS_HALF;
 
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytes:raw_rgbg_data.data() length:pixel_count * sizeof(ushort4) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_rgbg_data.data()
+                                                            length:pixel_count * sizeof(ushort4)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         //id<MTLBuffer> rgb_output_buffer = [pimpl_->device newBufferWithLength:pixel_count * 3 * sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
@@ -462,7 +497,10 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
             clip_pt,
             clip_pt8
         };        
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+                                                            length:sizeof(params)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -470,7 +508,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         MTLSize grid = MTLSizeMake(tiles_x, tiles_y, 1);
         MTLSize group = MTLSizeMake(4, 4, 1); // スレッドグループサイズを最適化        
 
-        [encoder setComputePipelineState:pimpl_->bayer_amaze_pipeline];
+        [encoder setComputePipelineState:bayer_amaze_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
@@ -501,7 +539,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         // Note: Dgrb1はhcd_buf (index 8) を再利用（CPU版同等: float* Dgrb1 = hcd;）
         // Note: rbm/rbp/pmwt/rbint buffers now use aliasing in Metal shader
 
-        [encoder setComputePipelineState:pimpl_->bayer_border_pipeline];
+        [encoder setComputePipelineState:bayer_border_pipeline];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:params_buffer offset:0 atIndex:1];
         [encoder dispatchThreads:grid threadsPerThreadgroup:group];    
@@ -525,7 +563,15 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
 
 bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
 #ifdef __OBJC__
-    if (!pimpl_->initialized || !pimpl_->xtrans_1pass_pipeline || !pimpl_->xtrans_border_pipeline) return false;
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    id<MTLComputePipelineState> xtrans_1pass_pipeline = get_pipeline("demosaic_xtrans_1pass");
+    id<MTLComputePipelineState> xtrans_border_pipeline = get_pipeline("demosaic_xtrans_border");
+    if (!xtrans_1pass_pipeline || !xtrans_border_pipeline) {
+        std::cerr << "[ERROR] Failed to get X-Trans 1pass pipelines" << std::endl;
+        return false;
+    }
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
@@ -538,9 +584,10 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
         }
         
         // Create Metal buffers
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytes:raw_gpu_data.data() 
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
                                                             length:pixel_count * sizeof(uint16_t) 
-                                                            options:MTLResourceStorageModeShared];
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         //id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * 3 * sizeof(float)
         //                                                  options:MTLResourceStorageModeShared];                                                                    
@@ -570,7 +617,7 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
 
         // First do border interpolation
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        [encoder setComputePipelineState:pimpl_->xtrans_border_pipeline];
+        [encoder setComputePipelineState:xtrans_border_pipeline];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
@@ -578,7 +625,7 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // Then do 1-pass demosaic
-        [encoder setComputePipelineState:pimpl_->xtrans_1pass_pipeline];
+        [encoder setComputePipelineState:xtrans_1pass_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
@@ -611,14 +658,20 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
                                           const float (&color_matrix)[3][4],
                                           uint16_t maximum_value) {
 #ifdef __OBJC__
-    if (!pimpl_->initialized || !pimpl_->xtrans_3pass_pipeline) return false;
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    id<MTLComputePipelineState> xtrans_3pass_pipeline = get_pipeline("demosaic_xtrans_3pass");
+    id<MTLComputePipelineState> xtrans_border_pipeline = get_pipeline("demosaic_xtrans_border");
+    if (!xtrans_3pass_pipeline || !xtrans_border_pipeline) {
+        std::cerr << "[ERROR] Failed to get X-Trans 3pass pipelines" << std::endl;
+        return false;
+    }
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
 
-        constexpr int ts = 114;
-        constexpr int passes = 3;
-        constexpr int ndir = 4 << (passes > 1);
+        constexpr int ts = XTRANS_3PASS_TS;
         
         // 生データ準備
         std::vector<uint16_t> raw_gpu_data(pixel_count);
@@ -628,9 +681,10 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         }
         
         // Metalバッファ作成
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytes:raw_gpu_data.data() 
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
                                                             length:pixel_count * sizeof(uint16_t) 
-                                                            options:MTLResourceStorageModeShared];
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
                                                             length:pixel_count * 3 * sizeof(float) 
@@ -684,14 +738,16 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
             }
         }
         
-        id<MTLBuffer> allhex_buffer = [pimpl_->device newBufferWithBytes:allhex_data
-                                                                  length:sizeof(allhex_data)
-                                                                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> allhex_buffer = [pimpl_->device newBufferWithBytesNoCopy:allhex_data
+                                                            length:sizeof(allhex_data)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         vector_uint2 sg_coords = {sgrow, sgcol};
-        id<MTLBuffer> sg_coords_buffer = [pimpl_->device newBufferWithBytes:&sg_coords
-                                                                     length:sizeof(sg_coords)
-                                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sg_coords_buffer = [pimpl_->device newBufferWithBytesNoCopy:&sg_coords
+                                                            length:sizeof(sg_coords)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         // XYZ_CAMマトリクス準備
         float xyz_cam[3][3];
@@ -700,9 +756,10 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
                 xyz_cam[i][j] = color_matrix[i][j];
             }
         }
-        id<MTLBuffer> xyz_cam_buffer = [pimpl_->device newBufferWithBytes:xyz_cam
-                                                                   length:sizeof(xyz_cam)
-                                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xyz_cam_buffer = [pimpl_->device newBufferWithBytesNoCopy:xyz_cam
+                                                            length:sizeof(xyz_cam)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         // cbrt LUT準備
         constexpr int table_size = 1<<16;
@@ -711,9 +768,10 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
             double r = i / static_cast<double>(table_size - 1);
             cbrt_lut_vec[i] = static_cast<float>(r > (216.0/24389.0) ? std::cbrt(r) : (24389.0/27.0 * r + 16.0) / 116.0);
         }
-        id<MTLBuffer> cbrt_lut_buffer = [pimpl_->device newBufferWithBytes:cbrt_lut_vec.data()
-                                                                    length:cbrt_lut_vec.size() * sizeof(float)
-                                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cbrt_lut_buffer = [pimpl_->device newBufferWithBytesNoCopy:cbrt_lut_vec.data()
+                                                            length:cbrt_lut_vec.size() * sizeof(float)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
         
         // XTransパラメータ準備
         XTransParams params = {
@@ -726,21 +784,28 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         };
         std::memcpy(params.xtrans, xtrans, sizeof(params.xtrans));
         
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params
-                                                                  length:sizeof(params)
-                                                                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+                                                            length:sizeof(params)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
 
-        id<MTLBuffer> tile_data_buffer = [pimpl_->device newBufferWithLength:tile_count * sizeof(XTransTileData) options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> tile_data_buffer = [pimpl_->device newBufferWithLength:tile_count * sizeof(XTrans3passTile) options:MTLResourceStorageModePrivate];
 
         // スレッドグループサイズ計算
         MTLSize grid_size = MTLSizeMake(tile_count_x, tile_count_y, 1);
-        MTLSize threadgroup_size = MTLSizeMake(4, 4, 1);
+        MTLSize threadgroup_size = MTLSizeMake(4, 2, 1);
         
-        // パイプライン実行
+        // パイプライン実行 - 新しい遅延ロード方式使用
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         
-        [encoder setComputePipelineState:pimpl_->xtrans_3pass_pipeline];
+        // 必要なシェーダーのみコンパイル (遅延ロード)
+        id<MTLComputePipelineState> xtrans_3pass_pipeline = get_pipeline("demosaic_xtrans_3pass");
+        if (!xtrans_3pass_pipeline) {
+            std::cerr << "[ERROR] Failed to get xtrans_3pass pipeline" << std::endl;
+            return false;
+        }
+        [encoder setComputePipelineState:xtrans_3pass_pipeline];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:cbrt_lut_buffer offset:0 atIndex:2];
@@ -753,7 +818,7 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         
         // ボーダー補間
-        [encoder setComputePipelineState:pimpl_->xtrans_border_pipeline];
+        [encoder setComputePipelineState:xtrans_border_pipeline];
         [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
         [encoder setBuffer:raw_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
@@ -946,5 +1011,135 @@ bool GPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
     return false;
 #endif
 }
+
+//===================================================================
+// 遅延ロード + キャッシュ方式の新しいシェーダー管理
+//===================================================================
+
+#ifdef __OBJC__
+id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shader_name) {
+    @autoreleasepool {
+        // パイプラインキャッシュから探して原始的に実装
+        static std::unordered_map<std::string, id<MTLComputePipelineState>> pipeline_cache;
+        
+        auto it = pipeline_cache.find(shader_name);
+        if (it != pipeline_cache.end() && it->second != nil) {
+            std::cout << "[DEBUG] Using cached pipeline: " << shader_name << std::endl;
+            return it->second;
+        }
+        
+        std::cout << "[DEBUG] Compiling pipeline on-demand: " << shader_name << std::endl;
+        
+        // メモリキャッシュのみ使用、直接コンパイル実行
+        id<MTLLibrary> library = compile_and_cache_shader(shader_name);
+        
+        if (!library) {
+            std::cerr << "[ERROR] Failed to compile shader: " << shader_name << std::endl;
+            return nil;
+        }
+        
+        // 3. ライブラリから関数取得
+        NSString* function_name = [NSString stringWithUTF8String:shader_name.c_str()];
+        id<MTLFunction> function = [library newFunctionWithName:function_name];
+        
+        if (!function) {
+            std::cerr << "[ERROR] Function not found in shader: " << shader_name << std::endl;
+            return nil;
+        }
+        
+        // 4. パイプライン作成
+        NSError* error = nil;
+        id<MTLComputePipelineState> pipeline = [pimpl_->device newComputePipelineStateWithFunction:function error:&error];
+        
+        if (!pipeline || error) {
+            std::cerr << "[ERROR] Failed to create pipeline for: " << shader_name;
+            if (error) {
+                std::cerr << ", error: " << [[error localizedDescription] UTF8String];
+            }
+            std::cerr << std::endl;
+            return nil;
+        }
+        
+        // 5. キャッシュに保存
+        pipeline_cache[shader_name] = pipeline;
+        std::cout << "[DEBUG] Pipeline compiled and cached: " << shader_name << std::endl;
+        
+        return pipeline;
+    }
+}
+
+// ファイルキャッシュ機能削除済み - メモリキャッシュのみ使用
+
+id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shader_name) {
+    @autoreleasepool {
+        // 1. シェーダーファイル読み込み
+        std::string shader_source = load_shader_file(shader_name + ".metal");
+        if (shader_source.empty()) {
+            std::cerr << "[ERROR] Failed to load shader source: " << shader_name << std::endl;
+            return nil;
+        }
+        
+        // 2. ヘッダーファイルを結合
+        std::string types_header = load_shader_file("shader_types.h");
+        std::string common_header = load_shader_file("shader_common.h");
+        
+        if (types_header.empty() || common_header.empty()) {
+            std::cerr << "[ERROR] Failed to load shader headers for: " << shader_name << std::endl;
+            return nil;
+        }
+        
+        // 3. #include文を削除してヘッダー結合
+        size_t pos;
+        while ((pos = shader_source.find("#include \"shader_types.h\"")) != std::string::npos) {
+            shader_source.erase(pos, strlen("#include \"shader_types.h\""));
+        }
+        while ((pos = shader_source.find("#include \"shader_common.h\"")) != std::string::npos) {
+            shader_source.erase(pos, strlen("#include \"shader_common.h\""));
+        }
+        
+        std::string combined_source = types_header + "\n" + common_header + "\n" + shader_source;
+        
+        // 4. Metalコンパイル（最適化オプション付き）
+        NSString* ns_source = [NSString stringWithUTF8String:combined_source.c_str()];
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        
+        // MTLLanguageVersionの互換性対応
+        if (@available(macOS 11.0, *)) {
+            options.languageVersion = MTLLanguageVersion2_3;
+        } else {
+            options.languageVersion = MTLLanguageVersion2_0; // macOS 10.15+対応
+        }
+        
+        // 最適化オプション設定
+        options.fastMathEnabled = YES;  // 高速数学演算
+        
+        // プリプロセッサ定義で最適化マクロを追加
+        NSMutableDictionary* preprocessorMacros = [[NSMutableDictionary alloc] init];
+        preprocessorMacros[@"METAL_OPTIMIZED"] = @"1";
+        preprocessorMacros[@"FAST_MATH"] = @"1";
+        preprocessorMacros[@"APPLE_M1_OPTIMIZED"] = @"1";
+        options.preprocessorMacros = preprocessorMacros;
+        
+        NSError* error = nil;
+        id<MTLLibrary> library = [pimpl_->device newLibraryWithSource:ns_source options:options error:&error];
+        
+        if (error || !library) {
+            std::cerr << "[ERROR] Failed to compile shader: " << shader_name;
+            if (error) {
+                std::cerr << ", error: " << [[error localizedDescription] UTF8String];
+            }
+            std::cerr << std::endl;
+            return nil;
+        }
+        
+        // Note: ファイルキャッシュは未実装、メモリキャッシュのみ使用
+        std::cout << "[DEBUG] Shader compiled (memory cache only): " << shader_name << std::endl;
+        
+        return library;
+    }
+}
+
+// get_cache_path関数削除済み - ファイルキャッシュ未実装
+#endif
 
 } // namespace libraw_enhanced

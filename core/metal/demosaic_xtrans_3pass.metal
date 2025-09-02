@@ -5,16 +5,16 @@
 
 using namespace metal;
 
-// CLIPマクロの定義（shader_common.hに追加するべき）
+// CLIPマクロの定義
 #define CLIP(x) (x)
 
 // ヘルパー関数の定義
-inline int fcol_xtrans(int row, int col, constant XTransParams& params) {
-    return params.xtrans[(row + 6) % 6][(col + 6) % 6];
+inline int fcol_xtrans(int row, int col, thread char (&xtrans)[6][6]) {
+    return xtrans[(row + 6) % 6][(col + 6) % 6];
 }
 
-inline int isgreen(int row, int col, constant XTransParams& params) {
-    return (params.xtrans[(row) % 3][(col) % 3] & 1);
+inline int isgreen(int row, int col, thread char (&xtrans)[6][6]) {
+    return (xtrans[(row) % 3][(col) % 3] & 1);
 }
 
 inline float raw_buffer(int row, int col, const device uint16_t* raw_data, constant XTransParams& params) {
@@ -29,6 +29,16 @@ inline float raw_buffer_hex(int row, int col, short hex, const device uint16_t* 
     return (float)raw_data[pos] / params.maximum_value;
 }
 
+inline void vconvertrgbrgbrgbrgb2rrrrggggbbbb(const device float *src,
+                                                    thread float4 &rv,
+                                                    thread float4 &gv,
+                                                    thread float4 &bv) {
+    // RGB tripletsから4つのピクセル分のR、G、B成分を分離
+    rv = float4(src[0], src[3], src[6], src[9]);
+    gv = float4(src[1], src[4], src[7], src[10]);
+    bv = float4(src[2], src[5], src[8], src[11]);
+}
+
 #define fabsf fabs
 
 // X-Trans 3-pass demosaic kernel
@@ -39,7 +49,7 @@ kernel void demosaic_xtrans_3pass(
     const device short* allhex_data [[buffer(3)]],
     const device uint2& sg_coords [[buffer(4)]],
     const device float* xyz_cam [[buffer(5)]],
-    device XTransTileData* tile_data [[buffer(6)]],
+    device XTrans3passTile* tile_data [[buffer(6)]],
     constant XTransParams& params [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 tid [[thread_position_in_threadgroup]],
@@ -50,20 +60,27 @@ kernel void demosaic_xtrans_3pass(
     const uint height = params.height;
     const bool use_cielab = params.use_cielab != 0;
     
-    const int ts = 114;
-    const int passes = 3;
-    const int ndir = 4 << (passes > 1);
+    const int ts = XTRANS_3PASS_TS;
+    const int passes = XTRANS_3PASS_PASSES;
+    const int ndir = XTRANS_3PASS_nDIRS;
     const int sgrow = sg_coords.x;
     const int sgcol = sg_coords.y;
     
     const short dir[4] = { 1, ts, ts + 1, ts - 1 };
 
+    // xtransデータをレジスタへロード
+    thread char xtrans[6][6];
+    for (int i = 0; i < 6; i++) {
+        *(thread char3*)(&xtrans[i][0]) = *(constant char3*)(&params.xtrans[i][0]);
+        *(thread char3*)(&xtrans[i][3]) = *(constant char3*)(&params.xtrans[i][3]);
+    }
+
     // RightShift配列の計算
-    int RightShift[3];
+    thread int RightShift[3];
     for(int row = 0; row < 3; row++) {
         int greencount = 0;
         for(int col = 0; col < 3; col++) {
-            greencount += isgreen(row, col, params);
+            greencount += isgreen(row, col, xtrans);
         }
         RightShift[row] = (greencount == 2);
     }
@@ -79,7 +96,7 @@ kernel void demosaic_xtrans_3pass(
 
     // 共有メモリ初期化
     const device short (*allhex)[3][3][8] = (const device short (*)[3][3][8])allhex_data;
-    device XTransTileData* shared_data = tile_data + (tile_y * tile_w + tile_x);
+    device XTrans3passTile* shared_data = tile_data + (tile_y * tile_w + tile_x);
     device float (*rgb)[ts][ts][3] = shared_data->rgb;
     device float (*lab)[ts - 8][ts - 8] = shared_data->lab;
     device float (*drv)[ts - 10][ts - 10] = shared_data->drv;
@@ -95,11 +112,11 @@ kernel void demosaic_xtrans_3pass(
         int leftstart = left;
 
         for(; leftstart < mcol; leftstart++)
-            if(!isgreen(row, leftstart, params)) {
+            if(!isgreen(row, leftstart, xtrans)) {
                 break;
             }
 
-        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans(row, leftstart + 1, params) & 1));
+        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans(row, leftstart + 1, xtrans) & 1));
 
         float minval = MAXFLOAT;
         float maxval = 0.f;
@@ -179,23 +196,24 @@ kernel void demosaic_xtrans_3pass(
     // threadgroup_barrier(mem_flags::mem_device);
 
     //memset(rgb, 0, ts * ts * 3 * sizeof(float));
-    device float* rgb_p = (device float*)rgb;
-    for (uint i = 0; i < ts * ts * 3; i++) {
+    device packed_float4* rgb_p = (device packed_float4*)rgb;
+    for (uint i = 0; i < ts * ts * 3 / 4; i++) {
         rgb_p[i] = 0.0;
     }
     // threadgroup_barrier(mem_flags::mem_device);
 
-    for (int row = top; row < mrow; row++)
+    for (int row = top; row < mrow; row++) {
         for (int col = left; col < mcol; col++) {
-            rgb[0][row - top][col - left][fcol_xtrans(row, col, params)] = raw_buffer(row, col, raw_data, params);
+            rgb[0][row - top][col - left][fcol_xtrans(row, col, xtrans)] = raw_buffer(row, col, raw_data, params);
         }
+    }
     // threadgroup_barrier(mem_flags::mem_device);
 
     for(int c = 0; c < 3; c++) {
         //memcpy (rgb[c + 1], rgb[0], sizeof * rgb);
-        device float *rgb_p = (device float*)&rgb[c + 1];
-        device float *rgb_s = (device float*)&rgb[0];
-        for (uint i = 0; i < sizeof(*rgb) / sizeof(float); ++i) {
+        device packed_float4 *rgb_p = (device packed_float4*)&rgb[c + 1];
+        device packed_float4 *rgb_s = (device packed_float4*)&rgb[0];
+        for (uint i = 0; i < sizeof(*rgb) / sizeof(packed_float4); ++i) {
             rgb_p[i] = rgb_s[i];
         }
     }
@@ -208,11 +226,11 @@ kernel void demosaic_xtrans_3pass(
         int leftstart = left;
 
         for(; leftstart < mcol; leftstart++)
-            if(!isgreen(row, leftstart, params)) {
+            if(!isgreen(row, leftstart, xtrans)) {
                 break;
             }
 
-        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans(row, leftstart + 1, params) & 1));
+        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans(row, leftstart + 1, xtrans) & 1));
 
         if(coloffset == 3) {
             const device short *hex = allhex[0][row % 3][leftstart % 3];
@@ -246,9 +264,10 @@ kernel void demosaic_xtrans_3pass(
                 color[1] = 0.87109375f *  raw_buffer_hex(row, col, hex[3], raw_data, params) + raw_buffer_hex(row, col, hex[2], raw_data, params) * 0.12890625f +
                             0.359375f * (raw_buffer_hex(row, col, 0, raw_data, params) - raw_buffer_hex(row, col, -hex[2], raw_data, params));
 
-                for(int c = 0; c < 2; c++)
+                for(int c = 0; c < 2; c++) {
                     color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c], raw_data, params) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c], raw_data, params) + 0.12890625f *
                                     (2.f * raw_buffer_hex(row, col, 0, raw_data, params) - raw_buffer_hex(row, col, 3 * hex[4 + c], raw_data, params) - raw_buffer_hex(row, col, -3 * hex[4 + c], raw_data, params));
+                }
 
                 for(int c = 0; c < 4; c++) {
                     rgb[c ^ 1][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
@@ -262,9 +281,9 @@ kernel void demosaic_xtrans_3pass(
         if (pass == 1) {
             //memcpy (rgb += 4, rgb_buffer_tile.data(), 4 * sizeof * rgb);
             rgb += 4;
-            device float* rgb_p = (device float*)rgb;
-            device float* rgb_s = (device float*)shared_data->rgb;
-            for (uint i = 0; i < 4 * sizeof(*rgb) / sizeof(float); ++i) {
+            device packed_float4* rgb_p = (device packed_float4*)rgb;
+            device packed_float4* rgb_s = (device packed_float4*)shared_data->rgb;
+            for (uint i = 0; i < 4 * sizeof(*rgb) / sizeof(packed_float4); ++i) {
                 rgb_p[i] = rgb_s[i];
             }
         }
@@ -277,14 +296,14 @@ kernel void demosaic_xtrans_3pass(
                 int leftstart = left + 2;
 
                 for(; leftstart < mcol - 2; leftstart++)
-                    if(!isgreen(row, leftstart, params)) {
+                    if(!isgreen(row, leftstart, xtrans)) {
                         break;
                     }
 
-                int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans(row, leftstart + 1, params) & 1));
+                int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans(row, leftstart + 1, xtrans) & 1));
 
                 if(coloffset == 3) {
-                    int f = fcol_xtrans(row, leftstart, params);
+                    int f = fcol_xtrans(row, leftstart, xtrans);
                     const device short *hex = allhex[1][row % 3][leftstart % 3];
 
                     for (int col = leftstart; col < mcol - 2; col += coloffset, f ^= 2) {
@@ -296,7 +315,7 @@ kernel void demosaic_xtrans_3pass(
                         }
                     }
                 } else {
-                    int f = fcol_xtrans(row, leftstart, params);
+                    int f = fcol_xtrans(row, leftstart, xtrans);
                     const device short *hexmod[2] = {
                         allhex[1][row % 3][leftstart % 3],
                         allhex[1][row % 3][(leftstart + coloffset) % 3],
@@ -320,10 +339,10 @@ kernel void demosaic_xtrans_3pass(
         // Interpolate red and blue values for solitary green pixels:
         //std::cout << "[DEBUG] Interpolate red and blue values for solitary green pixels:" << std::endl;
         int sgstartcol = (left - sgcol + 4) / 3 * 3 + sgcol;
-        float color[3][6];
+        thread float color[3][6];
 
         for (int row = (top - sgrow + 4) / 3 * 3 + sgrow; row < mrow - 2; row += 3) {
-            for (int col = sgstartcol, h = fcol_xtrans(row, col + 1, params); col < mcol - 2; col += 3, h ^= 2) {
+            for (int col = sgstartcol, h = fcol_xtrans(row, col + 1, xtrans); col < mcol - 2; col += 3, h ^= 2) {
                 device float (*rix)[3] = &rgb[0][row - top][col - left];
                 float diff[6] = {0.f};
 
@@ -361,7 +380,7 @@ kernel void demosaic_xtrans_3pass(
             int leftstart = left + 3;
 
             for(; leftstart < mcol - 1; leftstart++)
-                if(!isgreen(row, leftstart, params)) {
+                if(!isgreen(row, leftstart, xtrans)) {
                     break;
                 }
 
@@ -370,7 +389,7 @@ kernel void demosaic_xtrans_3pass(
             int h = 3 * (c ^ ts ^ 1);
 
             if(coloffset == 3) {
-                int f = 2 - fcol_xtrans(row, leftstart, params);
+                int f = 2 - fcol_xtrans(row, leftstart, xtrans);
 
                 for (int col = leftstart; col < mcol - 3; col += coloffset, f ^= 2) {
                     device float (*rix)[3] = &rgb[0][row - top][col - left];
@@ -383,15 +402,15 @@ kernel void demosaic_xtrans_3pass(
                     }
                 }
             } else {
-                coloffset = fcol_xtrans(row, leftstart + 1, params) == 1 ? 2 : 1;
-                int f = 2 - fcol_xtrans(row, leftstart, params);
+                coloffset = fcol_xtrans(row, leftstart + 1, xtrans) == 1 ? 2 : 1;
+                int f = 2 - fcol_xtrans(row, leftstart, xtrans);
 
                 for (int col = leftstart; col < mcol - 3; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2) ) {
                     device float (*rix)[3] = &rgb[0][row - top][col - left];
 
                     for (int d = 0; d < 4; d++, rix += ts * ts) {
                         int i = d > 1 || ((d ^ c) & 1) ||
-                                ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+                            ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
 
                         rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
                     }
@@ -417,7 +436,7 @@ kernel void demosaic_xtrans_3pass(
                 break;
             }
 
-        int coloffsetstart = 2 - (fcol_xtrans(topstart, leftstart + 1, params) & 1);
+        int coloffsetstart = 2 - (fcol_xtrans(topstart, leftstart + 1, xtrans) & 1);
 
         for (int row = topstart; row < mrow - 2; row++) {
             if ((row - sgrow) % 3) {
@@ -468,12 +487,36 @@ kernel void demosaic_xtrans_3pass(
         // less code and is nearly indistinguishable. It assumes the
         // camera RGB is roughly linear.
         //std::cout << "[DEBUG] For 1-pass demosaic we use YPbPr which requires much" << std::endl;
+#if 1
+        float4 zd2627v = float4(0.2627f);
+        float4 zd6780v = float4(0.6780f);
+        float4 zd0593v = float4(0.0593f);
+        float4 zd56433v = float4(0.56433f);
+        float4 zd67815v = float4(0.67815f);
+#endif
         for (int d = 0; d < ndir; d++) {
             device float (*yuv)[ts - 8][ts - 8] = lab; // we use the lab buffer, which has the same dimensions
 
             for (int row = 4; row < mrow - 4; row++) {
                 int col = 4;            
+#if 1
+                for (; col < mcol - 7; col += 4) {
+                    // 4ピクセル分のRGBデータを読み込み
+                    thread float4 redv, greenv, bluev;
+                    vconvertrgbrgbrgbrgb2rrrrggggbbbb(rgb[d][row][col], redv, greenv, bluev);
 
+                    // BT.2020変換
+                    float4 yv = zd2627v * redv + zd6780v * greenv + zd0593v * bluev;
+                    float4 u_comp = (bluev - yv) * zd56433v;
+                    float4 v_comp = (redv - yv) * zd67815v;
+
+                    // 結果の書き込み
+                    *(device float4*)(&yuv[0][row - 4][col - 4]) = yv;
+                    *(device float4*)(&yuv[1][row - 4][col - 4]) = u_comp;
+                    *(device float4*)(&yuv[2][row - 4][col - 4]) = v_comp;
+                }
+#endif
+                    
                 for (; col < mcol - 4; col++) {
                     // use ITU-R BT.2020 YPbPr, which is great, but could use
                     // a better/simpler choice? note that imageop.h provides
@@ -509,12 +552,12 @@ kernel void demosaic_xtrans_3pass(
         int col = 6;
 #if 1
         for (; col < mcol - 9; col += 4) {
-            float4 tr1v = min(*(device const float4*)(&drv[0][row - 5][col - 5]), *(device const float4*)(&drv[1][row - 5][col - 5]));
-            float4 tr2v = min(*(device const float4*)(&drv[2][row - 5][col - 5]), *(device const float4*)(&drv[3][row - 5][col - 5]));
+            float4 tr1v = min(*(device const packed_float4*)(&drv[0][row - 5][col - 5]), *(device const packed_float4*)(&drv[1][row - 5][col - 5]));
+            float4 tr2v = min(*(device const packed_float4*)(&drv[2][row - 5][col - 5]), *(device const packed_float4*)(&drv[3][row - 5][col - 5]));
 
             if(ndir > 4) {
-                float4 tr3v = min(*(device const float4*)(&drv[4][row - 5][col - 5]), *(device const float4*)(&drv[5][row - 5][col - 5]));
-                float4 tr4v = min(*(device const float4*)(&drv[6][row - 5][col - 5]), *(device const float4*)(&drv[7][row - 5][col - 5]));
+                float4 tr3v = min(*(device const packed_float4*)(&drv[4][row - 5][col - 5]), *(device const packed_float4*)(&drv[5][row - 5][col - 5]));
+                float4 tr4v = min(*(device const packed_float4*)(&drv[6][row - 5][col - 5]), *(device const packed_float4*)(&drv[7][row - 5][col - 5]));
                 tr1v = min(tr1v, tr3v);
                 tr1v = min(tr1v, tr4v);
             }
@@ -528,15 +571,12 @@ kernel void demosaic_xtrans_3pass(
 
                 for (int v = -1; v <= 1; v++) {
                     for (int h = -1; h <= 1; h++) {
-                        float4 drv_val = *(device const float4*)(&drv[d][row + v - 5][col + h - 5]);
+                        float4 drv_val = *(device const packed_float4*)(&drv[d][row + v - 5][col + h - 5]);
                         tempv += float4(drv_val <= tr1v);
                     }
                 }
 
-                homo[d][row][col + 0] = (uint8_t)tempv.x;
-                homo[d][row][col + 1] = (uint8_t)tempv.y;
-                homo[d][row][col + 2] = (uint8_t)tempv.z;
-                homo[d][row][col + 3] = (uint8_t)tempv.w;
+                *(device packed_uchar4*)(&homo[d][row][col]) = uchar4(tempv.x, tempv.y, tempv.z, tempv.w);
             }
         }
 #endif
@@ -582,13 +622,13 @@ kernel void demosaic_xtrans_3pass(
 
             // crunching 16 values at once is faster than summing up column sums
             for (; col < endcol; col += 4) {
-                uchar4 v5sum = 0;
+                uchar4 v5sum = uchar4(0);
                 
                 // 5x5畳み込み
                 for (int v = -2; v <= 2; v++) {
                     for (int h = -2; h <= 2; h++) {
                         v5sum += *(device packed_uchar4*)(&homo[d][row + v][col + h]);
-                        v5sum = min(v5sum, uchar4(255));
+                        //v5sum = min(v5sum, uchar4(255));
                     }
                 }
                 
@@ -602,6 +642,7 @@ kernel void demosaic_xtrans_3pass(
                 for(int v = -2; v <= 2; v++)
                     for(int h = -2; h <= 2; h++) {
                         v5sum[2 + h] += homo[d][row + v][col + h];
+                        //v5sum[2 + h] = min(v5sum[2 + h], 255);
                     }
 
                 int blocksum = v5sum[0] + v5sum[1] + v5sum[2] + v5sum[3] + v5sum[4];
@@ -679,27 +720,25 @@ kernel void demosaic_xtrans_3pass(
 
                 if (hm[d - 4] < hm[d]) {
                     hm[d - 4] = 0;
-                } else if (hm[d - 4] > hm[d]) {
+                } else
+                if (hm[d - 4] > hm[d]) {
                     hm[d] = 0;
                 }
             }
 
-            float avg[4] = {0.f, 0.f, 0.f, 0.f};
+            float3 avg = float3(0.f);
+            float count = 0.f;
 
             uint8_t maxval = homosummax[row][col];
 
             for (int d = 0; d < ndir; d++) {
                 if (hm[d] >= maxval) {
-                    for (int c = 0; c < 3; c++) {
-                        avg[c] += rgb[d][row][col][c];
-                    }
-                    avg[3] += 1.f;
+                    avg += *(device packed_float3*)(&rgb[d][row][col]);
+                    count += 1.f;
                 }
             }
             int idx = ((row + top) * width + (col + left)) * 3;
-            rgb_data[idx + 0] = max(0.f, avg[0] / avg[3]);
-            rgb_data[idx + 1] = max(0.f, avg[1] / avg[3]);
-            rgb_data[idx + 2] = max(0.f, avg[2] / avg[3]);
+            *(device packed_float3*)(&rgb_data[idx]) =  max(0.f, avg / count);
         }
     }
 }

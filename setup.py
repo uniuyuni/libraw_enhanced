@@ -197,10 +197,19 @@ class CustomBuildExt(build_ext):
             for ext in self.extensions:
                 # Apple Silicon最適化フラグ
                 if is_apple_silicon():
+                    # Universal Binaryやめてapple silicon専用に
+                    ext.extra_compile_args = [arg for arg in ext.extra_compile_args if not (arg == '-arch' or arg == 'x86_64')]
                     ext.extra_compile_args.extend([
+                        '-arch', 'arm64',      # Apple Silicon専用
                         '-mcpu=apple-a14',     # Apple Silicon最適化
                         '-O3',                 # 最高レベル最適化
-                        '-DAPPLE_SILICON_OPTIMIZED'
+                        '-DAPPLE_SILICON_OPTIMIZED',
+                        '-D__ARM_NEON=1',      # NEON明示的有効化
+                        '-D__ARM_FEATURE_FMA=1',  # FMA (Fused Multiply-Add) サポート
+                        # 削除: '-D__ARM_FP=0xE' - Metal環境では不要・有害
+                        # 削除: '-ffp-contract=fast' - NEON最適化を阻害する可能性
+                        '-fvectorize',         # ベクトル化強制
+                        '-mllvm', '-force-vector-width=4',  # NEON幅指定
                     ])
                 
                 # Metal定義
@@ -295,10 +304,17 @@ def create_extension():
         # Objective-C++ compilation flags (handled by CustomBuildExt for .mm files)
         extra_compile_args.extend(['-fmodules'])
         
-        # デバッグ情報（デバッグビルド時）
+        # デバッグ情報（デバッグビルド時）- O3は維持
         if os.environ.get('DEBUG'):
-            extra_compile_args.extend(['-g', '-O0'])
-            extra_compile_args.remove('-O3')
+            extra_compile_args.extend(['-g'])
+            # O3は性能維持のため削除しない
+        else:
+            # Release mode での追加最適化
+            extra_compile_args.extend([
+                '-Ofast',           # O3より積極的な最適化
+                '-flto',            # Link Time Optimization
+                '-fno-math-errno',  # 数学関数の高速化
+            ])
     
     # 警告レベル
     if sys.platform != 'win32':

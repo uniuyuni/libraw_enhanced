@@ -8,6 +8,17 @@
 #include <simd/simd.h>
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
+
+// Metal シェーダー最適化設定
+#ifdef METAL_OPTIMIZED
+    // 高速数学演算プラグマ
+    #pragma clang fp reassociate(on)
+    #pragma clang fp contract(fast)
+    using namespace metal;
+    // metal::fastは曖昧性を引き起こすため個別に明示
+    // using namespace metal::fast;
+#endif
+
 #define UINT2 uint2
 #else
 #define UINT2 vector_uint2
@@ -33,19 +44,22 @@ typedef struct {
     uint32_t use_cielab;     // 0=YPbPr, 1=CIELab
 } XTransParams;
 
+#define XTRANS_3PASS_TS 114
+#define XTRANS_3PASS_PASSES 3
+#define XTRANS_3PASS_nDIRS (4 << (XTRANS_3PASS_PASSES > 1)) 
 struct s_minmaxgreen {
     float min;
     float max;
 };
 typedef struct {
-    float rgb[8][114][114][3];  // 8方向のRGBデータ
-    float lab[3][106][106];     // Labデータ (ts-8)
-    float drv[8][104][104];     // 微分データ (ts-10)
-    uint8_t homo[8][114][114];  // 均質性マップ
-    uint8_t homosum[8][114][114]; // 均質性和
-    uint8_t homosummax[114][114]; // 最大均質性
-    s_minmaxgreen greenminmax[114][57]; // greenminmaxデータ (ts x ts/2)
-} XTransTileData;
+    float rgb[XTRANS_3PASS_nDIRS][XTRANS_3PASS_TS][XTRANS_3PASS_TS][3];  // 8方向のRGBデータ
+    float lab[3][XTRANS_3PASS_TS-8][XTRANS_3PASS_TS-8];     // Labデータ (ts-8)
+    float drv[XTRANS_3PASS_nDIRS][XTRANS_3PASS_TS-10][XTRANS_3PASS_TS-10];     // 微分データ (ts-10)
+    uint8_t homo[XTRANS_3PASS_nDIRS][XTRANS_3PASS_TS][XTRANS_3PASS_TS];  // 均質性マップ
+    uint8_t homosum[XTRANS_3PASS_nDIRS][XTRANS_3PASS_TS][XTRANS_3PASS_TS]; // 均質性和
+    uint8_t homosummax[XTRANS_3PASS_TS][XTRANS_3PASS_TS]; // 最大均質性
+    s_minmaxgreen greenminmax[XTRANS_3PASS_TS][XTRANS_3PASS_TS/2]; // greenminmaxデータ (ts x ts/2)
+} XTrans3passTile;
 
 typedef struct {
     uint32_t width;
