@@ -29,6 +29,29 @@ def is_apple_silicon():
     """Apple Silicon の検出"""
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
+def get_brew_libomp_paths():
+    """Homebrewでインストールしたlibompのパスを取得"""
+    try:
+        # brew --prefix libomp でパスを取得
+        brew_prefix = subprocess.check_output(
+            ['brew', '--prefix', 'libomp'],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        
+        include_path = os.path.join(brew_prefix, 'include')
+        lib_path = os.path.join(brew_prefix, 'lib')
+        
+        if os.path.exists(include_path) and os.path.exists(lib_path):
+            print(f"Found libomp via Homebrew:")
+            print(f"  Include path: {include_path}")
+            print(f"  Library path: {lib_path}")
+            return include_path, lib_path
+        
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    
+    warnings.warn("libomp not found via Homebrew. OpenMP support may be limited.")
+    return None, None
 
 def find_libraw():
     """LibRaw ライブラリの検出"""
@@ -210,10 +233,13 @@ class CustomBuildExt(build_ext):
                         # 削除: '-ffp-contract=fast' - NEON最適化を阻害する可能性
                         '-fvectorize',         # ベクトル化強制
                         '-mllvm', '-force-vector-width=4',  # NEON幅指定
+                        '-Xpreprocessor', '-fopenmp', '-lomp',  # OpenMPサポート
+                        '-I"$(brew --prefix libomp)/include"', '-L"$(brew --prefix libomp)/lib"',
+
                     ])
                 
                 # Metal定義
-                ext.define_macros.append(('METAL_ACCELERATION_AVAILABLE', '1'))
+                ext.define_macros.append(('__arm64__', '1'))
                 
                 # Apple プラットフォーム固有のフラグ
                 ext.extra_compile_args.extend([
@@ -254,6 +280,9 @@ def create_extension():
     # Apple フレームワーク検出
     apple_frameworks, apple_framework_dirs = get_apple_frameworks()
     
+    # libompのパス取得
+    libomp_include, libomp_lib = get_brew_libomp_paths()
+    
     # ソースファイル
     sources = [
         'core/python_bindings.cpp',
@@ -279,8 +308,16 @@ def create_extension():
         *libraw_includes,
     ]
     
+    # libompのインクルードパスを追加
+    if libomp_include:
+        include_dirs.append(libomp_include)
+    
     # ライブラリディレクトリ
     library_dirs = libraw_lib_dirs + apple_framework_dirs
+    
+    # libompのライブラリパスを追加
+    if libomp_lib:
+        library_dirs.append(libomp_lib)
     
     # ライブラリ
     libraries = libraw_libs.copy()
@@ -303,6 +340,11 @@ def create_extension():
         
         # Objective-C++ compilation flags (handled by CustomBuildExt for .mm files)
         extra_compile_args.extend(['-fmodules'])
+        
+        # OpenMPサポートを追加
+        if libomp_include and libomp_lib:
+            extra_compile_args.extend(['-Xpreprocessor', '-fopenmp'])
+            extra_link_args.extend(['-lomp'])
         
         # デバッグ情報（デバッグビルド時）- O3は維持
         if os.environ.get('DEBUG'):
@@ -332,10 +374,10 @@ def create_extension():
     
     if is_apple_platform():
         define_macros.append(('APPLE_PLATFORM', '1'))
-        define_macros.append(('METAL_ACCELERATION_AVAILABLE', '1'))
+        define_macros.append(('__arm64__', '1'))
         define_macros.append(('GPU_METAL_ENABLED', '1'))  # GPU Metal実装を有効化
         if is_apple_silicon():
-            define_macros.append(('APPLE_SILICON', '1'))
+            define_macros.append(('__arm64__', '1'))
     
     # pybind11拡張の作成
     ext = Pybind11Extension(
@@ -352,7 +394,6 @@ def create_extension():
     )
     
     return ext
-
 
 if __name__ == "__main__":
     print("=" * 60)

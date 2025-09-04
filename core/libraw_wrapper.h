@@ -11,11 +11,9 @@ namespace py = pybind11;
 
 namespace libraw_enhanced {
 
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
 // Forward declarations for common types (defined in accelerator.h)
 struct ProcessingParams;
-struct ImageBuffer;
-class LibRawGPUCallbacks;
 #endif
 
 
@@ -25,12 +23,10 @@ struct ProcessingTimes {
     double file_load_time = 0.0;
     double unpack_time = 0.0;
     double demosaic_time = 0.0;
-    double gpu_demosaic_time = 0.0;
     double color_correction_time = 0.0;
     double gamma_correction_time = 0.0;
     double memory_copy_time = 0.0;
     double postprocess_time = 0.0;
-    bool gpu_used = false;
     std::string demosaic_algorithm_name;
     
     ProcessingTimes() = default;
@@ -43,7 +39,8 @@ struct ProcessedImageData {
     size_t channels = 0;
     size_t bits_per_sample = 0;
     int error_code = 0;
-    std::vector<uint8_t> data;
+    float* data = nullptr;
+    //std::vector<uint8_t> data;
     ProcessingTimes timing_info;  // 追加: 処理時間情報
     
     ProcessedImageData() = default;
@@ -57,7 +54,7 @@ struct ProcessedImageData {
     bool is_valid() const {
         return width > 0 && height > 0 && channels > 0 && 
                bits_per_sample > 0 && error_code == 0 && 
-               !data.empty();
+               data != nullptr;
     }
 };
 
@@ -108,7 +105,7 @@ public:
     void set_debug_mode(bool enable);
     void close();
     
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
     // Metal関連メソッド（実装はlibraw_wrapper.cppで定義）
     void set_processing_params(const ProcessingParams& params);
     void enable_gpu_acceleration(bool enable);
@@ -123,7 +120,7 @@ private:
     std::unique_ptr<Impl> pimpl;
 };
 
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
 // rawpy完全互換パラメータ変換関数（実装はlibraw_wrapper.cppで定義）
 ProcessingParams create_params_from_rawpy_args(
     // Basic parameters
@@ -179,12 +176,11 @@ ProcessingParams create_params_from_rawpy_args(
     const std::string& bad_pixels_path = "",
     
     // LibRaw Enhanced extensions
-    bool use_gpu_acceleration = true
+    bool use_gpu_acceleration = false
 );
 
 // Platform detection functions
 bool is_apple_silicon();
-// REMOVED: bool is_gpu_available(); - use LibRawWrapper::is_gpu_available() instead
 std::vector<std::string> get_metal_device_list();
 
 #endif

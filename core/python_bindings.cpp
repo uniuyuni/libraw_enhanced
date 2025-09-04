@@ -4,7 +4,7 @@
 #include <pybind11/stl_bind.h>
 #include "libraw_wrapper.h"
 
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
 #include "accelerator.h"
 #include "cpu_accelerator.h"
 #include "camera_matrices.h"
@@ -26,15 +26,13 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("file_load_time", &ProcessingTimes::file_load_time)
         .def_readonly("unpack_time", &ProcessingTimes::unpack_time)
         .def_readonly("demosaic_time", &ProcessingTimes::demosaic_time)
-        .def_readonly("gpu_demosaic_time", &ProcessingTimes::gpu_demosaic_time)
         .def_readonly("color_correction_time", &ProcessingTimes::color_correction_time)
         .def_readonly("gamma_correction_time", &ProcessingTimes::gamma_correction_time)
         .def_readonly("memory_copy_time", &ProcessingTimes::memory_copy_time)
         .def_readonly("postprocess_time", &ProcessingTimes::postprocess_time)
-        .def_readonly("gpu_used", &ProcessingTimes::gpu_used)
         .def_readonly("demosaic_algorithm_name", &ProcessingTimes::demosaic_algorithm_name);
     
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
     // ProcessingParams構造体のバインディング (完全なrawpy互換)
     py::class_<ProcessingParams>(m, "ProcessingParams")
         .def(py::init<>())
@@ -119,10 +117,10 @@ PYBIND11_MODULE(_core, m) {
     // ImageBuffer構造体のバインディング  
     py::class_<ImageBuffer>(m, "ImageBuffer")
         .def(py::init<>())
-        .def_readwrite("width", &ImageBuffer::width)
-        .def_readwrite("height", &ImageBuffer::height)
-        .def_readwrite("channels", &ImageBuffer::channels)
-        .def_property("image",
+        .def_readonly("width", &ImageBuffer::width)
+        .def_readonly("height", &ImageBuffer::height)
+        .def_readonly("channels", &ImageBuffer::channels)
+        .def_property_readonly("image",
             [](ImageBuffer &self) -> py::object {
                 if (self.image == nullptr) {
                     return py::none();
@@ -130,55 +128,35 @@ PYBIND11_MODULE(_core, m) {
                 // Return image data as array
                 size_t total_size = self.height * self.width * self.channels;
                 return py::array_t<uint16_t>(total_size, reinterpret_cast<uint16_t*>(self.image));
-            },
-            [](ImageBuffer &self, py::array_t<uint16_t> input) {
-                py::buffer_info buf = input.request();
-                self.image = reinterpret_cast<uint16_t(*)[4]>(buf.ptr);
-            }
-        );
-
+            });
 
     // ImageInfo構造体のバインディング
     py::class_<ImageInfo>(m, "ImageInfo")
         .def(py::init<>())
-        .def_readwrite("width", &ImageInfo::width)
-        .def_readwrite("height", &ImageInfo::height)
-        .def_readwrite("raw_width", &ImageInfo::raw_width)
-        .def_readwrite("raw_height", &ImageInfo::raw_height)
-        .def_readwrite("colors", &ImageInfo::colors)
-        .def_readwrite("camera_make", &ImageInfo::camera_make)
-        .def_readwrite("camera_model", &ImageInfo::camera_model)
-        .def_property("cam_mul",
+        .def_readonly("width", &ImageInfo::width)
+        .def_readonly("height", &ImageInfo::height)
+        .def_readonly("raw_width", &ImageInfo::raw_width)
+        .def_readonly("raw_height", &ImageInfo::raw_height)
+        .def_readonly("colors", &ImageInfo::colors)
+        .def_readonly("camera_make", &ImageInfo::camera_make)
+        .def_readonly("camera_model", &ImageInfo::camera_model)
+        .def_property_readonly("cam_mul",
             [](ImageInfo &self) -> py::array_t<float> {
                 return py::array_t<float>(4, self.cam_mul);
-            },
-            [](ImageInfo &self, py::array_t<float> input) {
-                py::buffer_info buf = input.request();
-                if (buf.size != 4) {
-                    throw std::runtime_error("cam_mul must have 4 elements");
-                }
-                std::copy_n(static_cast<float*>(buf.ptr), 4, self.cam_mul);
             })
-        .def_property("pre_mul",
+        .def_property_readonly("pre_mul",
             [](ImageInfo &self) -> py::array_t<float> {
                 return py::array_t<float>(4, self.pre_mul);
-            },
-            [](ImageInfo &self, py::array_t<float> input) {
-                py::buffer_info buf = input.request();
-                if (buf.size != 4) {
-                    throw std::runtime_error("pre_mul must have 4 elements");
-                }
-                std::copy_n(static_cast<float*>(buf.ptr), 4, self.pre_mul);
             });
 
     // ImageBufferFloat32構造体のバインディング
     py::class_<ImageBufferFloat>(m, "ImageBufferFloat")
         .def(py::init<>())
-        .def_readwrite("width", &ImageBufferFloat::width)
-        .def_readwrite("height", &ImageBufferFloat::height)
-        .def_readwrite("channels", &ImageBufferFloat::channels)
+        .def_readonly("width", &ImageBufferFloat::width)
+        .def_readonly("height", &ImageBufferFloat::height)
+        .def_readonly("channels", &ImageBufferFloat::channels)
         .def("is_valid", &ImageBufferFloat::is_valid)
-        .def_property("data",
+        .def_property_readonly("data",
             [](ImageBufferFloat &self) -> py::array_t<float> {
                 if (!self.image || self.width == 0 || self.height == 0 || self.channels == 0) {
                     return py::array_t<float>();
@@ -190,24 +168,12 @@ PYBIND11_MODULE(_core, m) {
                     reinterpret_cast<float*>(self.image),
                     py::cast(self) // Keep object alive
                 );
-            },
-            [](ImageBufferFloat &self, py::array_t<float> input) {
-                py::buffer_info buf = input.request();
-                size_t expected_size = self.width * self.height * self.channels;
-                if (static_cast<size_t>(buf.size) != expected_size) {
-                    throw std::runtime_error("Data size mismatch");
-                }
-                self.image = reinterpret_cast<float(*)[3]>(buf.ptr);
             });
 
-    // CPUAccelerator class is internal implementation - not exposed to Python
-
-    // Accelerator classes are internal implementation - not exposed to Python
-        
     // Camera matrix functions
     py::class_<ColorTransformMatrix>(m, "ColorTransformMatrix")
         .def(py::init<>())
-        .def_readwrite("valid", &ColorTransformMatrix::valid)
+        .def_readonly("valid", &ColorTransformMatrix::valid)
         .def_property_readonly("transform", [](const ColorTransformMatrix& self) -> py::array_t<float> {
             return py::array_t<float>({3, 4}, {4*sizeof(float), sizeof(float)}, &self.transform[0][0]);
         });
@@ -225,11 +191,11 @@ PYBIND11_MODULE(_core, m) {
     // ProcessedImageData構造体のバインディング
     py::class_<ProcessedImageData>(m, "ProcessedImageData")
         .def(py::init<>())
-        .def_readwrite("width", &ProcessedImageData::width)
-        .def_readwrite("height", &ProcessedImageData::height)
-        .def_readwrite("channels", &ProcessedImageData::channels)
-        .def_readwrite("bits_per_sample", &ProcessedImageData::bits_per_sample)
-        .def_readwrite("error_code", &ProcessedImageData::error_code)
+        .def_readonly("width", &ProcessedImageData::width)
+        .def_readonly("height", &ProcessedImageData::height)
+        .def_readonly("channels", &ProcessedImageData::channels)
+        .def_readonly("bits_per_sample", &ProcessedImageData::bits_per_sample)
+        .def_readonly("error_code", &ProcessedImageData::error_code)
         .def_readonly("timing_info", &ProcessedImageData::timing_info)
         .def("get_data_size", &ProcessedImageData::get_data_size)
         .def("is_valid", &ProcessedImageData::is_valid)
@@ -242,35 +208,43 @@ PYBIND11_MODULE(_core, m) {
             size_t width = self.width; 
             size_t channels = self.channels;
             
-            if (self.bits_per_sample == 16) {
-                // Return as uint16 array for 16-bit data
-                return py::array_t<uint16_t>(
-                    {height, width, channels},
-                    {sizeof(uint16_t) * width * channels, sizeof(uint16_t) * channels, sizeof(uint16_t)},
-                    reinterpret_cast<uint16_t*>(self.data.data())
-                );
-            } else {
+            if(self.bits_per_sample == 8) {
                 // Return as uint8 array for 8-bit data  
-                return py::array_t<uint8_t>(
+                py::array_t<uint8_t> array_8({height, width, channels});
+                float* in_ptr = self.data;
+                uint8_t* out_ptr = static_cast<uint8_t*>(array_8.request().ptr);
+
+                for (size_t i = 0; i < height * width * channels; i++) {
+                    *out_ptr++ = *in_ptr++ * 255.0f + 0.5f;
+                }
+                return array_8;
+            
+            } else if(self.bits_per_sample == 16) {
+                // Return as uint16 array for 16-bit data
+                py::array_t<uint16_t> array_16({height, width, channels});
+                float* in_ptr = self.data;
+                uint16_t* out_ptr = static_cast<uint16_t*>(array_16.request().ptr);
+
+                for (size_t i = 0; i < height * width * channels; i++) {
+                    *out_ptr++ = *in_ptr++ * 65535.0f + 0.5f;
+                }
+                return array_16;
+
+            } else {
+                // Return as float32 array for 32-bit data
+                return py::array_t<float>(
                     {height, width, channels},
-                    {sizeof(uint8_t) * width * channels, sizeof(uint8_t) * channels, sizeof(uint8_t)},
-                    self.data.data()
+                    {sizeof(float) * width * channels, sizeof(float) * channels, sizeof(float)},
+                    self.data
                 );
             }
         }, "Convert to numpy array with proper shape and dtype")
-        .def_property("data", 
-            [](ProcessedImageData &self) -> py::array_t<uint8_t> {
-                return py::array_t<uint8_t>(
-                    self.data.size(),
-                    self.data.data(),
+        .def_property_readonly("data", 
+            [](ProcessedImageData &self) -> py::array_t<float> {
+                return py::array_t<float>(
+                    {self.width, self.height, self.channels},
+                    self.data,
                     py::cast(self)
-                );
-            },
-            [](ProcessedImageData &self, py::array_t<uint8_t> input) {
-                py::buffer_info buf_info = input.request();
-                self.data.assign(
-                    static_cast<uint8_t*>(buf_info.ptr),
-                    static_cast<uint8_t*>(buf_info.ptr) + buf_info.size
                 );
             }
         );
@@ -292,7 +266,7 @@ PYBIND11_MODULE(_core, m) {
         .def("process_with_dict", &LibRawWrapper::process_with_dict)
         .def("close", &LibRawWrapper::close)
         .def("set_debug_mode", &LibRawWrapper::set_debug_mode)
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
         .def("set_processing_params", 
             [](LibRawWrapper& self, const ProcessingParams& params) {
                 self.set_processing_params(params);
@@ -305,7 +279,7 @@ PYBIND11_MODULE(_core, m) {
         ;
 
     // ヘルパー関数のバインディング
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
     m.def("is_apple_silicon", &is_apple_silicon, "Check if running on Apple Silicon");
     // REMOVED: Global is_gpu_available function - use LibRawWrapper.is_gpu_available() instead
     m.def("is_gpu_available", []() { 
@@ -369,7 +343,7 @@ PYBIND11_MODULE(_core, m) {
           py::arg("bad_pixels_path") = std::string(""),
           
           // LibRaw Enhanced extensions
-          py::arg("metal_acceleration") = true
+          py::arg("use_gpu_acceleration") = false
     );
 #else
     // Metal非対応環境用のスタブ関数
@@ -435,14 +409,14 @@ PYBIND11_MODULE(_core, m) {
 #endif
         );
         info["metal_support"] = py::bool_(
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
             true
 #else
             false
 #endif
         );
         info["apple_silicon"] = py::bool_(
-#ifdef APPLE_SILICON
+#ifdef __arm64__
             true
 #else
             false

@@ -9,7 +9,7 @@
 // LibRaw ヘッダー
 #include <libraw/libraw.h>
 
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
 #include "accelerator.h"
 #include "gpu_accelerator.h"
 #include "camera_matrices.h"
@@ -20,14 +20,38 @@
 
 namespace libraw_enhanced {
 
-void convert_float32_to_uint8_pipeline(const ImageBufferFloat& src, uint8_t* dst) {
-    size_t count = src.width * src.height * src.channels;
-    const float scale = 255.0f;
+void convert_float_to_float(const ImageBufferFloat& rgb_buffer, float* dst) {
+    size_t count = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
     
+    float* src = reinterpret_cast<float*>(rgb_buffer.image);
     for (size_t i = 0; i < count; i++) {
-        float val = (&src.image[0][0])[i] * scale;
-        val = std::max(0.0f, std::min(255.0f, val));
-        dst[i] = static_cast<uint8_t>(val + 0.5f);
+        float val = *src++;
+        val = std::max(0.0f, std::min(1.f, val));
+        *dst++ = val;
+    }
+}
+
+void convert_float_to_uint16(const ImageBufferFloat& rgb_buffer, uint16_t* dst) {
+    size_t count = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
+    const float scale = 65535.f;
+    
+    float* src = reinterpret_cast<float*>(rgb_buffer.image);
+    for (size_t i = 0; i < count; i++) {
+        float val = *src++ * scale;
+        val = std::max(0.0f, std::min(scale, val));
+        *dst++ = static_cast<uint8_t>(val + 0.5f);
+    }
+}
+
+void convert_float_to_uint8(const ImageBufferFloat& rgb_buffer, uint8_t* dst) {
+    size_t count = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
+    const float scale = 255.f;
+    
+    float* src = reinterpret_cast<float*>(rgb_buffer.image);
+    for (size_t i = 0; i < count; i++) {
+        float val = *src++ * scale;
+        val = std::max(0.0f, std::min(scale, val));
+        *dst++ = static_cast<uint8_t>(val + 0.5f);
     }
 }
 
@@ -38,12 +62,11 @@ public:
     ProcessingTimes timing_info;  // 処理時間情報
     BufferManager buffer_manager;  // Generic memory manager for all allocations
     
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
     std::unique_ptr<Accelerator> accelerator;
 
     // REMOVED: bool custom_pipeline_enabled (unused custom pipeline feature)
     ProcessingParams current_params;
-    ushort* custom_rgb_buffer = nullptr;  // Custom RGB buffer for GPU processing
 #endif
 
     //===============================================================
@@ -96,7 +119,7 @@ public:
                     
                     // Clamp to valid range
                     if (val < 0) val = 0;
-                    if (val > processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
+                    if (val > (int)processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
                     
                     raw_buffer.image[q][c] = val;
                 }
@@ -114,7 +137,7 @@ public:
                     
                     // Clamp to valid range
                     if (val < 0) val = 0;
-                    if (val > processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
+                    if (val > (int)processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
                     
                     raw_buffer.image[q][c] = val;
                 }
@@ -131,7 +154,7 @@ public:
                     
                     // Clamp to valid range
                     if (val < 0) val = 0;
-                    if (val > processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
+                    if (val > (int)processor.imgdata.color.maximum) val = processor.imgdata.color.maximum;
                     
                     raw_buffer.image[q][c] = val;
                 }
@@ -230,27 +253,23 @@ public:
     //===============================================================
     // CFA-aware white balance (experimental pre-demosaic implementation)
     //===============================================================
-    enum class CFAType { BAYER, XTRANS };
-    
     // Main CFA-aware white balance function
     void apply_white_balance_to_cfa_data(
         ImageBuffer& raw_buffer, 
         const float wb_multipliers[4], 
         uint32_t filters,
         const char xtrans[6][6],
-        CFAType cfa_type,
         float sensor_maximum
     ) {
         std::cout << "🧪 EXPERIMENTAL: Applying CFA-aware white balance (pre-demosaic)" << std::endl;
-        std::cout << "   - CFA Type: " << (cfa_type == CFAType::BAYER ? "Bayer" : "X-Trans") << std::endl;
         std::cout << "   - Sensor Maximum: " << sensor_maximum << std::endl;
         std::cout << "   - WB Multipliers: [" << wb_multipliers[0] << ", " << wb_multipliers[1] 
                   << ", " << wb_multipliers[2] << ", " << wb_multipliers[3] << "]" << std::endl;
         
-        if (cfa_type == CFAType::BAYER) {
-            apply_wb_bayer(raw_buffer, wb_multipliers, filters, sensor_maximum);
-        } else {
+        if (filters == FILTERS_XTRANS) {
             apply_wb_xtrans(raw_buffer, wb_multipliers, xtrans, sensor_maximum);
+        } else {
+            apply_wb_bayer(raw_buffer, wb_multipliers, filters, sensor_maximum);
         }
         
         std::cout << "✅ CFA-aware white balance completed" << std::endl;
@@ -482,7 +501,6 @@ public:
         }
         
         // Determine CFA type and apply appropriate WB processing
-        CFAType cfa_type = (filters == FILTERS_XTRANS) ? CFAType::XTRANS : CFAType::BAYER;
         float sensor_max = static_cast<float>(processor.imgdata.color.maximum);
         
         apply_white_balance_to_cfa_data(
@@ -490,7 +508,6 @@ public:
             effective_wb, 
             filters, 
             xtrans, 
-            cfa_type, 
             sensor_max
         );
 
@@ -591,21 +608,6 @@ public:
             }
             std::cout << "✅ Highlight recovery completed" << std::endl;
         }
-        
-        // Step 7: Copy processed data back to output buffer
-        /*
-        rgb_buffer.width = rgb_float.width;
-        rgb_buffer.height = rgb_float.height;
-        rgb_buffer.channels = 3;
-        
-        // Copy the processed float32 data to the output buffer
-        size_t total_elements = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
-        std::memcpy(rgb_buffer.image, rgb_float.image, total_elements * sizeof(float));
-        
-        std::cout << "✅ Processed data copied to output buffer (" << total_elements << " elements)" << std::endl;
-        // Note: rgb_temp.image allocated via buffer_manager - automatically managed
-        std::cout << "✅ RGB buffer will be freed by buffer_manager" << std::endl;
-        */
         
         std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully" << std::endl;
         return true;
@@ -1020,7 +1022,7 @@ public:
     }
 
     Impl() {
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
         // Metal加速器初期化
         accelerator = std::make_unique<Accelerator>();
         accelerator->initialize();
@@ -1055,7 +1057,6 @@ public:
     
     int process() {
         start_timer();
-        timing_info.gpu_used = false;
         
         // CRITICAL: Ensure default parameters are initialized if not already set
         if (current_params.user_wb[0] == 0.0f && current_params.user_wb[1] == 0.0f && 
@@ -1065,7 +1066,7 @@ public:
             set_processing_params(defaults);
         }
         
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
         // Use unified pipeline for accelerated processing
         if (accelerator && accelerator->is_available()) {
             std::cout << "🚀 Using unified accelerated pipeline (automatic GPU/CPU selection)" << std::endl;
@@ -1086,40 +1087,17 @@ public:
             raw_buffer.image = processor.imgdata.image;          // Now guaranteed non-null
             
             // Prepare output RGB buffer
-            ImageBufferFloat rgb_buffer;
             rgb_buffer.width = processor.imgdata.sizes.iwidth;   // Use processed width, not raw width
             rgb_buffer.height = processor.imgdata.sizes.iheight; // Use processed height, not raw height
             rgb_buffer.channels = 3;
             
             // Allocate output buffer - CRITICAL: allocate for float32, then convert to uint8
             size_t float_elements = rgb_buffer.width * rgb_buffer.height * 3;
-            size_t float_bytes = float_elements * sizeof(float);
-            
-            // Allocate persistent float buffer using BufferManager
-            rgb_buffer.image = static_cast<float(*)[3]>(buffer_manager.allocate(float_bytes));
+            rgb_buffer_image.resize(float_elements); // Resize vector to hold float data
+            rgb_buffer.image = reinterpret_cast<float (*)[3]>(rgb_buffer_image.data());
             
             // Use unified processing pipeline
             if (process_raw_to_rgb(raw_buffer, rgb_buffer, current_params)) {
-                // Convert float32 RGB to uint8 RGB for final output
-                size_t uint8_elements = rgb_buffer.width * rgb_buffer.height * 3;
-                metal_processed_data.resize(uint8_elements);
-                
-                std::cout << "🔄 Converting float32 to uint8..." << std::endl;
-                
-                // Convert float [0.0, 1.0] to uint8 [0, 255]
-                float* float_data = &rgb_buffer.image[0][0];
-                for (size_t i = 0; i < uint8_elements; i++) {
-                    float value = float_data[i];
-                    // Clamp and convert
-                    value = std::max(0.0f, std::min(1.0f, value));
-                    metal_processed_data[i] = static_cast<uint8_t>(value * 255.0f + 0.5f);
-                }
-                
-                std::cout << "✅ Conversion completed successfully" << std::endl;
-                
-                metal_processed_width = rgb_buffer.width;
-                metal_processed_height = rgb_buffer.height;
-                timing_info.gpu_used = true;  // GPU may have been used internally
                 timing_info.total_time = get_elapsed_time();
                 
                 if (debug_mode) {
@@ -1146,48 +1124,33 @@ public:
         // return result;
     }
     
-#ifdef METAL_ACCELERATION_AVAILABLE
-    
-    // Store Metal processing results (converted to 8-bit for compatibility)
-    std::vector<uint8_t> metal_processed_data;
-    size_t metal_processed_width = 0;
-    size_t metal_processed_height = 0;
+#ifdef __arm64__
+    // Store processing results
+    std::vector<float> rgb_buffer_image;
+    ImageBufferFloat rgb_buffer;
 #endif
     
     ProcessedImageData get_processed_image() {
         ProcessedImageData result;
         
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
         // Check if we have Metal-processed data
-        if (!metal_processed_data.empty() && metal_processed_width > 0 && metal_processed_height > 0) {
-            result.width = metal_processed_width;
-            result.height = metal_processed_height;
-            result.channels = 3;
-            // Determine bits_per_sample based on stored data size
-            size_t expected_16bit_size = metal_processed_width * metal_processed_height * 3 * 2;
-            size_t expected_8bit_size = metal_processed_width * metal_processed_height * 3;
-            
-            if (metal_processed_data.size() == expected_16bit_size) {
-                result.bits_per_sample = 16;
-                std::cout << "Returning 16-bit Metal-processed data" << std::endl;
-            } else if (metal_processed_data.size() == expected_8bit_size) {
-                result.bits_per_sample = 8;
-                std::cout << "Returning 8-bit Metal-processed data" << std::endl;
-            } else {
-                std::cerr << "Warning: Unexpected Metal data size: " << metal_processed_data.size() 
-                          << " (expected 8-bit: " << expected_8bit_size 
-                          << ", 16-bit: " << expected_16bit_size << ")" << std::endl;
-                result.bits_per_sample = 8; // Fallback
+        std::cout << "🔧 LibRaw_Wrapper rgb_buffer: " << rgb_buffer.image << " width: " << rgb_buffer.width << " height: " << rgb_buffer.height << std::endl;
+        if (rgb_buffer.is_valid()) {
+            result.width = rgb_buffer.width;
+            result.height = rgb_buffer.height;
+            result.channels = rgb_buffer.channels;
+
+            std::cout << "🔧 LibRaw_Wrapper output bps:" << current_params.output_bps << std::endl;
+            switch(current_params.output_bps) {
+            case 8:     result.bits_per_sample = 8;     break;
+            case 16:    result.bits_per_sample = 16;    break;
+            default:    result.bits_per_sample = 32;    break;
             }
+            result.data = reinterpret_cast<float*>(rgb_buffer.image);
             
-            result.data.assign(metal_processed_data.begin(), metal_processed_data.end());  // Copy the data
             result.error_code = LIBRAW_SUCCESS;
             result.timing_info = timing_info;  // 計測情報を含める
-            
-            // Clear the Metal data after copying to avoid reuse
-            metal_processed_data.clear();
-            metal_processed_width = 0;
-            metal_processed_height = 0;
             
             return result;
         }
@@ -1208,9 +1171,9 @@ public:
         result.bits_per_sample = processed_image->bits;
         
         // データをコピー
-        size_t data_size = result.width * result.height * result.channels * (result.bits_per_sample / 8);
-        result.data.resize(data_size);
-        memcpy(result.data.data(), processed_image->data, data_size);
+        //size_t data_size = result.width * result.height * result.channels * (result.bits_per_sample / 8);
+        //result.data.resize(data_size);
+        //memcpy(result.data.data(), processed_image->data, data_size);
         
         result.error_code = LIBRAW_SUCCESS;
         result.timing_info = timing_info;  // 計測情報を含める
@@ -1224,7 +1187,7 @@ public:
         // Debug mode setting simplified
     }
 
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
     void set_processing_params(const ProcessingParams& params) {
         current_params = params;
         
@@ -1498,15 +1461,10 @@ public:
 };
 
 // LibRawWrapper実装
-LibRawWrapper::LibRawWrapper() : pimpl(std::make_unique<Impl>()) {}
+LibRawWrapper::LibRawWrapper() : pimpl(std::make_unique<Impl>()) {
+}
 
 LibRawWrapper::~LibRawWrapper() {
-#ifdef METAL_ACCELERATION_AVAILABLE
-    if (pimpl->custom_rgb_buffer) {
-        free(pimpl->custom_rgb_buffer);
-        pimpl->custom_rgb_buffer = nullptr;
-    }
-#endif
 }
 
 int LibRawWrapper::load_file(const std::string& filename) {
@@ -1529,7 +1487,7 @@ void LibRawWrapper::set_debug_mode(bool enable) {
     pimpl->set_debug_mode(enable);
 }
 
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
 void LibRawWrapper::set_processing_params(const ProcessingParams& params) {
     pimpl->set_processing_params(params);
 }
@@ -1614,7 +1572,7 @@ ProcessedImageData LibRawWrapper::process_with_dict(
         else if (p.first == "no_auto_bright") params.no_auto_bright = p.second;
         else if (p.first == "dcb_enhance") params.dcb_enhance = p.second;
         else if (p.first == "no_auto_scale") params.no_auto_scale = p.second;
-        else if (p.first == "metal_acceleration") params.use_gpu_acceleration = p.second;
+        else if (p.first == "use_gpu_acceleration") params.use_gpu_acceleration = p.second;
     }
     
     for (const auto& p : int_params) {
@@ -1801,7 +1759,7 @@ ProcessingParams create_params_from_rawpy_args(
 
 // Platform detection functions implementation
 bool is_apple_silicon() {
-#ifdef APPLE_SILICON
+#ifdef __arm64__
     return true;
 #else
     return false;
@@ -1813,7 +1771,7 @@ bool is_apple_silicon() {
 
 bool is_metal_available() {
     // Backward compatibility - check if Metal is available without creating instances
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
     return is_apple_silicon(); // Simple check - Apple Silicon has Metal support
 #else
     return false;
@@ -1823,7 +1781,7 @@ bool is_metal_available() {
 std::vector<std::string> get_metal_device_list() {
     std::vector<std::string> device_list;
     
-#ifdef METAL_ACCELERATION_AVAILABLE
+#ifdef __arm64__
 #ifdef __OBJC__
     @autoreleasepool {
         NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();

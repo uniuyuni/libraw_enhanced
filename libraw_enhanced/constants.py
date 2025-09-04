@@ -66,18 +66,14 @@ class DemosaicAlgorithm(IntEnum):
     AMaZE = 10          # AMaZE (Aliasing minimization and zipper elimination) (requires GPL3 pack)
     DHT = 11            # DHT interpolation (LibRaw quality=11)
     AAHD = 12           # AAHD (Modified AHD variant) (LibRaw quality=12)
-    
-    # LibRaw Enhanced extensions
-    Adaptive = 100      # 適応的デモザイク
-    MLEnhanced = 101    # 機械学習強化
 
 
 # Output bit depths
 class OutputBitDepth(IntEnum):
     """出力ビット深度"""
-    Bit8 = 8
-    Bit16 = 16
-
+    UInt8 = 8
+    UInt16 = 16
+    Float32 = 32
 
 # White Balance modes
 class WhiteBalance(IntEnum):
@@ -137,7 +133,7 @@ class LibRawError(IntEnum):
 SUPPORTED_RAW_EXTENSIONS = {
     '.cr2', '.cr3',        # Canon
     '.nef', '.nrw',        # Nikon
-    '.arw', '.srf', '.sr2', # Sony
+    '.arw', '.srf', '.sr2',# Sony
     '.orf',                # Olympus
     '.pef', '.ptx',        # Pentax
     '.raf',                # Fujifilm

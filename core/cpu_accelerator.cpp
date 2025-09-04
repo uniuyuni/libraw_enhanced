@@ -1104,413 +1104,415 @@ public:
 
     void run() {
         static const int v1 = TS, v2 = 2*TS, v3 = 3*TS, p1 = -TS+1, p2 = -2*TS+2, p3 = -3*TS+3, m1 = TS+1, m2 = 2*TS+2, m3 = 3*TS+3;
-        
-        std::vector<char> processing_buffer(15 * sizeof(float) * TS * TS + sizeof(unsigned char) * TS * TSH + 256);
-        char* aligned_buffer = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(processing_buffer.data()) + 63) & ~63);
+#ifdef _OPENMP
+        #pragma omp parallel
+#endif
+        {        
+            std::vector<char> processing_buffer(15 * sizeof(float) * TS * TS + sizeof(unsigned char) * TS * TSH + 256);
+            char* aligned_buffer = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(processing_buffer.data()) + 63) & ~63);
 
-        float* rgbgreen     = reinterpret_cast<float*>(aligned_buffer);
-        float* delhvsqsum   = rgbgreen + TS*TS;
-        float* dirwts0      = delhvsqsum + TS*TS;
-        float* dirwts1      = dirwts0 + TS*TS;
-        float* vcd          = dirwts1 + TS*TS;
-        float* hcd          = vcd + TS*TS;
-        float* vcdalt       = hcd + TS*TS;
-        float* hcdalt       = vcdalt + TS*TS;
-        float* cddiffsq     = hcdalt + TS*TS;
-        float* hvwt         = cddiffsq + TS*TS;
-        float* dgintv       = reinterpret_cast<float*>(reinterpret_cast<char*>(hvwt) + sizeof(float) * TS * TSH);
-        float* dginth       = dgintv + TS*TS;
-        float* Dgrbsq1m     = dginth + TS*TS;
-        float* Dgrbsq1p     = reinterpret_cast<float*>(reinterpret_cast<char*>(Dgrbsq1m) + sizeof(float) * TS * TSH);
-        float* cfa          = reinterpret_cast<float*>(reinterpret_cast<char*>(Dgrbsq1p) + sizeof(float) * TS * TSH);
-        unsigned char* nyquist = reinterpret_cast<unsigned char*>(cfa + TS*TS);
-        unsigned char* nyquist2 = reinterpret_cast<unsigned char*>(cddiffsq);
-        float* nyqutest     = reinterpret_cast<float*>(reinterpret_cast<char*>(nyquist) + sizeof(unsigned char) * TS * TSH);
+            float* rgbgreen     = reinterpret_cast<float*>(aligned_buffer);
+            float* delhvsqsum   = rgbgreen + TS*TS;
+            float* dirwts0      = delhvsqsum + TS*TS;
+            float* dirwts1      = dirwts0 + TS*TS;
+            float* vcd          = dirwts1 + TS*TS;
+            float* hcd          = vcd + TS*TS;
+            float* vcdalt       = hcd + TS*TS;
+            float* hcdalt       = vcdalt + TS*TS;
+            float* cddiffsq     = hcdalt + TS*TS;
+            float* hvwt         = cddiffsq + TS*TS;
+            float* dgintv       = reinterpret_cast<float*>(reinterpret_cast<char*>(hvwt) + sizeof(float) * TS * TSH);
+            float* dginth       = dgintv + TS*TS;
+            float* Dgrbsq1m     = dginth + TS*TS;
+            float* Dgrbsq1p     = reinterpret_cast<float*>(reinterpret_cast<char*>(Dgrbsq1m) + sizeof(float) * TS * TSH);
+            float* cfa          = reinterpret_cast<float*>(reinterpret_cast<char*>(Dgrbsq1p) + sizeof(float) * TS * TSH);
+            unsigned char* nyquist = reinterpret_cast<unsigned char*>(cfa + TS*TS);
+            unsigned char* nyquist2 = reinterpret_cast<unsigned char*>(cddiffsq);
+            float* nyqutest     = reinterpret_cast<float*>(reinterpret_cast<char*>(nyquist) + sizeof(unsigned char) * TS * TSH);
 
-        for (int top = -16; top < (int)height_; top += TS - 32) {
-            for (int left = -16; left < (int)width_; left += TS - 32) {
-                int bottom = std::min(top + TS, (int)height_ + 16);
-                int right = std::min(left + TS, (int)width_ + 16);
-                int rr1 = bottom - top;
-                int cc1 = right - left;
-                int rrmin = (top < 0) ? 16 : 0;
-                int ccmin = (left < 0) ? 16 : 0;
-                int rrmax = (bottom > (int)height_) ? (int)height_ - top : rr1;
-                int ccmax = (right > (int)width_) ? (int)width_ - left : cc1;
+#ifdef _OPENMP
+            #pragma omp for collapse(2) schedule(dynamic, 8) nowait
+#endif
+            for (int top = -16; top < (int)height_; top += TS - 32) {
+                for (int left = -16; left < (int)width_; left += TS - 32) {
+                    int bottom = std::min(top + TS, (int)height_ + 16);
+                    int right = std::min(left + TS, (int)width_ + 16);
+                    int rr1 = bottom - top;
+                    int cc1 = right - left;
+                    int rrmin = (top < 0) ? 16 : 0;
+                    int ccmin = (left < 0) ? 16 : 0;
+                    int rrmax = (bottom > (int)height_) ? (int)height_ - top : rr1;
+                    int ccmax = (right > (int)width_) ? (int)width_ - left : cc1;
 
-                // === Tile Initialization with 16-pixel border ===
-                const float scale = 1.0f / maximum_value_;
-                
-                // Fill upper border
-                if (rrmin > 0) {
-                    for (int rr = 0; rr < 16; rr++) {
-                        for (int cc = ccmin; cc < ccmax; cc++) {
-                            int row = 32 - rr + top;
-                            int safe_row = std::max(0, std::min((int)height_ - 1, row));
-                            int safe_col = std::max(0, std::min((int)width_ - 1, cc + left));
-                            int c = fc_rt(safe_row, safe_col);
-                            float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
-                            cfa[rr * TS + cc] = val;
-                            rgbgreen[rr * TS + cc] = val;
+                    // === Tile Initialization with 16-pixel border ===
+                    const float scale = 1.0f / maximum_value_;
+                    
+                    // Fill upper border
+                    if (rrmin > 0) {
+                        for (int rr = 0; rr < 16; rr++) {
+                            for (int cc = ccmin; cc < ccmax; cc++) {
+                                int row = 32 - rr + top;
+                                int safe_row = std::max(0, std::min((int)height_ - 1, row));
+                                int safe_col = std::max(0, std::min((int)width_ - 1, cc + left));
+                                int c = fc_rt(safe_row, safe_col);
+                                float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                                cfa[rr * TS + cc] = val;
+                                rgbgreen[rr * TS + cc] = val;
+                            }
                         }
                     }
-                }
 
-                // Fill inner part
-                for (int rr = rrmin; rr < rrmax; rr++) {
-                    int row = rr + top;
-                    int cc = ccmin;
-                    for (; cc < ccmax; cc++) {
-                        int indx1 = rr * TS + cc;
-                        int c = fc_rt(row, cc + left);
-                        float val = (float)raw_buffer_.image[row * width_ + (cc + left)][c] * scale;
-                        cfa[indx1] = val;
-                        rgbgreen[indx1] = val;
-                    }
-                }
-                
-                // Fill lower border
-                if (rrmax < rr1) {
-                    for (int rr = 0; rr < 16; rr++) {
-                         for (int cc = ccmin; cc < ccmax; cc++) {
-                            int safe_row = std::max(0, std::min((int)height_ - 1, (int)height_ - rr - 2));
-                            int safe_col = std::max(0, std::min((int)width_ - 1, left + cc));
-                            int c = fc_rt(safe_row, safe_col);
-                            float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
-                            cfa[(rrmax + rr) * TS + cc] = val;
-                            rgbgreen[(rrmax + rr) * TS + cc] = val;
-                        }
-                    }
-                }
-                // Fill left/right borders and corners (scalar is fine for these)
-                if (ccmin > 0) {
+                    // Fill inner part
                     for (int rr = rrmin; rr < rrmax; rr++) {
-                        for (int cc = 0; cc < 16; cc++) {
-                            int row = rr + top;
-                            int safe_row = std::max(0, std::min((int)height_ - 1, row));
-                            int safe_col = std::max(0, std::min((int)width_ - 1, 32 - cc + left));
-                            int c = fc_rt(safe_row, safe_col);
-                            float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
-                            cfa[rr * TS + cc] = val;
-                            rgbgreen[rr * TS + cc] = val;
+                        int row = rr + top;
+                        int cc = ccmin;
+                        for (; cc < ccmax; cc++) {
+                            int indx1 = rr * TS + cc;
+                            int c = fc_rt(row, cc + left);
+                            float val = (float)raw_buffer_.image[row * width_ + (cc + left)][c] * scale;
+                            cfa[indx1] = val;
+                            rgbgreen[indx1] = val;
                         }
                     }
-                }
-                if (ccmax < cc1) {
-                    for (int rr = rrmin; rr < rrmax; rr++) {
-                        for (int cc = 0; cc < 16; cc++) {
-                             int safe_row = std::max(0, std::min((int)height_ - 1, top + rr));
-                             int safe_col = std::max(0, std::min((int)width_ - 1, (int)width_ - cc - 2));
-                             int c = fc_rt(safe_row, safe_col);
-                             float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
-                             cfa[rr * TS + ccmax + cc] = val;
-                             rgbgreen[rr * TS + ccmax + cc] = val;
+                    
+                    // Fill lower border
+                    if (rrmax < rr1) {
+                        for (int rr = 0; rr < 16; rr++) {
+                            for (int cc = ccmin; cc < ccmax; cc++) {
+                                int safe_row = std::max(0, std::min((int)height_ - 1, (int)height_ - rr - 2));
+                                int safe_col = std::max(0, std::min((int)width_ - 1, left + cc));
+                                int c = fc_rt(safe_row, safe_col);
+                                float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                                cfa[(rrmax + rr) * TS + cc] = val;
+                                rgbgreen[(rrmax + rr) * TS + cc] = val;
+                            }
                         }
                     }
-                }
-                // ... corners ...
+                    // Fill left/right borders and corners (scalar is fine for these)
+                    if (ccmin > 0) {
+                        for (int rr = rrmin; rr < rrmax; rr++) {
+                            for (int cc = 0; cc < 16; cc++) {
+                                int row = rr + top;
+                                int safe_row = std::max(0, std::min((int)height_ - 1, row));
+                                int safe_col = std::max(0, std::min((int)width_ - 1, 32 - cc + left));
+                                int c = fc_rt(safe_row, safe_col);
+                                float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                                cfa[rr * TS + cc] = val;
+                                rgbgreen[rr * TS + cc] = val;
+                            }
+                        }
+                    }
+                    if (ccmax < cc1) {
+                        for (int rr = rrmin; rr < rrmax; rr++) {
+                            for (int cc = 0; cc < 16; cc++) {
+                                int safe_row = std::max(0, std::min((int)height_ - 1, top + rr));
+                                int safe_col = std::max(0, std::min((int)width_ - 1, (int)width_ - cc - 2));
+                                int c = fc_rt(safe_row, safe_col);
+                                float val = (float)raw_buffer_.image[safe_row * width_ + safe_col][c] * scale;
+                                cfa[rr * TS + ccmax + cc] = val;
+                                rgbgreen[rr * TS + ccmax + cc] = val;
+                            }
+                        }
+                    }
+                    // ... corners ...
 
-                // === Start of RawTherapee AMaZE Algorithm Stages ===
-                
-                // STAGE 1: Horizontal and vertical gradients
-                for (int rr = 2; rr < rr1 - 2; rr++) {
-                    for (int cc = 2, idx = rr*TS+cc; cc < cc1 - 2; cc++, idx++) {
-                        float delh = fabsf(cfa[idx+1]-cfa[idx-1]);
-                        float delv = fabsf(cfa[idx+v1]-cfa[idx-v1]);
-                        dirwts0[idx] = eps+fabsf(cfa[idx+v2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-v2])+delv;
-                        dirwts1[idx] = eps+fabsf(cfa[idx+2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-2])+delh;
-                        delhvsqsum[idx] = SQR(delh)+SQR(delv);
-                    }
-                }
-
-                // STAGE 2: Interpolate vertical and horizontal colour differences
-                for (int rr = 4; rr < rr1 - 4; rr++) {
-                    for (int cc = 4, idx=rr*TS+cc; cc < cc1 - 4; cc++, idx++) {
-                        int sgn = (fc_rt(rr,cc)&1) ? -1 : 1;
-                        float cru = cfa[idx-v1]*(dirwts0[idx-v2]+dirwts0[idx]) / (dirwts0[idx-v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx-v2]));
-                        float crd = cfa[idx+v1]*(dirwts0[idx+v2]+dirwts0[idx]) / (dirwts0[idx+v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx+v2]));
-                        float crl = cfa[idx-1]*(dirwts1[idx-2]+dirwts1[idx]) / (dirwts1[idx-2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx-2]));
-                        float crr = cfa[idx+1]*(dirwts1[idx+2]+dirwts1[idx]) / (dirwts1[idx+2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx+2]));
-                        float guha=cfa[idx-v1]+xdiv2f(cfa[idx]-cfa[idx-v2]);
-                        float gdha=cfa[idx+v1]+xdiv2f(cfa[idx]-cfa[idx+v2]);
-                        float glha=cfa[idx-1]+xdiv2f(cfa[idx]-cfa[idx-2]);
-                        float grha=cfa[idx+1]+xdiv2f(cfa[idx]-cfa[idx+2]);
-                        float guar = fabsf(1.f-cru)<arthresh ? cfa[idx]*cru : guha;
-                        float gdar = fabsf(1.f-crd)<arthresh ? cfa[idx]*crd : gdha;
-                        float glar = fabsf(1.f-crl)<arthresh ? cfa[idx]*crl : glha;
-                        float grar = fabsf(1.f-crr)<arthresh ? cfa[idx]*crr : grha;
-                        float hwt=dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]);
-                        float vwt=dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
-                        float Gintvha = vwt*gdha+(1.f-vwt)*guha;
-                        float Ginthha = hwt*grha+(1.f-hwt)*glha;
-                        vcdalt[idx] = sgn*(Gintvha-cfa[idx]); 
-                        hcdalt[idx] = sgn*(Ginthha-cfa[idx]);
-                        if(cfa[idx]>clip_pt8 || Gintvha>clip_pt8 || Ginthha>clip_pt8) {
-                            vcd[idx] = vcdalt[idx]; hcd[idx] = hcdalt[idx];
-                            guar=guha; gdar=gdha; glar=glha; grar=grha;
-                        } else {
-                            vcd[idx] = sgn*(vwt*gdar+(1.f-vwt)*guar-cfa[idx]);
-                            hcd[idx] = sgn*(hwt*grar+(1.f-hwt)*glar-cfa[idx]);
-                        }
-                        dgintv[idx] = std::min(SQR(guha-gdha), SQR(guar-gdar));
-                        dginth[idx] = std::min(SQR(glha-grha), SQR(glar-grar));
-                    }
-                }
-                
-                // STAGE 3: Variance calculation and interpolation bounding
-                for (int rr = 4; rr < rr1 - 4; rr++) {
-                    for (int cc = 4, idx = rr*TS+cc; cc < cc1-4; cc++, idx++) {
-                        float hcdvar = 3.f*(SQR(hcd[idx-2])+SQR(hcd[idx])+SQR(hcd[idx+2]))-SQR(hcd[idx-2]+hcd[idx]+hcd[idx+2]);
-                        float hcdaltvar = 3.f*(SQR(hcdalt[idx-2])+SQR(hcdalt[idx])+SQR(hcdalt[idx+2]))-SQR(hcdalt[idx-2]+hcdalt[idx]+hcdalt[idx+2]);
-                        float vcdvar = 3.f*(SQR(vcd[idx-v2])+SQR(vcd[idx])+SQR(vcd[idx+v2]))-SQR(vcd[idx-v2]+vcd[idx]+vcd[idx+v2]);
-                        float vcdaltvar = 3.f*(SQR(vcdalt[idx-v2])+SQR(vcdalt[idx])+SQR(vcdalt[idx+v2]))-SQR(vcdalt[idx-v2]+vcdalt[idx]+vcdalt[idx+v2]);
-                        if(hcdaltvar < hcdvar) hcd[idx] = hcdalt[idx];
-                        if(vcdaltvar < vcdvar) vcd[idx] = vcdalt[idx];
-                        float Gintv, Ginth;
-                        if(fc_rt(rr,cc)&1) {
-                            Ginth=-hcd[idx]+cfa[idx]; Gintv=-vcd[idx]+cfa[idx];
-                            if(hcd[idx]>0){if(3.f*hcd[idx]>(Ginth+cfa[idx]))hcd[idx]=-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx];else{float hwt2=1.f-3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx]);}}
-                            if(vcd[idx]>0){if(3.f*vcd[idx]>(Gintv+cfa[idx]))vcd[idx]=-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx];else{float vwt2=1.f-3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx]);}}
-                        } else {
-                            Ginth=hcd[idx]+cfa[idx]; Gintv=vcd[idx]+cfa[idx];
-                            if(hcd[idx]<0){if(3.f*hcd[idx]<-(Ginth+cfa[idx]))hcd[idx]=median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx];else{float hwt2=1.f+3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);}}
-                            if(vcd[idx]<0){if(3.f*vcd[idx]<-(Gintv+cfa[idx]))vcd[idx]=median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx];else{float vwt2=1.f+3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);}}
-                        }
-                        if(Ginth > clip_pt) hcd[idx] = (fc_rt(rr,cc)&1?-1:1) * (median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);
-                        if(Gintv > clip_pt) vcd[idx] = (fc_rt(rr,cc)&1?-1:1) * (median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);
-                        cddiffsq[idx] = SQR(vcd[idx]-hcd[idx]);
-                    }
-                }
-
-                // STAGE 4 & 5: Directional variance, Texture analysis & Nyquist test calculation
-                for (int rr=6; rr<rr1-6; rr++) {
-                    for (int cc=6+(fc_rt(rr,2)&1), idx=rr*TS+cc; cc<cc1-6; cc+=2, idx+=2) {
-                        float uave = vcd[idx]+vcd[idx-v1]+vcd[idx-v2]+vcd[idx-v3];
-                        float dave = vcd[idx]+vcd[idx+v1]+vcd[idx+v2]+vcd[idx+v3];
-                        float lave = hcd[idx]+hcd[idx-1]+hcd[idx-2]+hcd[idx-3];
-                        float rave = hcd[idx]+hcd[idx+1]+hcd[idx+2]+hcd[idx+3];
-                        float Dgrbvvaru = SQR(vcd[idx]-uave)+SQR(vcd[idx-v1]-uave)+SQR(vcd[idx-v2]-uave)+SQR(vcd[idx-v3]-uave);
-                        float Dgrbvvard = SQR(vcd[idx]-dave)+SQR(vcd[idx+v1]-dave)+SQR(vcd[idx+v2]-dave)+SQR(vcd[idx+v3]-dave);
-                        float Dgrbhvarl = SQR(hcd[idx]-lave)+SQR(hcd[idx-1]-lave)+SQR(hcd[idx-2]-lave)+SQR(hcd[idx-3]-lave);
-                        float Dgrbhvarr = SQR(hcd[idx]-rave)+SQR(hcd[idx+1]-rave)+SQR(hcd[idx+2]-rave)+SQR(hcd[idx+3]-rave);
-                        float hwt = dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]);
-                        float vwt = dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
-                        float vcdvar = epssq+vwt*Dgrbvvard+(1.f-vwt)*Dgrbvvaru;
-                        float hcdvar = epssq+hwt*Dgrbhvarr+(1.f-hwt)*Dgrbhvarl;
-                        float Dgrbvvaru2 = dgintv[idx]+dgintv[idx-v1]+dgintv[idx-v2];
-                        float Dgrbvvard2 = dgintv[idx]+dgintv[idx+v1]+dgintv[idx+v2];
-                        float Dgrbhvarl2 = dginth[idx]+dginth[idx-1]+dginth[idx-2];
-                        float Dgrbhvarr2 = dginth[idx]+dginth[idx+1]+dginth[idx+2];
-                        float vcdvar1 = epssq+vwt*Dgrbvvard2+(1.f-vwt)*Dgrbvvaru2;
-                        float hcdvar1 = epssq+hwt*Dgrbhvarr2+(1.f-hwt)*Dgrbhvarl2;
-                        float varwt = hcdvar/(vcdvar+hcdvar);
-                        float diffwt = hcdvar1/(vcdvar1+hcdvar1);
-                        hvwt[idx>>1] = ((0.5f-varwt)*(0.5f-diffwt)>0.f && fabsf(0.5f-diffwt)<fabsf(0.5f-varwt)) ? varwt : diffwt;
-                    }
-                }
-                for (int rr=6; rr<rr1-6; rr++) {
-                    for (int cc=6+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2){
-                        nyqutest[idx>>1]=(gaussodd[0]*cddiffsq[idx]+gaussodd[1]*(cddiffsq[idx-m1]+cddiffsq[idx+p1]+cddiffsq[idx-p1]+cddiffsq[idx+m1])+gaussodd[2]*(cddiffsq[idx-v2]+cddiffsq[idx-2]+cddiffsq[idx+2]+cddiffsq[idx+v2])+gaussodd[3]*(cddiffsq[idx-m2]+cddiffsq[idx+p2]+cddiffsq[idx-p2]+cddiffsq[idx+m2]))-(gaussgrad[0]*delhvsqsum[idx]+gaussgrad[1]*(delhvsqsum[idx-v1]+delhvsqsum[idx+1]+delhvsqsum[idx-1]+delhvsqsum[idx+v1])+gaussgrad[2]*(delhvsqsum[idx-m1]+delhvsqsum[idx+p1]+delhvsqsum[idx-p1]+delhvsqsum[idx+m1])+gaussgrad[3]*(delhvsqsum[idx-v2]+delhvsqsum[idx-2]+delhvsqsum[idx+2]+delhvsqsum[idx+v2])+gaussgrad[4]*(delhvsqsum[idx-v2-1]+delhvsqsum[idx-v2+1]+delhvsqsum[idx-TS-2]+delhvsqsum[idx-TS+2]+delhvsqsum[idx+TS-2]+delhvsqsum[idx+TS+2]+delhvsqsum[idx+v2-1]+delhvsqsum[idx+v2+1])+gaussgrad[5]*(delhvsqsum[idx-m2]+delhvsqsum[idx+p2]+delhvsqsum[idx-p2]+delhvsqsum[idx+m2]));
-                    }
-                }
-                bool doNyquist = false;
-                memset(nyquist, 0, sizeof(unsigned char) * TS * TSH);
-                for (int rr = 6; rr < rr1-6; rr++) for (int cc=6+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2) if(nyqutest[idx>>1]>0.f) {nyquist[idx>>1]=1; doNyquist=true;}
-
-                // STAGE 6: Nyquist processing & Green interpolation
-                if(doNyquist) {
-                    memset(nyquist2, 0, sizeof(unsigned char)*TS*TSH);
-                    for (int rr=8; rr<rr1-8; rr++) {
-                        for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) {
-                            unsigned int nqsum=(nyquist[(idx-v2)>>1]+nyquist[(idx-m1)>>1]+nyquist[(idx+p1)>>1]+nyquist[(idx-2)>>1]+nyquist[(idx+2)>>1]+nyquist[(idx-p1)>>1]+nyquist[(idx+m1)>>1]+nyquist[(idx+v2)>>1]);
-                            nyquist2[idx>>1]= nqsum>4?1:(nqsum<4?0:nyquist[idx>>1]);
+                    // === Start of RawTherapee AMaZE Algorithm Stages ===
+                    
+                    // STAGE 1: Horizontal and vertical gradients
+                    for (int rr = 2; rr < rr1 - 2; rr++) {
+                        for (int cc = 2, idx = rr*TS+cc; cc < cc1 - 2; cc++, idx++) {
+                            float delh = fabsf(cfa[idx+1]-cfa[idx-1]);
+                            float delv = fabsf(cfa[idx+v1]-cfa[idx-v1]);
+                            dirwts0[idx] = eps+fabsf(cfa[idx+v2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-v2])+delv;
+                            dirwts1[idx] = eps+fabsf(cfa[idx+2]-cfa[idx])+fabsf(cfa[idx]-cfa[idx-2])+delh;
+                            delhvsqsum[idx] = SQR(delh)+SQR(delv);
                         }
                     }
-                    for (int rr=8; rr<rr1-8; rr++) {
-                        for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]) {
-                            float sumcfa=0,sumh=0,sumv=0,sumsqh=0,sumsqv=0,areawt=0;
-                            for(int i=-6;i<7;i+=2) for(int j=-6;j<7;j+=2) {
-                                int idx1=idx+i*TS+j;
-                                if ( (idx1 >= 0) && (idx1 < TS*TS) && nyquist2[idx1>>1]) {
-                                    float cfatemplate=cfa[idx1]; sumcfa+=cfatemplate; sumh+=(cfa[idx1-1]+cfa[idx1+1]); sumv+=(cfa[idx1-v1]+cfa[idx1+v1]);
-                                    sumsqh+=SQR(cfatemplate-cfa[idx1-1])+SQR(cfatemplate-cfa[idx1+1]); sumsqv+=SQR(cfatemplate-cfa[idx1-v1])+SQR(cfatemplate-cfa[idx1+v1]); areawt+=1;
+
+                    // STAGE 2: Interpolate vertical and horizontal colour differences
+                    for (int rr = 4; rr < rr1 - 4; rr++) {
+                        for (int cc = 4, idx=rr*TS+cc; cc < cc1 - 4; cc++, idx++) {
+                            int sgn = (fc_rt(rr,cc)&1) ? -1 : 1;
+                            float cru = cfa[idx-v1]*(dirwts0[idx-v2]+dirwts0[idx]) / (dirwts0[idx-v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx-v2]));
+                            float crd = cfa[idx+v1]*(dirwts0[idx+v2]+dirwts0[idx]) / (dirwts0[idx+v2]*(eps+cfa[idx])+dirwts0[idx]*(eps+cfa[idx+v2]));
+                            float crl = cfa[idx-1]*(dirwts1[idx-2]+dirwts1[idx]) / (dirwts1[idx-2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx-2]));
+                            float crr = cfa[idx+1]*(dirwts1[idx+2]+dirwts1[idx]) / (dirwts1[idx+2]*(eps+cfa[idx])+dirwts1[idx]*(eps+cfa[idx+2]));
+                            float guha=cfa[idx-v1]+xdiv2f(cfa[idx]-cfa[idx-v2]);
+                            float gdha=cfa[idx+v1]+xdiv2f(cfa[idx]-cfa[idx+v2]);
+                            float glha=cfa[idx-1]+xdiv2f(cfa[idx]-cfa[idx-2]);
+                            float grha=cfa[idx+1]+xdiv2f(cfa[idx]-cfa[idx+2]);
+                            float guar = fabsf(1.f-cru)<arthresh ? cfa[idx]*cru : guha;
+                            float gdar = fabsf(1.f-crd)<arthresh ? cfa[idx]*crd : gdha;
+                            float glar = fabsf(1.f-crl)<arthresh ? cfa[idx]*crl : glha;
+                            float grar = fabsf(1.f-crr)<arthresh ? cfa[idx]*crr : grha;
+                            float hwt=dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]);
+                            float vwt=dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
+                            float Gintvha = vwt*gdha+(1.f-vwt)*guha;
+                            float Ginthha = hwt*grha+(1.f-hwt)*glha;
+                            vcdalt[idx] = sgn*(Gintvha-cfa[idx]); 
+                            hcdalt[idx] = sgn*(Ginthha-cfa[idx]);
+                            if(cfa[idx]>clip_pt8 || Gintvha>clip_pt8 || Ginthha>clip_pt8) {
+                                vcd[idx] = vcdalt[idx]; hcd[idx] = hcdalt[idx];
+                                guar=guha; gdar=gdha; glar=glha; grar=grha;
+                            } else {
+                                vcd[idx] = sgn*(vwt*gdar+(1.f-vwt)*guar-cfa[idx]);
+                                hcd[idx] = sgn*(hwt*grar+(1.f-hwt)*glar-cfa[idx]);
+                            }
+                            dgintv[idx] = std::min(SQR(guha-gdha), SQR(guar-gdar));
+                            dginth[idx] = std::min(SQR(glha-grha), SQR(glar-grar));
+                        }
+                    }
+                    
+                    // STAGE 3: Variance calculation and interpolation bounding
+                    for (int rr = 4; rr < rr1 - 4; rr++) {
+                        for (int cc = 4, idx = rr*TS+cc; cc < cc1-4; cc++, idx++) {
+                            float hcdvar = 3.f*(SQR(hcd[idx-2])+SQR(hcd[idx])+SQR(hcd[idx+2]))-SQR(hcd[idx-2]+hcd[idx]+hcd[idx+2]);
+                            float hcdaltvar = 3.f*(SQR(hcdalt[idx-2])+SQR(hcdalt[idx])+SQR(hcdalt[idx+2]))-SQR(hcdalt[idx-2]+hcdalt[idx]+hcdalt[idx+2]);
+                            float vcdvar = 3.f*(SQR(vcd[idx-v2])+SQR(vcd[idx])+SQR(vcd[idx+v2]))-SQR(vcd[idx-v2]+vcd[idx]+vcd[idx+v2]);
+                            float vcdaltvar = 3.f*(SQR(vcdalt[idx-v2])+SQR(vcdalt[idx])+SQR(vcdalt[idx+v2]))-SQR(vcdalt[idx-v2]+vcdalt[idx]+vcdalt[idx+v2]);
+                            if(hcdaltvar < hcdvar) hcd[idx] = hcdalt[idx];
+                            if(vcdaltvar < vcdvar) vcd[idx] = vcdalt[idx];
+                            float Gintv, Ginth;
+                            if(fc_rt(rr,cc)&1) {
+                                Ginth=-hcd[idx]+cfa[idx]; Gintv=-vcd[idx]+cfa[idx];
+                                if(hcd[idx]>0){if(3.f*hcd[idx]>(Ginth+cfa[idx]))hcd[idx]=-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx];else{float hwt2=1.f-3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(-median(Ginth,cfa[idx-1],cfa[idx+1])+cfa[idx]);}}
+                                if(vcd[idx]>0){if(3.f*vcd[idx]>(Gintv+cfa[idx]))vcd[idx]=-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx];else{float vwt2=1.f-3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(-median(Gintv,cfa[idx-v1],cfa[idx+v1])+cfa[idx]);}}
+                            } else {
+                                Ginth=hcd[idx]+cfa[idx]; Gintv=vcd[idx]+cfa[idx];
+                                if(hcd[idx]<0){if(3.f*hcd[idx]<-(Ginth+cfa[idx]))hcd[idx]=median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx];else{float hwt2=1.f+3.f*hcd[idx]/(eps+Ginth+cfa[idx]);hcd[idx]=hwt2*hcd[idx]+(1.f-hwt2)*(median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);}}
+                                if(vcd[idx]<0){if(3.f*vcd[idx]<-(Gintv+cfa[idx]))vcd[idx]=median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx];else{float vwt2=1.f+3.f*vcd[idx]/(eps+Gintv+cfa[idx]);vcd[idx]=vwt2*vcd[idx]+(1.f-vwt2)*(median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);}}
+                            }
+                            if(Ginth > clip_pt) hcd[idx] = (fc_rt(rr,cc)&1?-1:1) * (median(Ginth,cfa[idx-1],cfa[idx+1])-cfa[idx]);
+                            if(Gintv > clip_pt) vcd[idx] = (fc_rt(rr,cc)&1?-1:1) * (median(Gintv,cfa[idx-v1],cfa[idx+v1])-cfa[idx]);
+                            cddiffsq[idx] = SQR(vcd[idx]-hcd[idx]);
+                        }
+                    }
+
+                    // STAGE 4 & 5: Directional variance, Texture analysis & Nyquist test calculation
+                    for (int rr=6; rr<rr1-6; rr++) {
+                        for (int cc=6+(fc_rt(rr,2)&1), idx=rr*TS+cc; cc<cc1-6; cc+=2, idx+=2) {
+                            float uave = vcd[idx]+vcd[idx-v1]+vcd[idx-v2]+vcd[idx-v3];
+                            float dave = vcd[idx]+vcd[idx+v1]+vcd[idx+v2]+vcd[idx+v3];
+                            float lave = hcd[idx]+hcd[idx-1]+hcd[idx-2]+hcd[idx-3];
+                            float rave = hcd[idx]+hcd[idx+1]+hcd[idx+2]+hcd[idx+3];
+                            float Dgrbvvaru = SQR(vcd[idx]-uave)+SQR(vcd[idx-v1]-uave)+SQR(vcd[idx-v2]-uave)+SQR(vcd[idx-v3]-uave);
+                            float Dgrbvvard = SQR(vcd[idx]-dave)+SQR(vcd[idx+v1]-dave)+SQR(vcd[idx+v2]-dave)+SQR(vcd[idx+v3]-dave);
+                            float Dgrbhvarl = SQR(hcd[idx]-lave)+SQR(hcd[idx-1]-lave)+SQR(hcd[idx-2]-lave)+SQR(hcd[idx-3]-lave);
+                            float Dgrbhvarr = SQR(hcd[idx]-rave)+SQR(hcd[idx+1]-rave)+SQR(hcd[idx+2]-rave)+SQR(hcd[idx+3]-rave);
+                            float hwt = dirwts1[idx-1]/(dirwts1[idx-1]+dirwts1[idx+1]);
+                            float vwt = dirwts0[idx-v1]/(dirwts0[idx+v1]+dirwts0[idx-v1]);
+                            float vcdvar = epssq+vwt*Dgrbvvard+(1.f-vwt)*Dgrbvvaru;
+                            float hcdvar = epssq+hwt*Dgrbhvarr+(1.f-hwt)*Dgrbhvarl;
+                            float Dgrbvvaru2 = dgintv[idx]+dgintv[idx-v1]+dgintv[idx-v2];
+                            float Dgrbvvard2 = dgintv[idx]+dgintv[idx+v1]+dgintv[idx+v2];
+                            float Dgrbhvarl2 = dginth[idx]+dginth[idx-1]+dginth[idx-2];
+                            float Dgrbhvarr2 = dginth[idx]+dginth[idx+1]+dginth[idx+2];
+                            float vcdvar1 = epssq+vwt*Dgrbvvard2+(1.f-vwt)*Dgrbvvaru2;
+                            float hcdvar1 = epssq+hwt*Dgrbhvarr2+(1.f-hwt)*Dgrbhvarl2;
+                            float varwt = hcdvar/(vcdvar+hcdvar);
+                            float diffwt = hcdvar1/(vcdvar1+hcdvar1);
+                            hvwt[idx>>1] = ((0.5f-varwt)*(0.5f-diffwt)>0.f && fabsf(0.5f-diffwt)<fabsf(0.5f-varwt)) ? varwt : diffwt;
+                        }
+                    }
+                    for (int rr=6; rr<rr1-6; rr++) {
+                        for (int cc=6+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2){
+                            nyqutest[idx>>1]=(gaussodd[0]*cddiffsq[idx]+gaussodd[1]*(cddiffsq[idx-m1]+cddiffsq[idx+p1]+cddiffsq[idx-p1]+cddiffsq[idx+m1])+gaussodd[2]*(cddiffsq[idx-v2]+cddiffsq[idx-2]+cddiffsq[idx+2]+cddiffsq[idx+v2])+gaussodd[3]*(cddiffsq[idx-m2]+cddiffsq[idx+p2]+cddiffsq[idx-p2]+cddiffsq[idx+m2]))-(gaussgrad[0]*delhvsqsum[idx]+gaussgrad[1]*(delhvsqsum[idx-v1]+delhvsqsum[idx+1]+delhvsqsum[idx-1]+delhvsqsum[idx+v1])+gaussgrad[2]*(delhvsqsum[idx-m1]+delhvsqsum[idx+p1]+delhvsqsum[idx-p1]+delhvsqsum[idx+m1])+gaussgrad[3]*(delhvsqsum[idx-v2]+delhvsqsum[idx-2]+delhvsqsum[idx+2]+delhvsqsum[idx+v2])+gaussgrad[4]*(delhvsqsum[idx-v2-1]+delhvsqsum[idx-v2+1]+delhvsqsum[idx-TS-2]+delhvsqsum[idx-TS+2]+delhvsqsum[idx+TS-2]+delhvsqsum[idx+TS+2]+delhvsqsum[idx+v2-1]+delhvsqsum[idx+v2+1])+gaussgrad[5]*(delhvsqsum[idx-m2]+delhvsqsum[idx+p2]+delhvsqsum[idx-p2]+delhvsqsum[idx+m2]));
+                        }
+                    }
+                    bool doNyquist = false;
+                    memset(nyquist, 0, sizeof(unsigned char) * TS * TSH);
+                    for (int rr = 6; rr < rr1-6; rr++) for (int cc=6+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-6; cc+=2,idx+=2) if(nyqutest[idx>>1]>0.f) {nyquist[idx>>1]=1; doNyquist=true;}
+
+                    // STAGE 6: Nyquist processing & Green interpolation
+                    if(doNyquist) {
+                        memset(nyquist2, 0, sizeof(unsigned char)*TS*TSH);
+                        for (int rr=8; rr<rr1-8; rr++) {
+                            for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) {
+                                unsigned int nqsum=(nyquist[(idx-v2)>>1]+nyquist[(idx-m1)>>1]+nyquist[(idx+p1)>>1]+nyquist[(idx-2)>>1]+nyquist[(idx+2)>>1]+nyquist[(idx-p1)>>1]+nyquist[(idx+m1)>>1]+nyquist[(idx+v2)>>1]);
+                                nyquist2[idx>>1]= nqsum>4?1:(nqsum<4?0:nyquist[idx>>1]);
+                            }
+                        }
+                        for (int rr=8; rr<rr1-8; rr++) {
+                            for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]) {
+                                float sumcfa=0,sumh=0,sumv=0,sumsqh=0,sumsqv=0,areawt=0;
+                                for(int i=-6;i<7;i+=2) for(int j=-6;j<7;j+=2) {
+                                    int idx1=idx+i*TS+j;
+                                    if ( (idx1 >= 0) && (idx1 < TS*TS) && nyquist2[idx1>>1]) {
+                                        float cfatemplate=cfa[idx1]; sumcfa+=cfatemplate; sumh+=(cfa[idx1-1]+cfa[idx1+1]); sumv+=(cfa[idx1-v1]+cfa[idx1+v1]);
+                                        sumsqh+=SQR(cfatemplate-cfa[idx1-1])+SQR(cfatemplate-cfa[idx1+1]); sumsqv+=SQR(cfatemplate-cfa[idx1-v1])+SQR(cfatemplate-cfa[idx1+v1]); areawt+=1;
+                                    }
                                 }
+                                sumh=sumcfa-xdiv2f(sumh); sumv=sumcfa-xdiv2f(sumv); areawt=xdiv2f(areawt);
+                                float hcdvar2=epssq+fabsf(areawt*sumsqh-sumh*sumh), vcdvar2=epssq+fabsf(areawt*sumsqv-sumv*sumv);
+                                hvwt[idx>>1]=hcdvar2/(vcdvar2+hcdvar2);
                             }
-                            sumh=sumcfa-xdiv2f(sumh); sumv=sumcfa-xdiv2f(sumv); areawt=xdiv2f(areawt);
-                            float hcdvar2=epssq+fabsf(areawt*sumsqh-sumh*sumh), vcdvar2=epssq+fabsf(areawt*sumsqv-sumv*sumv);
-                            hvwt[idx>>1]=hcdvar2/(vcdvar2+hcdvar2);
                         }
                     }
-                }
-                float* Dgrb0 = vcdalt; 
-                s_hv* Dgrb2_ptr = reinterpret_cast<s_hv*>(Dgrbsq1m);
-                for (int rr=8; rr<rr1-8; rr++) {
-                    for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2){
-                        float hvwtalt=0.25f*(hvwt[(idx-m1)>>1]+hvwt[(idx+p1)>>1]+hvwt[(idx-p1)>>1]+hvwt[(idx+m1)>>1]);
-                        hvwt[idx>>1] = fabsf(0.5f-hvwt[idx>>1])<fabsf(0.5f-hvwtalt) ? hvwtalt : hvwt[idx>>1];
-                        Dgrb0[idx>>1] = hvwt[idx>>1]*vcd[idx] + (1.f-hvwt[idx>>1])*hcd[idx];
-                        rgbgreen[idx] = cfa[idx] + Dgrb0[idx>>1];
-                        Dgrb2_ptr[idx>>1].h = nyquist2[idx>>1] ? SQR(rgbgreen[idx]-xdiv2f(rgbgreen[idx-1]+rgbgreen[idx+1])) : 0.f;
-                        Dgrb2_ptr[idx>>1].v = nyquist2[idx>>1] ? SQR(rgbgreen[idx]-xdiv2f(rgbgreen[idx-v1]+rgbgreen[idx+v1])) : 0.f;
-                    }
-                }
-                if(doNyquist) {
-                    for(int rr=8; rr<rr1-8; rr++) {
-                        for(int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]){
-                            float gvarh=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].h+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].h+Dgrb2_ptr[(idx+p1)>>1].h+Dgrb2_ptr[(idx-p1)>>1].h+Dgrb2_ptr[(idx+m1)>>1].h)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].h+Dgrb2_ptr[(idx-2)>>1].h+Dgrb2_ptr[(idx+2)>>1].h+Dgrb2_ptr[(idx+v2)>>1].h)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].h+Dgrb2_ptr[(idx+p2)>>1].h+Dgrb2_ptr[(idx-p2)>>1].h+Dgrb2_ptr[(idx+m2)>>1].h));
-                            float gvarv=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].v+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].v+Dgrb2_ptr[(idx+p1)>>1].v+Dgrb2_ptr[(idx-p1)>>1].v+Dgrb2_ptr[(idx+m1)>>1].v)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].v+Dgrb2_ptr[(idx-2)>>1].v+Dgrb2_ptr[(idx+2)>>1].v+Dgrb2_ptr[(idx+v2)>>1].v)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].v+Dgrb2_ptr[(idx+p2)>>1].v+Dgrb2_ptr[(idx-p2)>>1].v+Dgrb2_ptr[(idx+m2)>>1].v));
-                            Dgrb0[idx>>1]=(hcd[idx]*gvarv+vcd[idx]*gvarh)/(gvarv+gvarh);
-                            rgbgreen[idx]=cfa[idx]+Dgrb0[idx>>1];
+                    float* Dgrb0 = vcdalt; 
+                    s_hv* Dgrb2_ptr = reinterpret_cast<s_hv*>(Dgrbsq1m);
+                    for (int rr=8; rr<rr1-8; rr++) {
+                        for (int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2){
+                            float hvwtalt=0.25f*(hvwt[(idx-m1)>>1]+hvwt[(idx+p1)>>1]+hvwt[(idx-p1)>>1]+hvwt[(idx+m1)>>1]);
+                            hvwt[idx>>1] = fabsf(0.5f-hvwt[idx>>1])<fabsf(0.5f-hvwtalt) ? hvwtalt : hvwt[idx>>1];
+                            Dgrb0[idx>>1] = hvwt[idx>>1]*vcd[idx] + (1.f-hvwt[idx>>1])*hcd[idx];
+                            rgbgreen[idx] = cfa[idx] + Dgrb0[idx>>1];
+                            Dgrb2_ptr[idx>>1].h = nyquist2[idx>>1] ? SQR(rgbgreen[idx]-xdiv2f(rgbgreen[idx-1]+rgbgreen[idx+1])) : 0.f;
+                            Dgrb2_ptr[idx>>1].v = nyquist2[idx>>1] ? SQR(rgbgreen[idx]-xdiv2f(rgbgreen[idx-v1]+rgbgreen[idx+v1])) : 0.f;
                         }
                     }
-                }
-
-                // STAGE 7: Red/Blue gradient preprocessing
-                float* delp = cddiffsq;
-                float* delm = reinterpret_cast<float*>(reinterpret_cast<char*>(delp) + sizeof(float) * TS * TSH);
-                for (int rr = 6; rr < rr1 - 6; rr++) {
-                    if ((fc_rt(rr, 2) & 1) == 0) {
-                        for (int cc = 6, idx = rr * TS + cc; cc < cc1 - 6; cc += 2, idx += 2) {
-                            delp[idx >> 1] = fabsf(cfa[idx + p1] - cfa[idx - p1]);
-                            delm[idx >> 1] = fabsf(cfa[idx + m1] - cfa[idx - m1]);
-                            Dgrbsq1p[idx >> 1] = SQR(cfa[idx + 1] - cfa[idx + 1 - p1]) + SQR(cfa[idx + 1] - cfa[idx + 1 + p1]);
-                            Dgrbsq1m[idx >> 1] = SQR(cfa[idx + 1] - cfa[idx + 1 - m1]) + SQR(cfa[idx + 1] - cfa[idx + 1 + m1]);
-                        }
-                    } else {
-                        for (int cc = 6, idx = rr * TS + cc; cc < cc1 - 6; cc += 2, idx += 2) {
-                            Dgrbsq1p[idx >> 1] = SQR(cfa[idx] - cfa[idx - p1]) + SQR(cfa[idx] - cfa[idx + p1]);
-                            Dgrbsq1m[idx >> 1] = SQR(cfa[idx] - cfa[idx - m1]) + SQR(cfa[idx] - cfa[idx + m1]);
-                            delp[idx >> 1] = fabsf(cfa[idx + 1 + p1] - cfa[idx + 1 - p1]);
-                            delm[idx >> 1] = fabsf(cfa[idx + 1 + m1] - cfa[idx + 1 - m1]);
-                        }
-                    }
-                }
-                
-                // STAGE 8: Red/Blue color ratio interpolation (Diagonal)
-                float* rbm = vcd;
-                float* rbp = hcdalt;
-                float* pmwt = dirwts1;
-                for (int rr = 8; rr < rr1 - 8; rr++) {
-                    for (int cc = 8 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 8; cc += 2, idx += 2, idx1++) {
-                        float crse = xmul2f(cfa[idx + m1]) / (eps + cfa[idx] + cfa[idx + m2]);
-                        float crnw = xmul2f(cfa[idx - m1]) / (eps + cfa[idx] + cfa[idx - m2]);
-                        float crne = xmul2f(cfa[idx + p1]) / (eps + cfa[idx] + cfa[idx + p2]);
-                        float crsw = xmul2f(cfa[idx - p1]) / (eps + cfa[idx] + cfa[idx - p2]);
-                        float rbse = fabsf(1.f - crse) < arthresh ? cfa[idx] * crse : (cfa[idx + m1]) + xdiv2f(cfa[idx] - cfa[idx + m2]);
-                        float rbnw = fabsf(1.f - crnw) < arthresh ? cfa[idx] * crnw : (cfa[idx - m1]) + xdiv2f(cfa[idx] - cfa[idx - m2]);
-                        float rbne = fabsf(1.f - crne) < arthresh ? cfa[idx] * crne : (cfa[idx + p1]) + xdiv2f(cfa[idx] - cfa[idx + p2]);
-                        float rbsw = fabsf(1.f - crsw) < arthresh ? cfa[idx] * crsw : (cfa[idx - p1]) + xdiv2f(cfa[idx] - cfa[idx - p2]);
-                        float wtse = eps + delm[idx1] + delm[(idx + m1) >> 1] + delm[(idx + m2) >> 1];
-                        float wtnw = eps + delm[idx1] + delm[(idx - m1) >> 1] + delm[(idx - m2) >> 1];
-                        float wtne = eps + delp[idx1] + delp[(idx + p1) >> 1] + delp[(idx + p2) >> 1];
-                        float wtsw = eps + delp[idx1] + delp[(idx - p1) >> 1] + delp[(idx - p2) >> 1];
-                        rbm[idx1] = (wtse * rbnw + wtnw * rbse) / (wtse + wtnw);
-                        rbp[idx1] = (wtne * rbsw + wtsw * rbne) / (wtne + wtsw);
-                        if (rbp[idx1] < cfa[idx]) { if (xmul2f(rbp[idx1]) < cfa[idx]) rbp[idx1] = median(rbp[idx1] , cfa[idx - p1], cfa[idx + p1]); else { float pwt = xmul2f(cfa[idx] - rbp[idx1]) / (eps + rbp[idx1] + cfa[idx]); rbp[idx1] = pwt * rbp[idx1] + (1.f - pwt) * median(rbp[idx1], cfa[idx - p1], cfa[idx + p1]); } }
-                        if (rbm[idx1] < cfa[idx]) { if (xmul2f(rbm[idx1]) < cfa[idx]) rbm[idx1] = median(rbm[idx1] , cfa[idx - m1], cfa[idx + m1]); else { float mwt = xmul2f(cfa[idx] - rbm[idx1]) / (eps + rbm[idx1] + cfa[idx]); rbm[idx1] = mwt * rbm[idx1] + (1.f - mwt) * median(rbm[idx1], cfa[idx - m1], cfa[idx + m1]); } }
-                        if (rbp[idx1] > clip_pt) rbp[idx1] = median(rbp[idx1], cfa[idx - p1], cfa[idx + p1]);
-                        if (rbm[idx1] > clip_pt) rbm[idx1] = median(rbm[idx1], cfa[idx - m1], cfa[idx + m1]);
-                        float rbvarm = epssq + (gausseven[0] * (Dgrbsq1m[(idx - v1) >> 1] + Dgrbsq1m[(idx - 1) >> 1] + Dgrbsq1m[(idx + 1) >> 1] + Dgrbsq1m[(idx + v1) >> 1]) + gausseven[1] * (Dgrbsq1m[(idx - v2 - 1) >> 1] + Dgrbsq1m[(idx - v2 + 1) >> 1] + Dgrbsq1m[(idx - 2 - v1) >> 1] + Dgrbsq1m[(idx + 2 - v1) >> 1] + Dgrbsq1m[(idx - 2 + v1) >> 1] + Dgrbsq1m[(idx + 2 + v1) >> 1] + Dgrbsq1m[(idx + v2 - 1) >> 1] + Dgrbsq1m[(idx + v2 + 1) >> 1]));
-                        float rbvarp = epssq + (gausseven[0] * (Dgrbsq1p[(idx - v1) >> 1] + Dgrbsq1p[(idx - 1) >> 1] + Dgrbsq1p[(idx + 1) >> 1] + Dgrbsq1p[(idx + v1) >> 1]) + gausseven[1] * (Dgrbsq1p[(idx - v2 - 1) >> 1] + Dgrbsq1p[(idx - v2 + 1) >> 1] + Dgrbsq1p[(idx - 2 - v1) >> 1] + Dgrbsq1p[(idx + 2 - v1) >> 1] + Dgrbsq1p[(idx - 2 + v1) >> 1] + Dgrbsq1p[(idx + 2 + v1) >> 1] + Dgrbsq1p[(idx + v2 - 1) >> 1] + Dgrbsq1p[(idx + v2 + 1) >> 1]));
-                        pmwt[idx1] = rbvarm / (rbvarp + rbvarm);
-                    }
-                }
-
-                // STAGE 9: Final Green interpolation and Chrominance interpolation
-                float* rbint = delhvsqsum;
-                for (int rr = 10; rr < rr1 - 10; rr++) {
-                    for (int cc = 10 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 10; cc += 2, idx += 2, idx1++) {
-                        float pmwtalt = 0.25f * (pmwt[(idx - m1) >> 1] + pmwt[(idx + p1) >> 1] + pmwt[(idx - p1) >> 1] + pmwt[(idx + m1) >> 1]);
-                        if (fabsf(0.5f - pmwt[idx1]) < fabsf(0.5f - pmwtalt)) pmwt[idx1] = pmwtalt;
-                        rbint[idx1] = xdiv2f(cfa[idx] + rbm[idx1] * (1.f - pmwt[idx1]) + rbp[idx1] * pmwt[idx1]);
-                    }
-                }
-                for (int rr = 12; rr < rr1 - 12; rr++) {
-                    for (int cc = 12 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 12; cc += 2, idx += 2, idx1++) {
-                        if (fabsf(0.5f - pmwt[idx1]) >= fabsf(0.5f - hvwt[idx1])) continue;
-                        float cru = xmul2f(cfa[idx-v1])/(eps+rbint[idx1]+rbint[idx1-v1]);
-                        float crd = xmul2f(cfa[idx+v1])/(eps+rbint[idx1]+rbint[idx1+v1]);
-                        float crl = xmul2f(cfa[idx-1])/(eps+rbint[idx1]+rbint[idx1-1]);
-                        float crr = xmul2f(cfa[idx+1])/(eps+rbint[idx1]+rbint[idx1+1]);
-                        float gu = fabsf(1.f - cru) < arthresh ? rbint[idx1] * cru : cfa[idx-v1] + xdiv2f(rbint[idx1] - rbint[idx1-v1]);
-                        float gd = fabsf(1.f - crd) < arthresh ? rbint[idx1] * crd : cfa[idx+v1] + xdiv2f(rbint[idx1] - rbint[idx1+v1]);
-                        float gl = fabsf(1.f - crl) < arthresh ? rbint[idx1] * crl : cfa[idx-1] + xdiv2f(rbint[idx1] - rbint[idx1-1]);
-                        float gr = fabsf(1.f - crr) < arthresh ? rbint[idx1] * crr : cfa[idx+1] + xdiv2f(rbint[idx1] - rbint[idx1+1]);
-                        float Gintv = (dirwts0[idx - v1] * gd + dirwts0[idx + v1] * gu) / (dirwts0[idx + v1] + dirwts0[idx - v1]);
-                        float Ginth = (dirwts1[idx - 1] * gr + dirwts1[idx + 1] * gl) / (dirwts1[idx - 1] + dirwts1[idx + 1]);
-                        if (Gintv < rbint[idx1]) { if (xmul2f(Gintv) < rbint[idx1]) Gintv = median(Gintv, cfa[idx - v1], cfa[idx + v1]); else { float vwt2 = xmul2f(rbint[idx1] - Gintv) / (eps + Gintv + rbint[idx1]); Gintv = vwt2 * Gintv + (1.f - vwt2) * median(Gintv, cfa[idx - v1], cfa[idx + v1]); } }
-                        if (Ginth < rbint[idx1]) { if (xmul2f(Ginth) < rbint[idx1]) Ginth = median(Ginth, cfa[idx - 1], cfa[idx + 1]); else { float hwt2 = xmul2f(rbint[idx1] - Ginth) / (eps + Ginth + rbint[idx1]); Ginth = hwt2 * Ginth + (1.f - hwt2) * median(Ginth, cfa[idx - 1], cfa[idx + 1]); } }
-                        if (Ginth > clip_pt) Ginth = median(Ginth, cfa[idx - 1], cfa[idx + 1]);
-                        if (Gintv > clip_pt) Gintv = median(Gintv, cfa[idx - v1], cfa[idx + v1]);
-                        rgbgreen[idx] = Ginth * (1.f - hvwt[idx1]) + Gintv * hvwt[idx1];
-                        Dgrb0[idx1] = rgbgreen[idx] - cfa[idx];
-                    }
-                }
-                float* Dgrb1 = hcd;
-                
-                // Dgrb1初期化
-                
-                for (int rr = 13 - ey; rr < rr1 - 12; rr += 2) {
-                    for (int idx1 = (rr * TS + 13 - ex) >> 1; idx1 < (rr * TS + cc1 - 12) >> 1; idx1++) {
-                        // 処理範囲内のコピー
-                        Dgrb1[idx1] = Dgrb0[idx1];
-                        Dgrb0[idx1] = 0;
-                    }
-                }
-                for (int rr = 14; rr < rr1 - 14; rr++) {
-                    for (int cc = 14 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc; cc < cc1 - 14; cc += 2, idx += 2) {
-                        // In RawTherapee, R=0, B=2. c becomes 1 for R-sites, 0 for B-sites
-                        int c = 1 - fc_rt(rr, cc) / 2;
-                        // Dgrb0 is for G-R, Dgrb1 is for G-B. But the interpolation logic uses the *other* color's buffer.
-                        float* Dgrb_c = c ? Dgrb1 : Dgrb0;
-                        float wtnw = 1.f / (eps + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx + m1) >> 1]) + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx - m3) >> 1]) + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - m3) >> 1]));
-                        float wtne = 1.f / (eps + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx - p1) >> 1]) + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx + p3) >> 1]) + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + p3) >> 1]));
-                        float wtsw = 1.f / (eps + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + p1) >> 1]) + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + m3) >> 1]) + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx - p3) >> 1]));
-                        float wtse = 1.f / (eps + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - m1) >> 1]) + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - p3) >> 1]) + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx + m3) >> 1]));
-                        // The buffer to *write to* is the original color's buffer.
-                        Dgrb_c = c ? Dgrb1 : Dgrb0;
-                        Dgrb_c[idx >> 1] = (wtnw * (1.325f * Dgrb_c[(idx - m1) >> 1] - 0.175f * Dgrb_c[(idx - m3) >> 1] - 0.075f * (Dgrb_c[(idx - m1 - 2) >> 1] + Dgrb_c[(idx - m1 - v2) >> 1])) +
-                                        wtne * (1.325f * Dgrb_c[(idx + p1) >> 1] - 0.175f * Dgrb_c[(idx + p3) >> 1] - 0.075f * (Dgrb_c[(idx + p1 + 2) >> 1] + Dgrb_c[(idx + p1 + v2) >> 1])) +
-                                        wtsw * (1.325f * Dgrb_c[(idx - p1) >> 1] - 0.175f * Dgrb_c[(idx - p3) >> 1] - 0.075f * (Dgrb_c[(idx - p1 - 2) >> 1] + Dgrb_c[(idx - p1 - v2) >> 1])) +
-                                        wtse * (1.325f * Dgrb_c[(idx + m1) >> 1] - 0.175f * Dgrb_c[(idx + m3) >> 1] - 0.075f * (Dgrb_c[(idx + m1 + 2) >> 1] + Dgrb_c[(idx + m1 + v2) >> 1]))) / (wtnw + wtne + wtsw + wtse);
-                    }
-                }
-                
-                // === STAGE 10: Final Output Composition (BUG FIXED) ===
-                for (int rr = 16; rr < rr1 - 16; rr++) {
-                    int row = rr + top; 
-                    if (row < 0 || row >= (int)height_) continue;
-                    for (int cc = 16; cc < cc1 - 16; cc++) {
-                        int col = cc + left; 
-                        if (col < 0 || col >= (int)width_) continue;
-                        
-                        int out_idx = row * width_ + col;
-                        int tile_idx = rr * TS + cc;
-                        
-                        float r, g, b;
-
-                        // ★★★ BUG FIX #2 ★★★
-                        // Use a direct and robust check for the G-site.
-                        if (fc_rt(row, col) == 1) { // G site
-                            g = cfa[tile_idx];
-                            float wsum_inv = 1.0f / (hvwt[(tile_idx - v1) >> 1] + 2.f - hvwt[(tile_idx + 1) >> 1] - hvwt[(tile_idx - 1) >> 1] + hvwt[(tile_idx + v1) >> 1]);                            float r_diff = (hvwt[(tile_idx-v1)>>1]*Dgrb0[(tile_idx-v1)>>1] + (1.f-hvwt[(tile_idx+1)>>1])*Dgrb0[(tile_idx+1)>>1] + (1.f-hvwt[(tile_idx-1)>>1])*Dgrb0[(tile_idx-1)>>1] + hvwt[(tile_idx+v1)>>1]*Dgrb0[(tile_idx+v1)>>1]) * wsum_inv;
-                            float b_diff = (hvwt[(tile_idx-v1)>>1]*Dgrb1[(tile_idx-v1)>>1] + (1.f-hvwt[(tile_idx+1)>>1])*Dgrb1[(tile_idx+1)>>1] + (1.f-hvwt[(tile_idx-1)>>1])*Dgrb1[(tile_idx-1)>>1] + hvwt[(tile_idx+v1)>>1]*Dgrb1[(tile_idx+v1)>>1]) * wsum_inv;
-                            r = g - r_diff;
-                            b = g - b_diff;
-                            // DEBUG: G-site処理の値確認
-                            if (row < 5 && col < 5) {
-                                std::cout << "🟢 CPU G-site (" << row << "," << col << "): g=" << g << ", r_diff=" << r_diff << ", b_diff=" << b_diff << ", r=" << r << ", b=" << b << std::endl;
+                    if(doNyquist) {
+                        for(int rr=8; rr<rr1-8; rr++) {
+                            for(int cc=8+(fc_rt(rr,2)&1),idx=rr*TS+cc; cc<cc1-8; cc+=2,idx+=2) if(nyquist2[idx>>1]){
+                                float gvarh=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].h+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].h+Dgrb2_ptr[(idx+p1)>>1].h+Dgrb2_ptr[(idx-p1)>>1].h+Dgrb2_ptr[(idx+m1)>>1].h)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].h+Dgrb2_ptr[(idx-2)>>1].h+Dgrb2_ptr[(idx+2)>>1].h+Dgrb2_ptr[(idx+v2)>>1].h)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].h+Dgrb2_ptr[(idx+p2)>>1].h+Dgrb2_ptr[(idx-p2)>>1].h+Dgrb2_ptr[(idx+m2)>>1].h));
+                                float gvarv=epssq+(gquinc[0]*Dgrb2_ptr[idx>>1].v+gquinc[1]*(Dgrb2_ptr[(idx-m1)>>1].v+Dgrb2_ptr[(idx+p1)>>1].v+Dgrb2_ptr[(idx-p1)>>1].v+Dgrb2_ptr[(idx+m1)>>1].v)+gquinc[2]*(Dgrb2_ptr[(idx-v2)>>1].v+Dgrb2_ptr[(idx-2)>>1].v+Dgrb2_ptr[(idx+2)>>1].v+Dgrb2_ptr[(idx+v2)>>1].v)+gquinc[3]*(Dgrb2_ptr[(idx-m2)>>1].v+Dgrb2_ptr[(idx+p2)>>1].v+Dgrb2_ptr[(idx-p2)>>1].v+Dgrb2_ptr[(idx+m2)>>1].v));
+                                Dgrb0[idx>>1]=(hcd[idx]*gvarv+vcd[idx]*gvarh)/(gvarv+gvarh);
+                                rgbgreen[idx]=cfa[idx]+Dgrb0[idx>>1];
                             }
-                        } else { // R or B site
-                            g = rgbgreen[tile_idx];
-                            // ネイティブの色(cfa)を使わず、Dgrb0とDgrb1から両方の色を計算する
-                            r = g - Dgrb0[tile_idx >> 1];
-                            b = g - Dgrb1[tile_idx >> 1];
-                            // R/B-site処理完了
                         }
-                        rgb_buffer_.image[out_idx][0] = std::max(0.f, r);
-                        rgb_buffer_.image[out_idx][1] = std::max(0.f, g);
-                        rgb_buffer_.image[out_idx][2] = std::max(0.f, b);
+                    }
+
+                    // STAGE 7: Red/Blue gradient preprocessing
+                    float* delp = cddiffsq;
+                    float* delm = reinterpret_cast<float*>(reinterpret_cast<char*>(delp) + sizeof(float) * TS * TSH);
+                    for (int rr = 6; rr < rr1 - 6; rr++) {
+                        if ((fc_rt(rr, 2) & 1) == 0) {
+                            for (int cc = 6, idx = rr * TS + cc; cc < cc1 - 6; cc += 2, idx += 2) {
+                                delp[idx >> 1] = fabsf(cfa[idx + p1] - cfa[idx - p1]);
+                                delm[idx >> 1] = fabsf(cfa[idx + m1] - cfa[idx - m1]);
+                                Dgrbsq1p[idx >> 1] = SQR(cfa[idx + 1] - cfa[idx + 1 - p1]) + SQR(cfa[idx + 1] - cfa[idx + 1 + p1]);
+                                Dgrbsq1m[idx >> 1] = SQR(cfa[idx + 1] - cfa[idx + 1 - m1]) + SQR(cfa[idx + 1] - cfa[idx + 1 + m1]);
+                            }
+                        } else {
+                            for (int cc = 6, idx = rr * TS + cc; cc < cc1 - 6; cc += 2, idx += 2) {
+                                Dgrbsq1p[idx >> 1] = SQR(cfa[idx] - cfa[idx - p1]) + SQR(cfa[idx] - cfa[idx + p1]);
+                                Dgrbsq1m[idx >> 1] = SQR(cfa[idx] - cfa[idx - m1]) + SQR(cfa[idx] - cfa[idx + m1]);
+                                delp[idx >> 1] = fabsf(cfa[idx + 1 + p1] - cfa[idx + 1 - p1]);
+                                delm[idx >> 1] = fabsf(cfa[idx + 1 + m1] - cfa[idx + 1 - m1]);
+                            }
+                        }
+                    }
+                    
+                    // STAGE 8: Red/Blue color ratio interpolation (Diagonal)
+                    float* rbm = vcd;
+                    float* rbp = hcdalt;
+                    float* pmwt = dirwts1;
+                    for (int rr = 8; rr < rr1 - 8; rr++) {
+                        for (int cc = 8 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 8; cc += 2, idx += 2, idx1++) {
+                            float crse = xmul2f(cfa[idx + m1]) / (eps + cfa[idx] + cfa[idx + m2]);
+                            float crnw = xmul2f(cfa[idx - m1]) / (eps + cfa[idx] + cfa[idx - m2]);
+                            float crne = xmul2f(cfa[idx + p1]) / (eps + cfa[idx] + cfa[idx + p2]);
+                            float crsw = xmul2f(cfa[idx - p1]) / (eps + cfa[idx] + cfa[idx - p2]);
+                            float rbse = fabsf(1.f - crse) < arthresh ? cfa[idx] * crse : (cfa[idx + m1]) + xdiv2f(cfa[idx] - cfa[idx + m2]);
+                            float rbnw = fabsf(1.f - crnw) < arthresh ? cfa[idx] * crnw : (cfa[idx - m1]) + xdiv2f(cfa[idx] - cfa[idx - m2]);
+                            float rbne = fabsf(1.f - crne) < arthresh ? cfa[idx] * crne : (cfa[idx + p1]) + xdiv2f(cfa[idx] - cfa[idx + p2]);
+                            float rbsw = fabsf(1.f - crsw) < arthresh ? cfa[idx] * crsw : (cfa[idx - p1]) + xdiv2f(cfa[idx] - cfa[idx - p2]);
+                            float wtse = eps + delm[idx1] + delm[(idx + m1) >> 1] + delm[(idx + m2) >> 1];
+                            float wtnw = eps + delm[idx1] + delm[(idx - m1) >> 1] + delm[(idx - m2) >> 1];
+                            float wtne = eps + delp[idx1] + delp[(idx + p1) >> 1] + delp[(idx + p2) >> 1];
+                            float wtsw = eps + delp[idx1] + delp[(idx - p1) >> 1] + delp[(idx - p2) >> 1];
+                            rbm[idx1] = (wtse * rbnw + wtnw * rbse) / (wtse + wtnw);
+                            rbp[idx1] = (wtne * rbsw + wtsw * rbne) / (wtne + wtsw);
+                            if (rbp[idx1] < cfa[idx]) { if (xmul2f(rbp[idx1]) < cfa[idx]) rbp[idx1] = median(rbp[idx1] , cfa[idx - p1], cfa[idx + p1]); else { float pwt = xmul2f(cfa[idx] - rbp[idx1]) / (eps + rbp[idx1] + cfa[idx]); rbp[idx1] = pwt * rbp[idx1] + (1.f - pwt) * median(rbp[idx1], cfa[idx - p1], cfa[idx + p1]); } }
+                            if (rbm[idx1] < cfa[idx]) { if (xmul2f(rbm[idx1]) < cfa[idx]) rbm[idx1] = median(rbm[idx1] , cfa[idx - m1], cfa[idx + m1]); else { float mwt = xmul2f(cfa[idx] - rbm[idx1]) / (eps + rbm[idx1] + cfa[idx]); rbm[idx1] = mwt * rbm[idx1] + (1.f - mwt) * median(rbm[idx1], cfa[idx - m1], cfa[idx + m1]); } }
+                            if (rbp[idx1] > clip_pt) rbp[idx1] = median(rbp[idx1], cfa[idx - p1], cfa[idx + p1]);
+                            if (rbm[idx1] > clip_pt) rbm[idx1] = median(rbm[idx1], cfa[idx - m1], cfa[idx + m1]);
+                            float rbvarm = epssq + (gausseven[0] * (Dgrbsq1m[(idx - v1) >> 1] + Dgrbsq1m[(idx - 1) >> 1] + Dgrbsq1m[(idx + 1) >> 1] + Dgrbsq1m[(idx + v1) >> 1]) + gausseven[1] * (Dgrbsq1m[(idx - v2 - 1) >> 1] + Dgrbsq1m[(idx - v2 + 1) >> 1] + Dgrbsq1m[(idx - 2 - v1) >> 1] + Dgrbsq1m[(idx + 2 - v1) >> 1] + Dgrbsq1m[(idx - 2 + v1) >> 1] + Dgrbsq1m[(idx + 2 + v1) >> 1] + Dgrbsq1m[(idx + v2 - 1) >> 1] + Dgrbsq1m[(idx + v2 + 1) >> 1]));
+                            float rbvarp = epssq + (gausseven[0] * (Dgrbsq1p[(idx - v1) >> 1] + Dgrbsq1p[(idx - 1) >> 1] + Dgrbsq1p[(idx + 1) >> 1] + Dgrbsq1p[(idx + v1) >> 1]) + gausseven[1] * (Dgrbsq1p[(idx - v2 - 1) >> 1] + Dgrbsq1p[(idx - v2 + 1) >> 1] + Dgrbsq1p[(idx - 2 - v1) >> 1] + Dgrbsq1p[(idx + 2 - v1) >> 1] + Dgrbsq1p[(idx - 2 + v1) >> 1] + Dgrbsq1p[(idx + 2 + v1) >> 1] + Dgrbsq1p[(idx + v2 - 1) >> 1] + Dgrbsq1p[(idx + v2 + 1) >> 1]));
+                            pmwt[idx1] = rbvarm / (rbvarp + rbvarm);
+                        }
+                    }
+
+                    // STAGE 9: Final Green interpolation and Chrominance interpolation
+                    float* rbint = delhvsqsum;
+                    for (int rr = 10; rr < rr1 - 10; rr++) {
+                        for (int cc = 10 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 10; cc += 2, idx += 2, idx1++) {
+                            float pmwtalt = 0.25f * (pmwt[(idx - m1) >> 1] + pmwt[(idx + p1) >> 1] + pmwt[(idx - p1) >> 1] + pmwt[(idx + m1) >> 1]);
+                            if (fabsf(0.5f - pmwt[idx1]) < fabsf(0.5f - pmwtalt)) pmwt[idx1] = pmwtalt;
+                            rbint[idx1] = xdiv2f(cfa[idx] + rbm[idx1] * (1.f - pmwt[idx1]) + rbp[idx1] * pmwt[idx1]);
+                        }
+                    }
+                    for (int rr = 12; rr < rr1 - 12; rr++) {
+                        for (int cc = 12 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc, idx1 = idx >> 1; cc < cc1 - 12; cc += 2, idx += 2, idx1++) {
+                            if (fabsf(0.5f - pmwt[idx1]) >= fabsf(0.5f - hvwt[idx1])) continue;
+                            float cru = xmul2f(cfa[idx-v1])/(eps+rbint[idx1]+rbint[idx1-v1]);
+                            float crd = xmul2f(cfa[idx+v1])/(eps+rbint[idx1]+rbint[idx1+v1]);
+                            float crl = xmul2f(cfa[idx-1])/(eps+rbint[idx1]+rbint[idx1-1]);
+                            float crr = xmul2f(cfa[idx+1])/(eps+rbint[idx1]+rbint[idx1+1]);
+                            float gu = fabsf(1.f - cru) < arthresh ? rbint[idx1] * cru : cfa[idx-v1] + xdiv2f(rbint[idx1] - rbint[idx1-v1]);
+                            float gd = fabsf(1.f - crd) < arthresh ? rbint[idx1] * crd : cfa[idx+v1] + xdiv2f(rbint[idx1] - rbint[idx1+v1]);
+                            float gl = fabsf(1.f - crl) < arthresh ? rbint[idx1] * crl : cfa[idx-1] + xdiv2f(rbint[idx1] - rbint[idx1-1]);
+                            float gr = fabsf(1.f - crr) < arthresh ? rbint[idx1] * crr : cfa[idx+1] + xdiv2f(rbint[idx1] - rbint[idx1+1]);
+                            float Gintv = (dirwts0[idx - v1] * gd + dirwts0[idx + v1] * gu) / (dirwts0[idx + v1] + dirwts0[idx - v1]);
+                            float Ginth = (dirwts1[idx - 1] * gr + dirwts1[idx + 1] * gl) / (dirwts1[idx - 1] + dirwts1[idx + 1]);
+                            if (Gintv < rbint[idx1]) { if (xmul2f(Gintv) < rbint[idx1]) Gintv = median(Gintv, cfa[idx - v1], cfa[idx + v1]); else { float vwt2 = xmul2f(rbint[idx1] - Gintv) / (eps + Gintv + rbint[idx1]); Gintv = vwt2 * Gintv + (1.f - vwt2) * median(Gintv, cfa[idx - v1], cfa[idx + v1]); } }
+                            if (Ginth < rbint[idx1]) { if (xmul2f(Ginth) < rbint[idx1]) Ginth = median(Ginth, cfa[idx - 1], cfa[idx + 1]); else { float hwt2 = xmul2f(rbint[idx1] - Ginth) / (eps + Ginth + rbint[idx1]); Ginth = hwt2 * Ginth + (1.f - hwt2) * median(Ginth, cfa[idx - 1], cfa[idx + 1]); } }
+                            if (Ginth > clip_pt) Ginth = median(Ginth, cfa[idx - 1], cfa[idx + 1]);
+                            if (Gintv > clip_pt) Gintv = median(Gintv, cfa[idx - v1], cfa[idx + v1]);
+                            rgbgreen[idx] = Ginth * (1.f - hvwt[idx1]) + Gintv * hvwt[idx1];
+                            Dgrb0[idx1] = rgbgreen[idx] - cfa[idx];
+                        }
+                    }
+                    float* Dgrb1 = hcd;
+                    
+                    // Dgrb1初期化
+                    
+                    for (int rr = 13 - ey; rr < rr1 - 12; rr += 2) {
+                        for (int idx1 = (rr * TS + 13 - ex) >> 1; idx1 < (rr * TS + cc1 - 12) >> 1; idx1++) {
+                            // 処理範囲内のコピー
+                            Dgrb1[idx1] = Dgrb0[idx1];
+                            Dgrb0[idx1] = 0;
+                        }
+                    }
+                    for (int rr = 14; rr < rr1 - 14; rr++) {
+                        for (int cc = 14 + (fc_rt(rr, 2) & 1), idx = rr * TS + cc; cc < cc1 - 14; cc += 2, idx += 2) {
+                            // In RawTherapee, R=0, B=2. c becomes 1 for R-sites, 0 for B-sites
+                            int c = 1 - fc_rt(rr, cc) / 2;
+                            // Dgrb0 is for G-R, Dgrb1 is for G-B. But the interpolation logic uses the *other* color's buffer.
+                            float* Dgrb_c = c ? Dgrb1 : Dgrb0;
+                            float wtnw = 1.f / (eps + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx + m1) >> 1]) + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx - m3) >> 1]) + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - m3) >> 1]));
+                            float wtne = 1.f / (eps + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx - p1) >> 1]) + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx + p3) >> 1]) + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + p3) >> 1]));
+                            float wtsw = 1.f / (eps + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + p1) >> 1]) + fabsf(Dgrb_c[(idx - p1) >> 1] - Dgrb_c[(idx + m3) >> 1]) + fabsf(Dgrb_c[(idx + p1) >> 1] - Dgrb_c[(idx - p3) >> 1]));
+                            float wtse = 1.f / (eps + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - m1) >> 1]) + fabsf(Dgrb_c[(idx + m1) >> 1] - Dgrb_c[(idx - p3) >> 1]) + fabsf(Dgrb_c[(idx - m1) >> 1] - Dgrb_c[(idx + m3) >> 1]));
+                            // The buffer to *write to* is the original color's buffer.
+                            Dgrb_c = c ? Dgrb1 : Dgrb0;
+                            Dgrb_c[idx >> 1] = (wtnw * (1.325f * Dgrb_c[(idx - m1) >> 1] - 0.175f * Dgrb_c[(idx - m3) >> 1] - 0.075f * (Dgrb_c[(idx - m1 - 2) >> 1] + Dgrb_c[(idx - m1 - v2) >> 1])) +
+                                            wtne * (1.325f * Dgrb_c[(idx + p1) >> 1] - 0.175f * Dgrb_c[(idx + p3) >> 1] - 0.075f * (Dgrb_c[(idx + p1 + 2) >> 1] + Dgrb_c[(idx + p1 + v2) >> 1])) +
+                                            wtsw * (1.325f * Dgrb_c[(idx - p1) >> 1] - 0.175f * Dgrb_c[(idx - p3) >> 1] - 0.075f * (Dgrb_c[(idx - p1 - 2) >> 1] + Dgrb_c[(idx - p1 - v2) >> 1])) +
+                                            wtse * (1.325f * Dgrb_c[(idx + m1) >> 1] - 0.175f * Dgrb_c[(idx + m3) >> 1] - 0.075f * (Dgrb_c[(idx + m1 + 2) >> 1] + Dgrb_c[(idx + m1 + v2) >> 1]))) / (wtnw + wtne + wtsw + wtse);
+                        }
+                    }
+                    
+                    // === STAGE 10: Final Output Composition (BUG FIXED) ===
+                    for (int rr = 16; rr < rr1 - 16; rr++) {
+                        int row = rr + top; 
+                        if (row < 0 || row >= (int)height_) continue;
+                        for (int cc = 16; cc < cc1 - 16; cc++) {
+                            int col = cc + left; 
+                            if (col < 0 || col >= (int)width_) continue;
+                            
+                            int out_idx = row * width_ + col;
+                            int tile_idx = rr * TS + cc;
+                            
+                            float r, g, b;
+
+                            // Use a direct and robust check for the G-site.
+                            if (fc_rt(row, col) == 1) { // G site
+                                g = cfa[tile_idx];
+                                float wsum_inv = 1.0f / (hvwt[(tile_idx - v1) >> 1] + 2.f - hvwt[(tile_idx + 1) >> 1] - hvwt[(tile_idx - 1) >> 1] + hvwt[(tile_idx + v1) >> 1]);                            float r_diff = (hvwt[(tile_idx-v1)>>1]*Dgrb0[(tile_idx-v1)>>1] + (1.f-hvwt[(tile_idx+1)>>1])*Dgrb0[(tile_idx+1)>>1] + (1.f-hvwt[(tile_idx-1)>>1])*Dgrb0[(tile_idx-1)>>1] + hvwt[(tile_idx+v1)>>1]*Dgrb0[(tile_idx+v1)>>1]) * wsum_inv;
+                                float b_diff = (hvwt[(tile_idx-v1)>>1]*Dgrb1[(tile_idx-v1)>>1] + (1.f-hvwt[(tile_idx+1)>>1])*Dgrb1[(tile_idx+1)>>1] + (1.f-hvwt[(tile_idx-1)>>1])*Dgrb1[(tile_idx-1)>>1] + hvwt[(tile_idx+v1)>>1]*Dgrb1[(tile_idx+v1)>>1]) * wsum_inv;
+                                r = g - r_diff;
+                                b = g - b_diff;
+                            } else { // R or B site
+                                g = rgbgreen[tile_idx];
+                                // ネイティブの色(cfa)を使わず、Dgrb0とDgrb1から両方の色を計算する
+                                r = g - Dgrb0[tile_idx >> 1];
+                                b = g - Dgrb1[tile_idx >> 1];
+                                // R/B-site処理完了
+                            }
+                            rgb_buffer_.image[out_idx][0] = std::max(0.f, r);
+                            rgb_buffer_.image[out_idx][1] = std::max(0.f, g);
+                            rgb_buffer_.image[out_idx][2] = std::max(0.f, b);
+                        }
                     }
                 }
             }
@@ -1847,708 +1849,716 @@ public:
             RightShift[row] = (greencount == 2);
         }
 
-        std::vector<float> rgb_buffer_tile(ndir * ts * ts * 3);
-        std::vector<float> lab_buffer_tile(3 * (ts - 8) * (ts - 8));
-        std::vector<float> drv_buffer_tile(ndir * (ts - 10) * (ts - 10));
-        std::vector<uint8_t> homo_buffer_tile(ndir * ts * ts);
-        std::vector<uint8_t> homosum_buffer_tile(ndir * ts * ts);
-        std::vector<uint8_t> homosummax_buffer_tile(ts * ts);
-        std::vector<s_minmaxgreen> greenminmax_buffer_tile(ts * ts / 2);
+#ifdef _OPENMP
+        #pragma omp parallel
+#endif
+        {
+            std::vector<float> rgb_buffer_tile(ndir * ts * ts * 3);
+            std::vector<float> lab_buffer_tile(3 * (ts - 8) * (ts - 8));
+            std::vector<float> drv_buffer_tile(ndir * (ts - 10) * (ts - 10));
+            std::vector<uint8_t> homo_buffer_tile(ndir * ts * ts);
+            std::vector<uint8_t> homosum_buffer_tile(ndir * ts * ts);
+            std::vector<uint8_t> homosummax_buffer_tile(ts * ts);
+            std::vector<s_minmaxgreen> greenminmax_buffer_tile(ts * ts / 2);
 
-        auto rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
-        auto lab = reinterpret_cast<float(*)[ts - 8][ts - 8]>(lab_buffer_tile.data());
-        auto drv = reinterpret_cast<float(*)[ts - 10][ts - 10]>(drv_buffer_tile.data());
-        auto homo = reinterpret_cast<uint8_t(*)[ts][ts]>(homo_buffer_tile.data());
-        auto homosum = reinterpret_cast<uint8_t(*)[ts][ts]>(homosum_buffer_tile.data());
-        auto homosummax = reinterpret_cast<uint8_t(*)[ts]>(homosummax_buffer_tile.data());
-        auto greenminmaxtile = reinterpret_cast<s_minmaxgreen(*)[ts / 2]>(greenminmax_buffer_tile.data());
+            auto rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
+            auto lab = reinterpret_cast<float(*)[ts - 8][ts - 8]>(lab_buffer_tile.data());
+            auto drv = reinterpret_cast<float(*)[ts - 10][ts - 10]>(drv_buffer_tile.data());
+            auto homo = reinterpret_cast<uint8_t(*)[ts][ts]>(homo_buffer_tile.data());
+            auto homosum = reinterpret_cast<uint8_t(*)[ts][ts]>(homosum_buffer_tile.data());
+            auto homosummax = reinterpret_cast<uint8_t(*)[ts]>(homosummax_buffer_tile.data());
+            auto greenminmaxtile = reinterpret_cast<s_minmaxgreen(*)[ts / 2]>(greenminmax_buffer_tile.data());
 
-        //std::cout << "[DEBUG] X-Trans tile loop begin" << std::endl;
-        for (int top = 3; top < (int)height_ - 19; top += ts - 16) {
-            for (int left = 3; left < (int)width_ - 19; left += ts - 16) {
-                int mrow = std::min (top + ts, (int)height_ - 3);
-                int mcol = std::min (left + ts, (int)width_ - 3);
+#ifdef _OPENMP
+            #pragma omp for collapse(2) schedule(dynamic, 4) nowait
+#endif
+            //std::cout << "[DEBUG] X-Trans tile loop begin" << std::endl;
+            for (int top = 3; top < (int)height_ - 19; top += ts - 16) {
+                for (int left = 3; left < (int)width_ - 19; left += ts - 16) {
+                    int mrow = std::min (top + ts, (int)height_ - 3);
+                    int mcol = std::min (left + ts, (int)width_ - 3);
 
-                /* Set greenmin and greenmax to the minimum and maximum allowed values: */
-                for (int row = top; row < mrow; row++) {
-                    // find first non-green pixel
-                    int leftstart = left;
+                    /* Set greenmin and greenmax to the minimum and maximum allowed values: */
+                    for (int row = top; row < mrow; row++) {
+                        // find first non-green pixel
+                        int leftstart = left;
 
-                    for(; leftstart < mcol; leftstart++)
-                        if(!isgreen_(row, leftstart)) {
-                            break;
-                        }
-
-                    int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
-
-                    float minval = std::numeric_limits<float>::max();
-                    float maxval = 0.f;
-
-                    if(coloffset == 3) {
-                        short *hex = allhex[0][row % 3][leftstart % 3];
-
-                        for (int col = leftstart; col < mcol; col += coloffset) {
-                            minval = std::numeric_limits<float>::max();
-                            maxval = 0.f;
-
-                            for(int c = 0; c < 6; c++) {
-                                float val = raw_buffer_hex(row, col, hex[c]);
-
-                                minval = minval < val ? minval : val;
-                                maxval = maxval > val ? maxval : val;
-                            }
-
-                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
-                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
-                        }
-                    } else {
-                        int col = leftstart;
-
-                        if(coloffset == 2) {
-                            minval = std::numeric_limits<float>::max();
-                            maxval = 0.f;
-                            short *hex = allhex[0][row % 3][col % 3];
-
-                            for(int c = 0; c < 6; c++) {
-                                float val = raw_buffer_hex(row, col, hex[c]);
-
-                                minval = minval < val ? minval : val;
-                                maxval = maxval > val ? maxval : val;
-                            }
-
-                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
-                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
-                            col += 2;
-                        }
-
-                        short *hex = allhex[0][row % 3][col % 3];
-
-                        for (; col < mcol - 1; col += 3) {
-                            minval = std::numeric_limits<float>::max();
-                            maxval = 0.f;
-
-                            for(int c = 0; c < 6; c++) {
-                                float val = raw_buffer_hex(row, col, hex[c]);
-
-                                minval = minval < val ? minval : val;
-                                maxval = maxval > val ? maxval : val;
-                            }
-
-                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
-                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
-                            greenminmaxtile[row - top][(col + 1 - left) >> 1].min = minval;
-                            greenminmaxtile[row - top][(col + 1 - left) >> 1].max = maxval;
-                        }
-
-                        if(col < mcol) {
-                            minval = std::numeric_limits<float>::max();
-                            maxval = 0.f;
-
-                            for(int c = 0; c < 6; c++) {
-                                float val = raw_buffer_hex(row, col, hex[c]);
-
-                                minval = minval < val ? minval : val;
-                                maxval = maxval > val ? maxval : val;
-                            }
-
-                            greenminmaxtile[row - top][(col - left) >> 1].min = minval;
-                            greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
-                        }
-                    }
-                }
-
-                memset(rgb, 0, ts * ts * 3 * sizeof(float));
-
-                for (int row = top; row < mrow; row++)
-                    for (int col = left; col < mcol; col++) {
-                        rgb[0][row - top][col - left][fcol_xtrans_(row, col)] = raw_buffer(row, col);
-                    }
-
-                for(int c = 0; c < 3; c++) {
-                    memcpy (rgb[c + 1], rgb[0], sizeof * rgb);
-                }
-
-                /* Interpolate green horizontally, vertically, and along both diagonals: */
-                // std::cout << "[DEBUG] Interpolate green horizontally, vertically, and along both diagonals:" << std::endl;
-                for (int row = top; row < mrow; row++) {
-                    // find first non-green pixel
-                    int leftstart = left;
-
-                    for(; leftstart < mcol; leftstart++)
-                        if(!isgreen_(row, leftstart)) {
-                            break;
-                        }
-
-                    int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
-
-                    if(coloffset == 3) {
-                        short *hex = allhex[0][row % 3][leftstart % 3];
-
-                        for (int col = leftstart; col < mcol; col += coloffset) {
-                            float color[4];
-                            color[0] = 0.6796875f * (raw_buffer_hex(row, col, hex[1]) + raw_buffer_hex(row, col, hex[0])) -
-                                       0.1796875f * (raw_buffer_hex(row, col, 2 * hex[1]) + raw_buffer_hex(row, col, 2 * hex[0]));
-                            color[1] = 0.87109375f * raw_buffer_hex(row, col, hex[3]) + raw_buffer_hex(row, col, hex[2]) * 0.12890625f +
-                                       0.359375f * (raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, -hex[2]));
-
-                            for(int c = 0; c < 2; c++)
-                                color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c]) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c]) + 0.12890625f *
-                                               (2.f * raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, 3 * hex[4 + c]) - raw_buffer_hex(row, col, -3 * hex[4 + c]));
-
-                            for(int c = 0; c < 4; c++) {
-                                rgb[c][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
-                            }
-                        }
-                    } else {
-                        short *hexmod[2];
-                        hexmod[0] = allhex[0][row % 3][leftstart % 3];
-                        hexmod[1] = allhex[0][row % 3][(leftstart + coloffset) % 3];
-
-                        for (int col = leftstart, hexindex = 0; col < mcol; col += coloffset, coloffset ^= 3, hexindex ^= 1) {
-                            short *hex = hexmod[hexindex];
-                            float color[4];
-                            color[0] = 0.6796875f * (raw_buffer_hex(row, col, hex[1]) + raw_buffer_hex(row, col, hex[0])) -
-                                       0.1796875f * (raw_buffer_hex(row, col, 2 * hex[1]) + raw_buffer_hex(row, col, 2 * hex[0]));
-                            color[1] = 0.87109375f *  raw_buffer_hex(row, col, hex[3]) + raw_buffer_hex(row, col, hex[2]) * 0.12890625f +
-                                       0.359375f * (raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, -hex[2]));
-
-                            for(int c = 0; c < 2; c++)
-                                color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c]) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c]) + 0.12890625f *
-                                               (2.f * raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, 3 * hex[4 + c]) - raw_buffer_hex(row, col, -3 * hex[4 + c]));
-
-                            for(int c = 0; c < 4; c++) {
-                                rgb[c ^ 1][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
-                            }
-                        }
-                    }
-                }
-
-                for (int pass = 0; pass < passes; pass++) {
-                    if (pass == 1) {
-                        memcpy (rgb += 4, rgb_buffer_tile.data(), 4 * sizeof * rgb);
-                    }
-
-                    /* Recalculate green from interpolated values of closer pixels: */
-                    //std::cout << "[DEBUG] Recalculate green from interpolated values of closer pixels: " << std::endl;
-                    if (pass) {
-                        for (int row = top + 2; row < mrow - 2; row++) {
-                            int leftstart = left + 2;
-
-                            for(; leftstart < mcol - 2; leftstart++)
-                                if(!isgreen_(row, leftstart)) {
-                                    break;
-                                }
-
-                            int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
-
-                            if(coloffset == 3) {
-                                int f = fcol_xtrans_(row, leftstart);
-                                short *hex = allhex[1][row % 3][leftstart % 3];
-
-                                for (int col = leftstart; col < mcol - 2; col += coloffset, f ^= 2) {
-                                    for (int d = 3; d < 6; d++) {
-                                        float (*rix)[3] = &rgb[(d - 2)][row - top][col - left];
-                                        float val = 0.33333333f * (rix[-2 * hex[d]][1] + 2 * (rix[hex[d]][1] - rix[hex[d]][f])
-                                                                   - rix[-2 * hex[d]][f]) + rix[0][f];
-                                        rix[0][1] = LIM(val, greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
-                                    }
-                                }
-                            } else {
-                                int f = fcol_xtrans_(row, leftstart);
-                                short *hexmod[2];
-                                hexmod[0] = allhex[1][row % 3][leftstart % 3];
-                                hexmod[1] = allhex[1][row % 3][(leftstart + coloffset) % 3];
-
-                                for (int col = leftstart, hexindex = 0; col < mcol - 2; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2), hexindex ^= 1 ) {
-                                    short *hex = hexmod[hexindex];
-
-                                    for (int d = 3; d < 6; d++) {
-                                        float (*rix)[3] = &rgb[(d - 2) ^ 1][row - top][col - left];
-                                        float val = 0.33333333f * (rix[-2 * hex[d]][1] + 2 * (rix[hex[d]][1] - rix[hex[d]][f])
-                                                                   - rix[-2 * hex[d]][f]) + rix[0][f];
-                                        rix[0][1] = LIM(val, greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    /* Interpolate red and blue values for solitary green pixels:   */
-                    //std::cout << "[DEBUG] Interpolate red and blue values for solitary green pixels:" << std::endl;
-                    int sgstartcol = (left - sgcol + 4) / 3 * 3 + sgcol;
-                    float color[3][6];
-
-                    for (int row = (top - sgrow + 4) / 3 * 3 + sgrow; row < mrow - 2; row += 3) {
-                        for (int col = sgstartcol, h = fcol_xtrans_(row, col + 1); col < mcol - 2; col += 3, h ^= 2) {
-                            float (*rix)[3] = &rgb[0][row - top][col - left];
-                            float diff[6] = {0.f};
-
-                            for (int i = 1, d = 0; d < 6; d++, i ^= ts ^ 1, h ^= 2) {
-                                for (int c = 0; c < 2; c++, h ^= 2) {
-                                    float g = rix[0][1] + rix[0][1] - rix[i << c][1] - rix[-i << c][1];
-                                    color[h][d] = g + rix[i << c][h] + rix[-i << c][h];
-
-                                    if (d > 1)
-                                        diff[d] += SQR (rix[i << c][1] - rix[-i << c][1]
-                                                        - rix[i << c][h] + rix[-i << c][h]) + SQR(g);
-                                }
-
-                                if (d > 2 && (d & 1))    // 3, 5
-                                    if (diff[d - 1] < diff[d])
-                                        for(int c = 0; c < 2; c++) {
-                                            color[c * 2][d] = color[c * 2][d - 1];
-                                        }
-
-                                if ((d & 1) || d < 2) { // d: 0, 1, 3, 5
-                                    for(int c = 0; c < 2; c++) {
-                                        rix[0][c * 2] = CLIP(0.5f * color[c * 2][d]);
-                                    }
-
-                                    rix += ts * ts;
-                                }
-                            }
-                        }
-                    }
-
-                    /* Interpolate red for blue pixels and vice versa:      */
-                    //std::cout << "[DEBUG] Interpolate red for blue pixels and vice versa: " << std::endl;
-                    for (int row = top + 3; row < mrow - 3; row++) {
-                        int leftstart = left + 3;
-
-                        for(; leftstart < mcol - 1; leftstart++)
+                        for(; leftstart < mcol; leftstart++)
                             if(!isgreen_(row, leftstart)) {
                                 break;
                             }
 
-                        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1);
-                        int c = ((row - sgrow) % 3) ? ts : 1;
-                        int h = 3 * (c ^ ts ^ 1);
+                        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
+
+                        float minval = std::numeric_limits<float>::max();
+                        float maxval = 0.f;
 
                         if(coloffset == 3) {
-                            int f = 2 - fcol_xtrans_(row, leftstart);
+                            short *hex = allhex[0][row % 3][leftstart % 3];
 
-                            for (int col = leftstart; col < mcol - 3; col += coloffset, f ^= 2) {
-                                float (*rix)[3] = &rgb[0][row - top][col - left];
+                            for (int col = leftstart; col < mcol; col += coloffset) {
+                                minval = std::numeric_limits<float>::max();
+                                maxval = 0.f;
 
-                                for (int d = 0; d < 4; d++, rix += ts * ts) {
-                                    int i = d > 1 || ((d ^ c) & 1) ||
-                                            ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+                                for(int c = 0; c < 6; c++) {
+                                    float val = raw_buffer_hex(row, col, hex[c]);
 
-                                    rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
+                                    minval = minval < val ? minval : val;
+                                    maxval = maxval > val ? maxval : val;
+                                }
+
+                                greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                                greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                            }
+                        } else {
+                            int col = leftstart;
+
+                            if(coloffset == 2) {
+                                minval = std::numeric_limits<float>::max();
+                                maxval = 0.f;
+                                short *hex = allhex[0][row % 3][col % 3];
+
+                                for(int c = 0; c < 6; c++) {
+                                    float val = raw_buffer_hex(row, col, hex[c]);
+
+                                    minval = minval < val ? minval : val;
+                                    maxval = maxval > val ? maxval : val;
+                                }
+
+                                greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                                greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                                col += 2;
+                            }
+
+                            short *hex = allhex[0][row % 3][col % 3];
+
+                            for (; col < mcol - 1; col += 3) {
+                                minval = std::numeric_limits<float>::max();
+                                maxval = 0.f;
+
+                                for(int c = 0; c < 6; c++) {
+                                    float val = raw_buffer_hex(row, col, hex[c]);
+
+                                    minval = minval < val ? minval : val;
+                                    maxval = maxval > val ? maxval : val;
+                                }
+
+                                greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                                greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                                greenminmaxtile[row - top][(col + 1 - left) >> 1].min = minval;
+                                greenminmaxtile[row - top][(col + 1 - left) >> 1].max = maxval;
+                            }
+
+                            if(col < mcol) {
+                                minval = std::numeric_limits<float>::max();
+                                maxval = 0.f;
+
+                                for(int c = 0; c < 6; c++) {
+                                    float val = raw_buffer_hex(row, col, hex[c]);
+
+                                    minval = minval < val ? minval : val;
+                                    maxval = maxval > val ? maxval : val;
+                                }
+
+                                greenminmaxtile[row - top][(col - left) >> 1].min = minval;
+                                greenminmaxtile[row - top][(col - left) >> 1].max = maxval;
+                            }
+                        }
+                    }
+
+                    memset(rgb, 0, ts * ts * 3 * sizeof(float));
+
+                    for (int row = top; row < mrow; row++)
+                        for (int col = left; col < mcol; col++) {
+                            rgb[0][row - top][col - left][fcol_xtrans_(row, col)] = raw_buffer(row, col);
+                        }
+
+                    for(int c = 0; c < 3; c++) {
+                        memcpy (rgb[c + 1], rgb[0], sizeof * rgb);
+                    }
+
+                    /* Interpolate green horizontally, vertically, and along both diagonals: */
+                    // std::cout << "[DEBUG] Interpolate green horizontally, vertically, and along both diagonals:" << std::endl;
+                    for (int row = top; row < mrow; row++) {
+                        // find first non-green pixel
+                        int leftstart = left;
+
+                        for(; leftstart < mcol; leftstart++)
+                            if(!isgreen_(row, leftstart)) {
+                                break;
+                            }
+
+                        int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
+
+                        if(coloffset == 3) {
+                            short *hex = allhex[0][row % 3][leftstart % 3];
+
+                            for (int col = leftstart; col < mcol; col += coloffset) {
+                                float color[4];
+                                color[0] = 0.6796875f * (raw_buffer_hex(row, col, hex[1]) + raw_buffer_hex(row, col, hex[0])) -
+                                        0.1796875f * (raw_buffer_hex(row, col, 2 * hex[1]) + raw_buffer_hex(row, col, 2 * hex[0]));
+                                color[1] = 0.87109375f * raw_buffer_hex(row, col, hex[3]) + raw_buffer_hex(row, col, hex[2]) * 0.12890625f +
+                                        0.359375f * (raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, -hex[2]));
+
+                                for(int c = 0; c < 2; c++)
+                                    color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c]) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c]) + 0.12890625f *
+                                                (2.f * raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, 3 * hex[4 + c]) - raw_buffer_hex(row, col, -3 * hex[4 + c]));
+
+                                for(int c = 0; c < 4; c++) {
+                                    rgb[c][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
                                 }
                             }
                         } else {
-                            coloffset = fcol_xtrans_(row, leftstart + 1) == 1 ? 2 : 1;
-                            int f = 2 - fcol_xtrans_(row, leftstart);
+                            short *hexmod[2];
+                            hexmod[0] = allhex[0][row % 3][leftstart % 3];
+                            hexmod[1] = allhex[0][row % 3][(leftstart + coloffset) % 3];
 
-                            for (int col = leftstart; col < mcol - 3; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2) ) {
-                                float (*rix)[3] = &rgb[0][row - top][col - left];
+                            for (int col = leftstart, hexindex = 0; col < mcol; col += coloffset, coloffset ^= 3, hexindex ^= 1) {
+                                short *hex = hexmod[hexindex];
+                                float color[4];
+                                color[0] = 0.6796875f * (raw_buffer_hex(row, col, hex[1]) + raw_buffer_hex(row, col, hex[0])) -
+                                        0.1796875f * (raw_buffer_hex(row, col, 2 * hex[1]) + raw_buffer_hex(row, col, 2 * hex[0]));
+                                color[1] = 0.87109375f *  raw_buffer_hex(row, col, hex[3]) + raw_buffer_hex(row, col, hex[2]) * 0.12890625f +
+                                        0.359375f * (raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, -hex[2]));
 
-                                for (int d = 0; d < 4; d++, rix += ts * ts) {
-                                    int i = d > 1 || ((d ^ c) & 1) ||
-                                            ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+                                for(int c = 0; c < 2; c++)
+                                    color[2 + c] = 0.640625f * raw_buffer_hex(row, col, hex[4 + c]) + 0.359375f * raw_buffer_hex(row, col, -2 * hex[4 + c]) + 0.12890625f *
+                                                (2.f * raw_buffer_hex(row, col, 0) - raw_buffer_hex(row, col, 3 * hex[4 + c]) - raw_buffer_hex(row, col, -3 * hex[4 + c]));
 
-                                    rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
+                                for(int c = 0; c < 4; c++) {
+                                    rgb[c ^ 1][row - top][col - left][1] = LIM(color[c], greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
                                 }
                             }
                         }
                     }
 
-                    /* Fill in red and blue for 2x2 blocks of green:        */
-                    //std::cout << "[DEBUG] Fill in red and blue for 2x2 blocks of green:" << std::endl;
-                    // Find first row of 2x2 green
-                    int topstart = top + 2;
-
-                    for(; topstart < mrow - 2; topstart++)
-                        if((topstart - sgrow) % 3) {
-                            break;
+                    for (int pass = 0; pass < passes; pass++) {
+                        if (pass == 1) {
+                            memcpy (rgb += 4, rgb_buffer_tile.data(), 4 * sizeof * rgb);
                         }
 
-                    int leftstart = left + 2;
+                        /* Recalculate green from interpolated values of closer pixels: */
+                        //std::cout << "[DEBUG] Recalculate green from interpolated values of closer pixels: " << std::endl;
+                        if (pass) {
+                            for (int row = top + 2; row < mrow - 2; row++) {
+                                int leftstart = left + 2;
 
-                    for(; leftstart < mcol - 2; leftstart++)
-                        if((leftstart - sgcol) % 3) {
-                            break;
-                        }
+                                for(; leftstart < mcol - 2; leftstart++)
+                                    if(!isgreen_(row, leftstart)) {
+                                        break;
+                                    }
 
-                    int coloffsetstart = 2 - (fcol_xtrans_(topstart, leftstart + 1) & 1);
+                                int coloffset = (RightShift[row % 3] == 1 ? 3 : 1 + (fcol_xtrans_(row, leftstart + 1) & 1));
 
-                    for (int row = topstart; row < mrow - 2; row++) {
-                        if ((row - sgrow) % 3) {
-                            short *hexmod[2];
-                            hexmod[0] = allhex[1][row % 3][leftstart % 3];
-                            hexmod[1] = allhex[1][row % 3][(leftstart + coloffsetstart) % 3];
+                                if(coloffset == 3) {
+                                    int f = fcol_xtrans_(row, leftstart);
+                                    short *hex = allhex[1][row % 3][leftstart % 3];
 
-                            for (int col = leftstart, coloffset = coloffsetstart, hexindex = 0; col < mcol - 2; col += coloffset, coloffset ^= 3, hexindex ^= 1) {
-                                float (*rix)[3] = &rgb[0][row - top][col - left];
-                                short *hex = hexmod[hexindex];
-
-                                for (int d = 0; d < ndir; d += 2, rix += ts * ts) {
-                                    if (hex[d] + hex[d + 1]) {
-                                        float g = 3 * rix[0][1] - 2 * rix[hex[d]][1] - rix[hex[d + 1]][1];
-
-                                        for (int c = 0; c < 4; c += 2) {
-                                            rix[0][c] = CLIP((g + 2 * rix[hex[d]][c] + rix[hex[d + 1]][c]) * 0.33333333f);
+                                    for (int col = leftstart; col < mcol - 2; col += coloffset, f ^= 2) {
+                                        for (int d = 3; d < 6; d++) {
+                                            float (*rix)[3] = &rgb[(d - 2)][row - top][col - left];
+                                            float val = 0.33333333f * (rix[-2 * hex[d]][1] + 2 * (rix[hex[d]][1] - rix[hex[d]][f])
+                                                                    - rix[-2 * hex[d]][f]) + rix[0][f];
+                                            rix[0][1] = LIM(val, greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
                                         }
-                                    } else {
-                                        float g = 2 * rix[0][1] - rix[hex[d]][1] - rix[hex[d + 1]][1];
+                                    }
+                                } else {
+                                    int f = fcol_xtrans_(row, leftstart);
+                                    short *hexmod[2];
+                                    hexmod[0] = allhex[1][row % 3][leftstart % 3];
+                                    hexmod[1] = allhex[1][row % 3][(leftstart + coloffset) % 3];
 
-                                        for (int c = 0; c < 4; c += 2) {
-                                            rix[0][c] = CLIP((g + rix[hex[d]][c] + rix[hex[d + 1]][c]) * 0.5f);
+                                    for (int col = leftstart, hexindex = 0; col < mcol - 2; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2), hexindex ^= 1 ) {
+                                        short *hex = hexmod[hexindex];
+
+                                        for (int d = 3; d < 6; d++) {
+                                            float (*rix)[3] = &rgb[(d - 2) ^ 1][row - top][col - left];
+                                            float val = 0.33333333f * (rix[-2 * hex[d]][1] + 2 * (rix[hex[d]][1] - rix[hex[d]][f])
+                                                                    - rix[-2 * hex[d]][f]) + rix[0][f];
+                                            rix[0][1] = LIM(val, greenminmaxtile[row - top][(col - left) >> 1].min, greenminmaxtile[row - top][(col - left) >> 1].max);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Interpolate red and blue values for solitary green pixels:   */
+                        //std::cout << "[DEBUG] Interpolate red and blue values for solitary green pixels:" << std::endl;
+                        int sgstartcol = (left - sgcol + 4) / 3 * 3 + sgcol;
+                        float color[3][6];
+
+                        for (int row = (top - sgrow + 4) / 3 * 3 + sgrow; row < mrow - 2; row += 3) {
+                            for (int col = sgstartcol, h = fcol_xtrans_(row, col + 1); col < mcol - 2; col += 3, h ^= 2) {
+                                float (*rix)[3] = &rgb[0][row - top][col - left];
+                                float diff[6] = {0.f};
+
+                                for (int i = 1, d = 0; d < 6; d++, i ^= ts ^ 1, h ^= 2) {
+                                    for (int c = 0; c < 2; c++, h ^= 2) {
+                                        float g = rix[0][1] + rix[0][1] - rix[i << c][1] - rix[-i << c][1];
+                                        color[h][d] = g + rix[i << c][h] + rix[-i << c][h];
+
+                                        if (d > 1)
+                                            diff[d] += SQR (rix[i << c][1] - rix[-i << c][1]
+                                                            - rix[i << c][h] + rix[-i << c][h]) + SQR(g);
+                                    }
+
+                                    if (d > 2 && (d & 1))    // 3, 5
+                                        if (diff[d - 1] < diff[d])
+                                            for(int c = 0; c < 2; c++) {
+                                                color[c * 2][d] = color[c * 2][d - 1];
+                                            }
+
+                                    if ((d & 1) || d < 2) { // d: 0, 1, 3, 5
+                                        for(int c = 0; c < 2; c++) {
+                                            rix[0][c * 2] = CLIP(0.5f * color[c * 2][d]);
+                                        }
+
+                                        rix += ts * ts;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Interpolate red for blue pixels and vice versa:      */
+                        //std::cout << "[DEBUG] Interpolate red for blue pixels and vice versa: " << std::endl;
+                        for (int row = top + 3; row < mrow - 3; row++) {
+                            int leftstart = left + 3;
+
+                            for(; leftstart < mcol - 1; leftstart++)
+                                if(!isgreen_(row, leftstart)) {
+                                    break;
+                                }
+
+                            int coloffset = (RightShift[row % 3] == 1 ? 3 : 1);
+                            int c = ((row - sgrow) % 3) ? ts : 1;
+                            int h = 3 * (c ^ ts ^ 1);
+
+                            if(coloffset == 3) {
+                                int f = 2 - fcol_xtrans_(row, leftstart);
+
+                                for (int col = leftstart; col < mcol - 3; col += coloffset, f ^= 2) {
+                                    float (*rix)[3] = &rgb[0][row - top][col - left];
+
+                                    for (int d = 0; d < 4; d++, rix += ts * ts) {
+                                        int i = d > 1 || ((d ^ c) & 1) ||
+                                                ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+
+                                        rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
+                                    }
+                                }
+                            } else {
+                                coloffset = fcol_xtrans_(row, leftstart + 1) == 1 ? 2 : 1;
+                                int f = 2 - fcol_xtrans_(row, leftstart);
+
+                                for (int col = leftstart; col < mcol - 3; col += coloffset, coloffset ^= 3, f = f ^ (coloffset & 2) ) {
+                                    float (*rix)[3] = &rgb[0][row - top][col - left];
+
+                                    for (int d = 0; d < 4; d++, rix += ts * ts) {
+                                        int i = d > 1 || ((d ^ c) & 1) ||
+                                                ((fabsf(rix[0][1] - rix[c][1]) + fabsf(rix[0][1] - rix[-c][1])) < 2.f * (fabsf(rix[0][1] - rix[h][1]) + fabsf(rix[0][1] - rix[-h][1]))) ? c : h;
+
+                                        rix[0][f] = CLIP(rix[0][1] + 0.5f * (rix[i][f] + rix[-i][f] - rix[i][1] - rix[-i][1]));
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Fill in red and blue for 2x2 blocks of green:        */
+                        //std::cout << "[DEBUG] Fill in red and blue for 2x2 blocks of green:" << std::endl;
+                        // Find first row of 2x2 green
+                        int topstart = top + 2;
+
+                        for(; topstart < mrow - 2; topstart++)
+                            if((topstart - sgrow) % 3) {
+                                break;
+                            }
+
+                        int leftstart = left + 2;
+
+                        for(; leftstart < mcol - 2; leftstart++)
+                            if((leftstart - sgcol) % 3) {
+                                break;
+                            }
+
+                        int coloffsetstart = 2 - (fcol_xtrans_(topstart, leftstart + 1) & 1);
+
+                        for (int row = topstart; row < mrow - 2; row++) {
+                            if ((row - sgrow) % 3) {
+                                short *hexmod[2];
+                                hexmod[0] = allhex[1][row % 3][leftstart % 3];
+                                hexmod[1] = allhex[1][row % 3][(leftstart + coloffsetstart) % 3];
+
+                                for (int col = leftstart, coloffset = coloffsetstart, hexindex = 0; col < mcol - 2; col += coloffset, coloffset ^= 3, hexindex ^= 1) {
+                                    float (*rix)[3] = &rgb[0][row - top][col - left];
+                                    short *hex = hexmod[hexindex];
+
+                                    for (int d = 0; d < ndir; d += 2, rix += ts * ts) {
+                                        if (hex[d] + hex[d + 1]) {
+                                            float g = 3 * rix[0][1] - 2 * rix[hex[d]][1] - rix[hex[d + 1]][1];
+
+                                            for (int c = 0; c < 4; c += 2) {
+                                                rix[0][c] = CLIP((g + 2 * rix[hex[d]][c] + rix[hex[d + 1]][c]) * 0.33333333f);
+                                            }
+                                        } else {
+                                            float g = 2 * rix[0][1] - rix[hex[d]][1] - rix[hex[d + 1]][1];
+
+                                            for (int c = 0; c < 4; c += 2) {
+                                                rix[0][c] = CLIP((g + rix[hex[d]][c] + rix[hex[d + 1]][c]) * 0.5f);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
-// end of multipass part
+    // end of multipass part
 
-                rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
-                mrow -= top;
-                mcol -= left;
+                    rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
+                    mrow -= top;
+                    mcol -= left;
 
-                if(false) {
-                    /* Convert to CIELab and differentiate in all directions:   */
-                    //std::cout << "[DEBUG] Convert to CIELab and differentiate in all directions:" << std::endl;
-                    // Original dcraw algorithm uses CIELab as perceptual space
-                    // (presumably coming from original AHD) and converts taking
-                    // camera matrix into account.  We use this in RT.
-                    for (int d = 0; d < ndir; d++) {
-                        cielab2(&rgb[d][4][4], &lab[0][0][0], &lab[1][0][0], &lab[2][0][0], ts, mrow - 8, ts - 8, xyz_cam);
-                        int f = dir[d & 3];
-                        f = f == 1 ? 1 : f - 8;
+                    if(false) {
+                        /* Convert to CIELab and differentiate in all directions:   */
+                        //std::cout << "[DEBUG] Convert to CIELab and differentiate in all directions:" << std::endl;
+                        // Original dcraw algorithm uses CIELab as perceptual space
+                        // (presumably coming from original AHD) and converts taking
+                        // camera matrix into account.  We use this in RT.
+                        for (size_t d = 0; d < ndir; d++) {
+                            cielab2(&rgb[d][4][4], &lab[0][0][0], &lab[1][0][0], &lab[2][0][0], ts, mrow - 8, ts - 8, xyz_cam);
+                            int f = dir[d & 3];
+                            f = f == 1 ? 1 : f - 8;
 
-                        for (int row = 5; row < mrow - 5; row++) {
-                            for (int col = 5; col < mcol - 5; col++) {
-                                float *l = &lab[0][row - 4][col - 4];
-                                float *a = &lab[1][row - 4][col - 4];
-                                float *b = &lab[2][row - 4][col - 4];
+                            for (int row = 5; row < mrow - 5; row++) {
+                                for (int col = 5; col < mcol - 5; col++) {
+                                    float *l = &lab[0][row - 4][col - 4];
+                                    float *a = &lab[1][row - 4][col - 4];
+                                    float *b = &lab[2][row - 4][col - 4];
 
-                                float g = 2 * l[0] - l[f] - l[-f];
-                                drv[d][row - 5][col - 5] =  SQR(g)
-                                                            + SQR((2 * a[0] - a[f] - a[-f] + g * 2.1551724f))
-                                                            + SQR((2 * b[0] - b[f] - b[-f] - g * 0.86206896f));
+                                    float g = 2 * l[0] - l[f] - l[-f];
+                                    drv[d][row - 5][col - 5] =  SQR(g)
+                                                                + SQR((2 * a[0] - a[f] - a[-f] + g * 2.1551724f))
+                                                                + SQR((2 * b[0] - b[f] - b[-f] - g * 0.86206896f));
+                                }
                             }
                         }
-                    }
-                } else {
-                    // For 1-pass demosaic we use YPbPr which requires much
-                    // less code and is nearly indistinguishable. It assumes the
-                    // camera RGB is roughly linear.
-                    //std::cout << "[DEBUG] For 1-pass demosaic we use YPbPr which requires much" << std::endl;
-                    for (int d = 0; d < ndir; d++) {
-                        float (*yuv)[ts - 8][ts - 8] = lab; // we use the lab buffer, which has the same dimensions
-#ifdef __ARM_NEON
-                        float32x4_t zd2627v = vdupq_n_f32(0.2627f);
-                        float32x4_t zd6780v = vdupq_n_f32(0.6780f);
-                        float32x4_t zd0593v = vdupq_n_f32(0.0593f);
-                        float32x4_t zd56433v = vdupq_n_f32(0.56433f);
-                        float32x4_t zd67815v = vdupq_n_f32(0.67815f);
-#endif
-
-                        for (int row = 4; row < mrow - 4; row++) {
-                            int col = 4;
-#ifdef __ARM_NEON
-                            for (; col < mcol - 7; col += 4) {
-                                // use ITU-R BT.2020 YPbPr, which is great, but could use
-                                // a better/simpler choice? note that imageop.h provides
-                                // dt_iop_RGB_to_YCbCr which uses Rec. 601 conversion,
-                                // which appears less good with specular highlights
-
-                                // Load 4 interleaved RGB pixels
-                                float32x4x3_t rgb_pixels = vld3q_f32((const float*)&rgb[d][row][col]);
-                                float32x4_t redv = rgb_pixels.val[0];
-                                float32x4_t greenv = rgb_pixels.val[1];
-                                float32x4_t bluev = rgb_pixels.val[2];
-                                
-                                // Calculate Y component: 0.2627*R + 0.6780*G + 0.0593*B
-                                float32x4_t yv = vmulq_f32(redv, zd2627v);
-                                yv = vmlaq_f32(yv, greenv, zd6780v);
-                                yv = vmlaq_f32(yv, bluev, zd0593v);
-                                
-                                // Calculate U/Pb component: (B - Y) * 0.56433
-                                float32x4_t uv = vmulq_f32(vsubq_f32(bluev, yv), zd56433v);
-                                
-                                // Calculate V/Pr component: (R - Y) * 0.67815
-                                float32x4_t vv = vmulq_f32(vsubq_f32(redv, yv), zd67815v);
-                                
-                                // Store results
-                                vst1q_f32(&yuv[0][row - 4][col - 4], yv);
-                                vst1q_f32(&yuv[1][row - 4][col - 4], uv);
-                                vst1q_f32(&yuv[2][row - 4][col - 4], vv);
-                            }
-#endif
-                            for (; col < mcol - 4; col++) {
-                                // use ITU-R BT.2020 YPbPr, which is great, but could use
-                                // a better/simpler choice? note that imageop.h provides
-                                // dt_iop_RGB_to_YCbCr which uses Rec. 601 conversion,
-                                // which appears less good with specular highlights
-                                float y = 0.2627f * rgb[d][row][col][0] + 0.6780f * rgb[d][row][col][1] + 0.0593f * rgb[d][row][col][2];
-                                yuv[0][row - 4][col - 4] = y;
-                                yuv[1][row - 4][col - 4] = (rgb[d][row][col][2] - y) * 0.56433f;
-                                yuv[2][row - 4][col - 4] = (rgb[d][row][col][0] - y) * 0.67815f;
-                            }
-                        }
-
-                        int f = dir[d & 3];
-                        f = f == 1 ? 1 : f - 8;
-
-                        for (int row = 5; row < mrow - 5; row++) {
-                            for (int col = 5; col < mcol - 5; col++) {
-                                float *y = &yuv[0][row - 4][col - 4];
-                                float *u = &yuv[1][row - 4][col - 4];
-                                float *v = &yuv[2][row - 4][col - 4];
-                                drv[d][row - 5][col - 5] = SQR(2 * y[0] - y[f] - y[-f])
-                                                           + SQR(2 * u[0] - u[f] - u[-f])
-                                                           + SQR(2 * v[0] - v[f] - v[-f]);
-                            }
-                        }
-                    }
-                }
-
-                /* Build homogeneity maps from the derivatives:         */
-                //std::cout << "[DEBUG] Build homogeneity maps from the derivatives:" << std::endl;
-#ifdef __ARM_NEON
-                float32x4_t eightv = vdupq_n_f32(8.f);
-                float32x4_t zerov = vdupq_n_f32(0.f);
-                float32x4_t onev = vdupq_n_f32(1.f);
-#endif
-
-                for (int row = 6; row < mrow - 6; row++) {
-                    int col = 6;
-#ifdef __ARM_NEON
-                    for (; col < mcol - 9; col += 4) {
-                        float32x4_t tr1v = vminq_f32(vld1q_f32(&drv[0][row - 5][col - 5]), vld1q_f32(&drv[1][row - 5][col - 5]));
-                        float32x4_t tr2v = vminq_f32(vld1q_f32(&drv[2][row - 5][col - 5]), vld1q_f32(&drv[3][row - 5][col - 5]));
-
-                        if(ndir > 4) {
-                            float32x4_t tr3v = vminq_f32(vld1q_f32(&drv[4][row - 5][col - 5]), vld1q_f32(&drv[5][row - 5][col - 5]));
-                            float32x4_t tr4v = vminq_f32(vld1q_f32(&drv[6][row - 5][col - 5]), vld1q_f32(&drv[7][row - 5][col - 5]));
-                            tr1v = vminq_f32(tr1v, tr3v);
-                            tr1v = vminq_f32(tr1v, tr4v);
-                        }
-
-                        tr1v = vminq_f32(tr1v, tr2v);
-                        tr1v = vmulq_f32(tr1v, eightv);
-
+                    } else {
+                        // For 1-pass demosaic we use YPbPr which requires much
+                        // less code and is nearly indistinguishable. It assumes the
+                        // camera RGB is roughly linear.
+                        //std::cout << "[DEBUG] For 1-pass demosaic we use YPbPr which requires much" << std::endl;
                         for (int d = 0; d < ndir; d++) {
-                            //uint8_t tempstore[16];
-                            float32x4_t tempv = zerov;
+                            float (*yuv)[ts - 8][ts - 8] = lab; // we use the lab buffer, which has the same dimensions
+    #ifdef __ARM_NEON
+                            float32x4_t zd2627v = vdupq_n_f32(0.2627f);
+                            float32x4_t zd6780v = vdupq_n_f32(0.6780f);
+                            float32x4_t zd0593v = vdupq_n_f32(0.0593f);
+                            float32x4_t zd56433v = vdupq_n_f32(0.56433f);
+                            float32x4_t zd67815v = vdupq_n_f32(0.67815f);
+    #endif
 
-                            for (int v = -1; v <= 1; v++) {
-                                for (int h = -1; h <= 1; h++) {
-                                    float32x4_t drv_val = vld1q_f32(&drv[d][row + v - 5][col + h - 5]);
-                                    uint32x4_t mask = vcleq_f32(drv_val, tr1v);
-                                    tempv = vaddq_f32(tempv, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(onev))));
+                            for (int row = 4; row < mrow - 4; row++) {
+                                int col = 4;
+    #ifdef __ARM_NEON
+                                for (; col < mcol - 7; col += 4) {
+                                    // use ITU-R BT.2020 YPbPr, which is great, but could use
+                                    // a better/simpler choice? note that imageop.h provides
+                                    // dt_iop_RGB_to_YCbCr which uses Rec. 601 conversion,
+                                    // which appears less good with specular highlights
+
+                                    // Load 4 interleaved RGB pixels
+                                    float32x4x3_t rgb_pixels = vld3q_f32((const float*)&rgb[d][row][col]);
+                                    float32x4_t redv = rgb_pixels.val[0];
+                                    float32x4_t greenv = rgb_pixels.val[1];
+                                    float32x4_t bluev = rgb_pixels.val[2];
+                                    
+                                    // Calculate Y component: 0.2627*R + 0.6780*G + 0.0593*B
+                                    float32x4_t yv = vmulq_f32(redv, zd2627v);
+                                    yv = vmlaq_f32(yv, greenv, zd6780v);
+                                    yv = vmlaq_f32(yv, bluev, zd0593v);
+                                    
+                                    // Calculate U/Pb component: (B - Y) * 0.56433
+                                    float32x4_t uv = vmulq_f32(vsubq_f32(bluev, yv), zd56433v);
+                                    
+                                    // Calculate V/Pr component: (R - Y) * 0.67815
+                                    float32x4_t vv = vmulq_f32(vsubq_f32(redv, yv), zd67815v);
+                                    
+                                    // Store results
+                                    vst1q_f32(&yuv[0][row - 4][col - 4], yv);
+                                    vst1q_f32(&yuv[1][row - 4][col - 4], uv);
+                                    vst1q_f32(&yuv[2][row - 4][col - 4], vv);
+                                }
+    #endif
+                                for (; col < mcol - 4; col++) {
+                                    // use ITU-R BT.2020 YPbPr, which is great, but could use
+                                    // a better/simpler choice? note that imageop.h provides
+                                    // dt_iop_RGB_to_YCbCr which uses Rec. 601 conversion,
+                                    // which appears less good with specular highlights
+                                    float y = 0.2627f * rgb[d][row][col][0] + 0.6780f * rgb[d][row][col][1] + 0.0593f * rgb[d][row][col][2];
+                                    yuv[0][row - 4][col - 4] = y;
+                                    yuv[1][row - 4][col - 4] = (rgb[d][row][col][2] - y) * 0.56433f;
+                                    yuv[2][row - 4][col - 4] = (rgb[d][row][col][0] - y) * 0.67815f;
                                 }
                             }
 
-                            // Convert float32x4_t to int32x4_t and extract values
-                            int32x4_t temp_int = vcvtq_s32_f32(tempv);
-                            int32_t temp_arr[4];
-                            vst1q_s32(temp_arr, temp_int);
-                            
-                            homo[d][row][col] = (uint8_t)temp_arr[0];
-                            homo[d][row][col + 1] = (uint8_t)temp_arr[1];
-                            homo[d][row][col + 2] = (uint8_t)temp_arr[2];
-                            homo[d][row][col + 3] = (uint8_t)temp_arr[3];
-                        }
-                    }
-#endif
+                            int f = dir[d & 3];
+                            f = f == 1 ? 1 : f - 8;
 
-                    for (; col < mcol - 6; col++) {
-                        float tr = drv[0][row - 5][col - 5] < drv[1][row - 5][col - 5] ? drv[0][row - 5][col - 5] : drv[1][row - 5][col - 5];
-
-                        for (int d = 2; d < ndir; d++) {
-                            tr = (drv[d][row - 5][col - 5] < tr ? drv[d][row - 5][col - 5] : tr);
-                        }
-
-                        tr *= 8;
-
-                        for (int d = 0; d < ndir; d++) {
-                            uint8_t temp = 0;
-
-                            for (int v = -1; v <= 1; v++) {
-                                for (int h = -1; h <= 1; h++) {
-                                    temp += (drv[d][row + v - 5][col + h - 5] <= tr ? 1 : 0);
+                            for (int row = 5; row < mrow - 5; row++) {
+                                for (int col = 5; col < mcol - 5; col++) {
+                                    float *y = &yuv[0][row - 4][col - 4];
+                                    float *u = &yuv[1][row - 4][col - 4];
+                                    float *v = &yuv[2][row - 4][col - 4];
+                                    drv[d][row - 5][col - 5] = SQR(2 * y[0] - y[f] - y[-f])
+                                                            + SQR(2 * u[0] - u[f] - u[-f])
+                                                            + SQR(2 * v[0] - v[f] - v[-f]);
                                 }
                             }
-
-                            homo[d][row][col] = temp;
                         }
                     }
-                }
 
-                if (height_ - top < ts + 4) {
-                    mrow = height_ - top + 2;
-                }
+                    /* Build homogeneity maps from the derivatives:         */
+                    //std::cout << "[DEBUG] Build homogeneity maps from the derivatives:" << std::endl;
+    #ifdef __ARM_NEON
+                    float32x4_t eightv = vdupq_n_f32(8.f);
+                    float32x4_t zerov = vdupq_n_f32(0.f);
+                    float32x4_t onev = vdupq_n_f32(1.f);
+    #endif
 
-                if (width_ - left < ts + 4) {
-                    mcol = width_ - left + 2;
-                }
+                    for (int row = 6; row < mrow - 6; row++) {
+                        int col = 6;
+    #ifdef __ARM_NEON
+                        for (; col < mcol - 9; col += 4) {
+                            float32x4_t tr1v = vminq_f32(vld1q_f32(&drv[0][row - 5][col - 5]), vld1q_f32(&drv[1][row - 5][col - 5]));
+                            float32x4_t tr2v = vminq_f32(vld1q_f32(&drv[2][row - 5][col - 5]), vld1q_f32(&drv[3][row - 5][col - 5]));
 
-                /* Build 5x5 sum of homogeneity maps */
-                //std::cout << "[DEBUG] Build 5x5 sum of homogeneity maps" << std::endl;
-                const int startcol = std::min(left, 8);
+                            if(ndir > 4) {
+                                float32x4_t tr3v = vminq_f32(vld1q_f32(&drv[4][row - 5][col - 5]), vld1q_f32(&drv[5][row - 5][col - 5]));
+                                float32x4_t tr4v = vminq_f32(vld1q_f32(&drv[6][row - 5][col - 5]), vld1q_f32(&drv[7][row - 5][col - 5]));
+                                tr1v = vminq_f32(tr1v, tr3v);
+                                tr1v = vminq_f32(tr1v, tr4v);
+                            }
 
-                for(int d = 0; d < ndir; d++) {
+                            tr1v = vminq_f32(tr1v, tr2v);
+                            tr1v = vmulq_f32(tr1v, eightv);
+
+                            for (int d = 0; d < ndir; d++) {
+                                //uint8_t tempstore[16];
+                                float32x4_t tempv = zerov;
+
+                                for (int v = -1; v <= 1; v++) {
+                                    for (int h = -1; h <= 1; h++) {
+                                        float32x4_t drv_val = vld1q_f32(&drv[d][row + v - 5][col + h - 5]);
+                                        uint32x4_t mask = vcleq_f32(drv_val, tr1v);
+                                        tempv = vaddq_f32(tempv, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(onev))));
+                                    }
+                                }
+
+                                // Convert float32x4_t to int32x4_t and extract values
+                                int32x4_t temp_int = vcvtq_s32_f32(tempv);
+                                int32_t temp_arr[4];
+                                vst1q_s32(temp_arr, temp_int);
+                                
+                                homo[d][row][col] = (uint8_t)temp_arr[0];
+                                homo[d][row][col + 1] = (uint8_t)temp_arr[1];
+                                homo[d][row][col + 2] = (uint8_t)temp_arr[2];
+                                homo[d][row][col + 3] = (uint8_t)temp_arr[3];
+                            }
+                        }
+    #endif
+
+                        for (; col < mcol - 6; col++) {
+                            float tr = drv[0][row - 5][col - 5] < drv[1][row - 5][col - 5] ? drv[0][row - 5][col - 5] : drv[1][row - 5][col - 5];
+
+                            for (int d = 2; d < ndir; d++) {
+                                tr = (drv[d][row - 5][col - 5] < tr ? drv[d][row - 5][col - 5] : tr);
+                            }
+
+                            tr *= 8;
+
+                            for (int d = 0; d < ndir; d++) {
+                                uint8_t temp = 0;
+
+                                for (int v = -1; v <= 1; v++) {
+                                    for (int h = -1; h <= 1; h++) {
+                                        temp += (drv[d][row + v - 5][col + h - 5] <= tr ? 1 : 0);
+                                    }
+                                }
+
+                                homo[d][row][col] = temp;
+                            }
+                        }
+                    }
+
+                    if (height_ - top < ts + 4) {
+                        mrow = height_ - top + 2;
+                    }
+
+                    if (width_ - left < ts + 4) {
+                        mcol = width_ - left + 2;
+                    }
+
+                    /* Build 5x5 sum of homogeneity maps */
+                    //std::cout << "[DEBUG] Build 5x5 sum of homogeneity maps" << std::endl;
+                    const int startcol = std::min(left, 8);
+
+                    for(int d = 0; d < ndir; d++) {
+                        for (int row = std::min(top, 8); row < mrow - 8; row++) {
+                            int col = startcol;
+    #ifdef __ARM_NEON
+                            int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
+
+                            // crunching 16 values at once is faster than summing up column sums
+                            for (; col < endcol; col += 16) {
+                                uint8x16_t v5sumv = vdupq_n_u8(0);
+
+                                for(int v = -2; v <= 2; v++) {
+                                    for(int h = -2; h <= 2; h++) {
+                                        uint8x16_t homov = vld1q_u8(&homo[d][row + v][col + h]);
+                                        v5sumv = vqaddq_u8(homov, v5sumv);
+                                    }
+                                }
+
+                                vst1q_u8(&homosum[d][row][col], v5sumv);
+                            }
+    #endif
+
+                            if(col < mcol - 8) {
+                                int v5sum[5] = {0};
+
+                                for(int v = -2; v <= 2; v++)
+                                    for(int h = -2; h <= 2; h++) {
+                                        v5sum[2 + h] += homo[d][row + v][col + h];
+                                    }
+
+                                int blocksum = v5sum[0] + v5sum[1] + v5sum[2] + v5sum[3] + v5sum[4];
+                                homosum[d][row][col] = blocksum;
+                                col++;
+
+                                // now we can subtract a column of five from blocksum and get new colsum of 5
+                                for (int voffset = 0; col < mcol - 8; col++, voffset++) {
+                                    int colsum = homo[d][row - 2][col + 2] + homo[d][row - 1][col + 2] + homo[d][row][col + 2] + homo[d][row + 1][col + 2] + homo[d][row + 2][col + 2];
+                                    voffset = voffset == 5 ? 0 : voffset;  // faster than voffset %= 5;
+                                    blocksum -= v5sum[voffset];
+                                    blocksum += colsum;
+                                    v5sum[voffset] = colsum;
+                                    homosum[d][row][col] = blocksum;
+                                }
+                            }
+                        }
+                    }
+
+
+                    // calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step
+                    //std::cout << "[DEBUG] calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step" << std::endl;
+    #ifdef __ARM_NEON
+                    uint8x16_t maskv = vdupq_n_u8(31);
+    #endif
+
                     for (int row = std::min(top, 8); row < mrow - 8; row++) {
                         int col = startcol;
-#ifdef __ARM_NEON
+    #ifdef __ARM_NEON
                         int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
 
-                        // crunching 16 values at once is faster than summing up column sums
                         for (; col < endcol; col += 16) {
-                            uint8x16_t v5sumv = vdupq_n_u8(0);
+                            uint8x16_t maxval1 = vmaxq_u8(vld1q_u8(&homosum[0][row][col]), vld1q_u8(&homosum[1][row][col]));
+                            uint8x16_t maxval2 = vmaxq_u8(vld1q_u8(&homosum[2][row][col]), vld1q_u8(&homosum[3][row][col]));
 
-                            for(int v = -2; v <= 2; v++) {
-                                for(int h = -2; h <= 2; h++) {
-                                    uint8x16_t homov = vld1q_u8(&homo[d][row + v][col + h]);
-                                    v5sumv = vqaddq_u8(homov, v5sumv);
+                            if(ndir > 4) {
+                                uint8x16_t maxval3 = vmaxq_u8(vld1q_u8(&homosum[4][row][col]), vld1q_u8(&homosum[5][row][col]));
+                                uint8x16_t maxval4 = vmaxq_u8(vld1q_u8(&homosum[6][row][col]), vld1q_u8(&homosum[7][row][col]));
+                                maxval1 = vmaxq_u8(maxval1, maxval3);
+                                maxval1 = vmaxq_u8(maxval1, maxval4);
+                            }
+
+                            maxval1 = vmaxq_u8(maxval1, maxval2);
+                            
+                            // NEONには8ビット単位のシフト命令がないため、16ビットに拡張してシフト
+                            uint16x8_t maxval1_high = vshll_n_u8(vget_high_u8(maxval1), 0); // 16ビットに拡張
+                            uint16x8_t maxval1_low = vshll_n_u8(vget_low_u8(maxval1), 0);   // 16ビットに拡張
+                            
+                            // 32ビットに拡張して3ビット右シフト
+                            uint32x4_t subv_high_high = vshrq_n_u32(vmovl_u16(vget_high_u16(maxval1_high)), 3);
+                            uint32x4_t subv_high_low = vshrq_n_u32(vmovl_u16(vget_low_u16(maxval1_high)), 3);
+                            uint32x4_t subv_low_high = vshrq_n_u32(vmovl_u16(vget_high_u16(maxval1_low)), 3);
+                            uint32x4_t subv_low_low = vshrq_n_u32(vmovl_u16(vget_low_u16(maxval1_low)), 3);
+                            
+                            // 32ビットから16ビットに戻す
+                            uint16x4_t subv_high_high_16 = vmovn_u32(subv_high_high);
+                            uint16x4_t subv_high_low_16 = vmovn_u32(subv_high_low);
+                            uint16x4_t subv_low_high_16 = vmovn_u32(subv_low_high);
+                            uint16x4_t subv_low_low_16 = vmovn_u32(subv_low_low);
+                            
+                            uint16x8_t subv_high = vcombine_u16(subv_high_low_16, subv_high_high_16);
+                            uint16x8_t subv_low = vcombine_u16(subv_low_low_16, subv_low_high_16);
+                            
+                            // 16ビットから8ビットに戻す
+                            uint8x16_t subv = vcombine_u8(vmovn_u16(subv_low), vmovn_u16(subv_high));
+                            
+                            // 8ビットのマスクを適用（31 = 0x1F）
+                            subv = vandq_u8(subv, maskv);
+                            
+                            // 飽和減算
+                            maxval1 = vqsubq_u8(maxval1, subv);
+                            
+                            vst1q_u8(&homosummax[row][col], maxval1);
+                        }
+    #endif
+
+                        for (; col < mcol - 8; col ++) {
+                            uint8_t maxval = homosum[0][row][col];
+
+                            for(int d = 1; d < ndir; d++) {
+                                maxval = maxval < homosum[d][row][col] ? homosum[d][row][col] : maxval;
+                            }
+
+                            maxval -= maxval >> 3;
+                            homosummax[row][col] = maxval;
+                        }
+                    }
+
+                    /* Average the most homogeneous pixels for the final result: */
+                    //std::cout << "[DEBUG] Average the most homogeneous pixels for the final result:" << std::endl;
+                    uint8_t hm[8] = {};
+
+                    for (int row = std::min(top, 8); row < mrow - 8; row++) {
+                        for (int col = std::min(left, 8); col < mcol - 8; col++) {
+
+                            for (int d = 0; d < 4; d++) {
+                                hm[d] = homosum[d][row][col];
+                            }
+
+                            for (int d = 4; d < ndir; d++) {
+                                hm[d] = homosum[d][row][col];
+
+                                if (hm[d - 4] < hm[d]) {
+                                    hm[d - 4] = 0;
+                                } else if (hm[d - 4] > hm[d]) {
+                                    hm[d] = 0;
                                 }
                             }
 
-                            vst1q_u8(&homosum[d][row][col], v5sumv);
-                        }
-#endif
+                            float avg[4] = {0.f, 0.f, 0.f, 0.f};
 
-                        if(col < mcol - 8) {
-                            int v5sum[5] = {0};
+                            uint8_t maxval = homosummax[row][col];
 
-                            for(int v = -2; v <= 2; v++)
-                                for(int h = -2; h <= 2; h++) {
-                                    v5sum[2 + h] += homo[d][row + v][col + h];
+                            for (int d = 0; d < ndir; d++)
+                                if (hm[d] >= maxval) {
+                                    for (int c = 0; c < 3; c++) {
+                                        avg[c] += rgb[d][row][col][c];
+                                    }
+                                    avg[3]++;
                                 }
 
-                            int blocksum = v5sum[0] + v5sum[1] + v5sum[2] + v5sum[3] + v5sum[4];
-                            homosum[d][row][col] = blocksum;
-                            col++;
-
-                            // now we can subtract a column of five from blocksum and get new colsum of 5
-                            for (int voffset = 0; col < mcol - 8; col++, voffset++) {
-                                int colsum = homo[d][row - 2][col + 2] + homo[d][row - 1][col + 2] + homo[d][row][col + 2] + homo[d][row + 1][col + 2] + homo[d][row + 2][col + 2];
-                                voffset = voffset == 5 ? 0 : voffset;  // faster than voffset %= 5;
-                                blocksum -= v5sum[voffset];
-                                blocksum += colsum;
-                                v5sum[voffset] = colsum;
-                                homosum[d][row][col] = blocksum;
-                            }
+                            RGB_BUFFER(row + top, col + left, 0) = std::max(0.f, avg[0] / avg[3]);
+                            RGB_BUFFER(row + top, col + left, 1) = std::max(0.f, avg[1] / avg[3]);
+                            RGB_BUFFER(row + top, col + left, 2) = std::max(0.f, avg[2] / avg[3]);
                         }
-                    }
-                }
-
-
-                // calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step
-                //std::cout << "[DEBUG] calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step" << std::endl;
-#ifdef __ARM_NEON
-                uint8x16_t maskv = vdupq_n_u8(31);
-#endif
-
-                for (int row = std::min(top, 8); row < mrow - 8; row++) {
-                    int col = startcol;
-#ifdef __ARM_NEON
-                    int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
-
-                    for (; col < endcol; col += 16) {
-                        uint8x16_t maxval1 = vmaxq_u8(vld1q_u8(&homosum[0][row][col]), vld1q_u8(&homosum[1][row][col]));
-                        uint8x16_t maxval2 = vmaxq_u8(vld1q_u8(&homosum[2][row][col]), vld1q_u8(&homosum[3][row][col]));
-
-                        if(ndir > 4) {
-                            uint8x16_t maxval3 = vmaxq_u8(vld1q_u8(&homosum[4][row][col]), vld1q_u8(&homosum[5][row][col]));
-                            uint8x16_t maxval4 = vmaxq_u8(vld1q_u8(&homosum[6][row][col]), vld1q_u8(&homosum[7][row][col]));
-                            maxval1 = vmaxq_u8(maxval1, maxval3);
-                            maxval1 = vmaxq_u8(maxval1, maxval4);
-                        }
-
-                        maxval1 = vmaxq_u8(maxval1, maxval2);
-                        
-                        // NEONには8ビット単位のシフト命令がないため、16ビットに拡張してシフト
-                        uint16x8_t maxval1_high = vshll_n_u8(vget_high_u8(maxval1), 0); // 16ビットに拡張
-                        uint16x8_t maxval1_low = vshll_n_u8(vget_low_u8(maxval1), 0);   // 16ビットに拡張
-                        
-                        // 32ビットに拡張して3ビット右シフト
-                        uint32x4_t subv_high_high = vshrq_n_u32(vmovl_u16(vget_high_u16(maxval1_high)), 3);
-                        uint32x4_t subv_high_low = vshrq_n_u32(vmovl_u16(vget_low_u16(maxval1_high)), 3);
-                        uint32x4_t subv_low_high = vshrq_n_u32(vmovl_u16(vget_high_u16(maxval1_low)), 3);
-                        uint32x4_t subv_low_low = vshrq_n_u32(vmovl_u16(vget_low_u16(maxval1_low)), 3);
-                        
-                        // 32ビットから16ビットに戻す
-                        uint16x4_t subv_high_high_16 = vmovn_u32(subv_high_high);
-                        uint16x4_t subv_high_low_16 = vmovn_u32(subv_high_low);
-                        uint16x4_t subv_low_high_16 = vmovn_u32(subv_low_high);
-                        uint16x4_t subv_low_low_16 = vmovn_u32(subv_low_low);
-                        
-                        uint16x8_t subv_high = vcombine_u16(subv_high_low_16, subv_high_high_16);
-                        uint16x8_t subv_low = vcombine_u16(subv_low_low_16, subv_low_high_16);
-                        
-                        // 16ビットから8ビットに戻す
-                        uint8x16_t subv = vcombine_u8(vmovn_u16(subv_low), vmovn_u16(subv_high));
-                        
-                        // 8ビットのマスクを適用（31 = 0x1F）
-                        subv = vandq_u8(subv, maskv);
-                        
-                        // 飽和減算
-                        maxval1 = vqsubq_u8(maxval1, subv);
-                        
-                        vst1q_u8(&homosummax[row][col], maxval1);
-                    }
-#endif
-
-                    for (; col < mcol - 8; col ++) {
-                        uint8_t maxval = homosum[0][row][col];
-
-                        for(int d = 1; d < ndir; d++) {
-                            maxval = maxval < homosum[d][row][col] ? homosum[d][row][col] : maxval;
-                        }
-
-                        maxval -= maxval >> 3;
-                        homosummax[row][col] = maxval;
-                    }
-                }
-
-                /* Average the most homogeneous pixels for the final result: */
-                //std::cout << "[DEBUG] Average the most homogeneous pixels for the final result:" << std::endl;
-                uint8_t hm[8] = {};
-
-                for (int row = std::min(top, 8); row < mrow - 8; row++) {
-                    for (int col = std::min(left, 8); col < mcol - 8; col++) {
-
-                        for (int d = 0; d < 4; d++) {
-                            hm[d] = homosum[d][row][col];
-                        }
-
-                        for (int d = 4; d < ndir; d++) {
-                            hm[d] = homosum[d][row][col];
-
-                            if (hm[d - 4] < hm[d]) {
-                                hm[d - 4] = 0;
-                            } else if (hm[d - 4] > hm[d]) {
-                                hm[d] = 0;
-                            }
-                        }
-
-                        float avg[4] = {0.f, 0.f, 0.f, 0.f};
-
-                        uint8_t maxval = homosummax[row][col];
-
-                        for (int d = 0; d < ndir; d++)
-                            if (hm[d] >= maxval) {
-                                for (int c = 0; c < 3; c++) {
-                                    avg[c] += rgb[d][row][col][c];
-                                }
-                                avg[3]++;
-                            }
-
-                        RGB_BUFFER(row + top, col + left, 0) = std::max(0.f, avg[0] / avg[3]);
-                        RGB_BUFFER(row + top, col + left, 1) = std::max(0.f, avg[1] / avg[3]);
-                        RGB_BUFFER(row + top, col + left, 2) = std::max(0.f, avg[2] / avg[3]);
                     }
                 }
             }
-        }
 
-        xtrans_border_interpolate(8);
+            xtrans_border_interpolate(8);
+        }
     }
 
    // 1-pass fast demosaic - RawTherapee's exact fast_xtrans_interpolate

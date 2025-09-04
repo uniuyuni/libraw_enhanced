@@ -28,7 +28,6 @@ namespace libraw_enhanced {
 static id<MTLDevice> g_metal_device = nil;
 static id<MTLCommandQueue> g_command_queue = nil;
 static id<MTLLibrary> g_shader_library = nil;
-static bool g_gpu_initialized = false;
 
 class GPUAccelerator::Impl {
 public:

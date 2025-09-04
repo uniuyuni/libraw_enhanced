@@ -21,21 +21,13 @@ if(APPLE)
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     
-    if(MACHINE_ARCH STREQUAL "arm64")
-        set(APPLE_SILICON TRUE)
-        message(STATUS "Building for Apple Silicon (arm64)")
-    else()
-        set(APPLE_SILICON FALSE)
-        message(STATUS "Building for Intel Mac (x86_64)")
-    endif()
-else()
+else()z
     set(APPLE_PLATFORM FALSE)
-    set(APPLE_SILICON FALSE)
     message(STATUS "Building for non-Apple platform")
 endif()
 
 # 最適化フラグ設定
-if(APPLE_SILICON)
+if(__arm64__)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-a14")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffast-math")
@@ -79,7 +71,7 @@ endif()
 if(NOT LIBRAW_FOUND)
     # Homebrewパスを確認
     if(APPLE_PLATFORM)
-        if(APPLE_SILICON)
+        if(__arm64__)
             set(HOMEBREW_PREFIX "/opt/homebrew")
         else()
             set(HOMEBREW_PREFIX "/usr/local")
@@ -147,10 +139,6 @@ if(APPLE_PLATFORM)
         ${APPLE_FRAMEWORKS}
     )
     
-    # Metal関連の定義を追加
-    target_compile_definitions(libraw_enhanced_core PRIVATE
-        METAL_ACCELERATION_AVAILABLE
-    )
 endif()
 
 # コンパイル設定
@@ -225,7 +213,6 @@ message(STATUS "=== Build Configuration Summary ===")
 message(STATUS "Platform: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "Apple Platform: ${APPLE_PLATFORM}")
-message(STATUS "Apple Silicon: ${APPLE_SILICON}")
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 if(APPLE_PLATFORM)
@@ -249,7 +236,7 @@ if(APPLE_PLATFORM)
     )
     
     # Apple Silicon固有の最適化レポート
-    if(APPLE_SILICON)
+    if(__arm64__)
         add_custom_target(optimization_report
             COMMAND ${CMAKE_CXX_COMPILER} ${CMAKE_CXX_FLAGS} -S -mllvm -print-after-all
                     ${CMAKE_CURRENT_SOURCE_DIR}/core/libraw_wrapper.cpp -o /dev/null 2>&1 | 

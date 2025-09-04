@@ -11,8 +11,6 @@ from pathlib import Path
 try:
     from ._core import (
         LibRawWrapper,
-        ProcessingParams,
-        ProcessedImageData,
         ImageInfo,
     )
     _CORE_AVAILABLE = True
@@ -23,8 +21,6 @@ except ImportError as e:
     
     # Create dummy classes for type annotations when core not available
     class LibRawWrapper: pass
-    class ProcessingParams: pass
-    class ProcessedImageData: pass
     class ImageInfo: pass
 
 from .constants import (
@@ -169,9 +165,7 @@ class RawImage:
                    bad_pixels_path: Optional[str] = None,
                    
                    # LibRaw Enhanced extensions
-                   metal_acceleration: bool = True,
-                   use_gpu_acceleration: Optional[bool] = None,
-                   custom_pipeline = None) -> np.ndarray:
+                   use_gpu_acceleration: Optional[bool] = False) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
         
@@ -248,7 +242,7 @@ class RawImage:
         from .constants import DemosaicAlgorithm
         
         # Handle GPU acceleration parameters (allow use_gpu_acceleration to override)
-        gpu_acceleration = use_gpu_acceleration if use_gpu_acceleration is not None else metal_acceleration
+        gpu_acceleration = use_gpu_acceleration
         
         # Create parameters structure (assuming it will be passed to C++ layer)
         params = {
@@ -306,17 +300,9 @@ class RawImage:
             'bad_pixels_path': bad_pixels_path if bad_pixels_path is not None else '',
             
             # LibRaw Enhanced extensions
-            'metal_acceleration': gpu_acceleration,
             'use_gpu_acceleration': gpu_acceleration,
         }
-        
-        # Handle custom pipeline 
-        use_custom_pipeline = custom_pipeline if custom_pipeline is not None else True  # Default to True
-        
-        # Enable custom pipeline on wrapper
-        if hasattr(self._wrapper, 'enable_custom_pipeline'):
-            self._wrapper.enable_custom_pipeline(use_custom_pipeline)
-        
+                
         # Convert parameter dict to the format expected by C++
         float_params = {}
         int_params = {}
@@ -488,12 +474,12 @@ class RawImage:
         Returns:
             dict: 最適化機能の利用可能性
         """
-        from . import is_gpu_available
+        from . import is_gpu_available, is_apple_selicon
         
         return {
-            'metal_available': is_gpu_available(),
             'accelerate_available': True,  # Accelerate framework is always available on macOS
-            'apple_silicon': is_gpu_available(),
+            'apple_silicon': is_apple_selicon(),
+            'gpu_available': is_gpu_available(),
         }
     
     def __repr__(self):

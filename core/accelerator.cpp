@@ -17,7 +17,7 @@ public:
     std::unique_ptr<CPUAccelerator> cpu_accelerator;
     std::unique_ptr<GPUAccelerator> gpu_accelerator;
 
-    bool use_gpu_acceleration = true;  // Default to true
+    bool use_gpu_acceleration = false;  // Default to true
     
     Impl() : cpu_accelerator(std::make_unique<CPUAccelerator>()),
              gpu_accelerator(std::make_unique<GPUAccelerator>()) {}

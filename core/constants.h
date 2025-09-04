@@ -23,10 +23,6 @@ enum class DemosaicAlgorithm : int {
     AMaZE = 10,                   // AMaZE (Aliasing minimization and zipper elimination) (requires GPL3 pack)
     DHT = 11,                     // DHT interpolation (LibRaw quality=11)
     AAHD = 12,                    // AAHD (Modified AHD variant) (LibRaw quality=12)
-    
-    // LibRaw Enhanced extensions
-    Adaptive = 100,               // 適応的デモザイク
-    MLEnhanced = 101             // 機械学習強化
 };
 
 // Color Space Constants (rawpy/LibRaw compatible)

@@ -45,43 +45,27 @@ except ImportError as e:
 # Core classes (low-level API)
 if _CORE_AVAILABLE:
     try:
-        CPUAccelerator = _core.CPUAccelerator
         Accelerator = _core.Accelerator
         ImageBufferFloat = _core.ImageBufferFloat
         ProcessingParams = _core.ProcessingParams
     except AttributeError:
         # These classes might not be available in all builds
-        CPUAccelerator = None
         Accelerator = None
         ImageBufferFloat = None
         ProcessingParams = None
 else:
-    CPUAccelerator = None
     Accelerator = None
     ImageBufferFloat = None
     ProcessingParams = None
 
 # Constants and enums
-try:
-    from .constants import (
-        ColorSpace,
-        HighlightMode, 
-        FBDDNoiseReduction,
-        NoiseReduction,
-        DemosaicAlgorithm
-    )
-except ImportError:
-    # Define minimal constants as fallback
-    class ColorSpace:
-        sRGB = 1
-        AdobeRGB = 2
-        ProPhotoRGB = 4
-    
-    class HighlightMode:
-        Clip = 0
-        Unclip = 1
-        Blend = 2
-        Rebuild = 3
+from .constants import (
+    ColorSpace,
+    HighlightMode, 
+    FBDDNoiseReduction,
+    NoiseReduction,
+    DemosaicAlgorithm
+)
 
 # Pipeline functionality (optional)
 try:
@@ -118,10 +102,10 @@ def get_platform_info():
             build_info = _core.get_build_info()
             info.update(build_info)
             
-            info["metal_available"] = _core.is_gpu_available()
             info["apple_silicon"] = _core.is_apple_silicon()
+            info["gpu_available"] = _core.is_gpu_available()
             
-            if info["metal_available"]:
+            if info["gpu_available"]:
                 info["metal_devices"] = _core.get_metal_device_list()
             
         except (AttributeError, RuntimeError):
@@ -151,11 +135,6 @@ def is_gpu_available():
     
     return False
 
-# Backward compatibility
-def is_metal_available():
-    """Metal加速の可用性チェック (is_gpu_availableの別名)"""
-    return is_gpu_available()
-
 def get_version_info():
     """バージョン情報の取得"""
     info = {
@@ -179,7 +158,6 @@ __all__ = [
     "imread_buffer",
     
     # Core classes (low-level API)
-    "CPUAccelerator",
     "Accelerator", 
     "ImageBufferFloat",
     "ProcessingParams",
@@ -187,7 +165,6 @@ __all__ = [
     # Platform detection  
     "is_apple_silicon",
     "is_gpu_available",
-    "is_metal_available",  # Backward compatibility 
     "get_platform_info",
     "get_version_info",
     
