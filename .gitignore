@@ -244,4 +244,8 @@ test_output*/
 *.NEF
 *.ARW
 *.DNG
-tests/data/
+tests/fixtures*/
+tests/results*/
+
+# External
+external*/

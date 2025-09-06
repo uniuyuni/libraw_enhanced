@@ -11,7 +11,6 @@
 
 #ifdef __arm64__
 #include "accelerator.h"
-#include "gpu_accelerator.h"
 #include "camera_matrices.h"
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -60,12 +59,10 @@ public:
     LibRaw processor;
     bool debug_mode = false;
     ProcessingTimes timing_info;  // 処理時間情報
-    BufferManager buffer_manager;  // Generic memory manager for all allocations
     
 #ifdef __arm64__
     std::unique_ptr<Accelerator> accelerator;
 
-    // REMOVED: bool custom_pipeline_enabled (unused custom pipeline feature)
     ProcessingParams current_params;
 #endif
 
@@ -538,7 +535,6 @@ public:
         bool demosaic_success = accelerator->demosaic_compute(raw_buffer, rgb_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform, processor.imgdata.color.cam_mul, processor.imgdata.color.maximum);
         if (!demosaic_success) {
             std::cerr << "❌ Demosaic processing failed" << std::endl;
-            // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
 
@@ -575,7 +571,6 @@ public:
                 << ", " << effective_wb[2] << ", " << effective_wb[3] << "]" << std::endl;
         if (!accelerator->apply_white_balance(rgb_buffer, rgb_buffer, effective_wb)) {
             std::cerr << "❌ White balance failed" << std::endl;
-            // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
 */        
@@ -588,14 +583,12 @@ public:
         }
         if (!accelerator->convert_color_space(rgb_buffer, rgb_buffer, camera_matrix.transform)) {
             std::cerr << "❌ Camera matrix color conversion failed" << std::endl;
-            // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
                 
         // Step 6: In-place gamma correction with color space awareness (reuse float_rgb buffer)  
         if (!accelerator->gamma_correct(rgb_buffer, rgb_buffer, params.gamma_power, params.gamma_slope, params.output_color_space)) {
             std::cerr << "❌ Gamma correction failed" << std::endl;
-            // Note: rgb_temp.image allocated via buffer_manager, not malloc - auto-managed
             return false;
         }
         
@@ -1261,11 +1254,7 @@ public:
         }
     }
     
-    bool is_gpu_available() const {
-        return accelerator->is_gpu_available();
-    }
-    
-    std::string get_metal_device_info() const {
+    std::string get_device_info() const {
         if (accelerator) {
             return accelerator->get_device_info();
         }
@@ -1492,20 +1481,13 @@ void LibRawWrapper::set_processing_params(const ProcessingParams& params) {
     pimpl->set_processing_params(params);
 }
 
-bool LibRawWrapper::is_gpu_available() const {
-    return pimpl->accelerator->is_gpu_available();
-}
-
 void LibRawWrapper::enable_gpu_acceleration(bool enable) {
     pimpl->accelerator->set_use_gpu_acceleration(enable);
 }
 
-std::string LibRawWrapper::get_metal_device_info() const {
-    return pimpl->get_metal_device_info();
+std::string LibRawWrapper::get_device_info() const {
+    return pimpl->get_device_info();
 }
-
-// REMOVED: Unused enable_custom_pipeline() method (10 lines)
-// Custom pipeline feature was replaced by unified accelerator dispatch
 
 // New methods for high-level API support
 int LibRawWrapper::load_buffer(const std::vector<uint8_t>& buffer) {
@@ -1766,19 +1748,16 @@ bool is_apple_silicon() {
 #endif
 }
 
-// REMOVED: Global is_gpu_available() function that creates temporary GPU instances
-// Use LibRawWrapper::is_gpu_available() or instance-based methods instead
-
-bool is_metal_available() {
+bool is_available() {
     // Backward compatibility - check if Metal is available without creating instances
 #ifdef __arm64__
-    return is_apple_silicon(); // Simple check - Apple Silicon has Metal support
+    return is_available(); // Simple check - Apple Silicon has Metal support
 #else
     return false;
 #endif
 }
 
-std::vector<std::string> get_metal_device_list() {
+std::vector<std::string> get_device_list() {
     std::vector<std::string> device_list;
     
 #ifdef __arm64__

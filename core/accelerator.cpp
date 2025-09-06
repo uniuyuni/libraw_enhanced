@@ -49,20 +49,16 @@ void Accelerator::set_use_gpu_acceleration(bool enable) {
     pimpl_->use_gpu_acceleration = enable;
 }
 
-bool Accelerator::should_use_gpu(const ProcessingParams& params) const {
+bool Accelerator::should_use_gpu() const {
     // Use GPU if:
     // 1. GPU is available
     // 2. Metal acceleration is enabled in params
     // Note: Image size check is handled elsewhere
-    return pimpl_->gpu_accelerator->is_available() && params.use_gpu_acceleration;
+    return pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration;
 }
 
 bool Accelerator::is_available() const {
-    return pimpl_->cpu_accelerator->is_available() || pimpl_->cpu_accelerator->is_available();
-}
-
-bool Accelerator::is_gpu_available() const {
-    return pimpl_->gpu_accelerator->is_available();
+    return pimpl_->cpu_accelerator->is_available() && pimpl_->gpu_accelerator->is_available();
 }
 
 std::string Accelerator::get_device_info() const {
@@ -78,10 +74,8 @@ bool Accelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer,
                                            uint32_t filters,
                                            uint16_t maximum_value) {
     // GPU acceleration check
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
+    if (should_use_gpu()) {
         std::cout << "🎯 Trying GPU Bayer Linear demosaic..." << std::endl;
-        
-        // Try GPU first with filters parameter
         if (pimpl_->gpu_accelerator->demosaic_bayer_linear(raw_buffer, rgb_buffer, filters, maximum_value)) {
             std::cout << "✅ GPU Bayer Linear demosaic completed successfully" << std::endl;
             return true;
@@ -99,7 +93,10 @@ bool Accelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
                                         uint32_t filters,
                                         uint16_t maximum_value) {
 
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
+    if (should_use_gpu()) {
+        // GPU accelerator needs to be updated for demosaic_bayer_aahd
+        // For now, fallback to CPU immediately
+        std::cout << "⚠️  GPU not yet updated for demosaic_bayer_aahd, falling back to CPU" << std::endl;
     }
     
     std::cout << "🔧 Using CPU AHD demosaic" << std::endl;
@@ -113,7 +110,10 @@ bool Accelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
                                         int iterations,
                                         bool dcb_enhance) {
 
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
+    if (should_use_gpu()) {
+        // GPU accelerator needs to be updated for demosaic_bayer_dcb
+        // For now, fallback to CPU immediately
+        std::cout << "⚠️  GPU not yet updated for demosaic_bayer_dcb, falling back to CPU" << std::endl;
     }
     
     std::cout << "🔧 Using CPU DCB demosaic" << std::endl;
@@ -125,10 +125,9 @@ bool Accelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
                                           uint32_t filters,
                                           const float (&cam_mul)[4],
                                           uint16_t maximum_value) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
+    //if (should_use_gpu()) {
+    if (false) {
         std::cout << "🎯 Trying GPU AMaZE demosaic..." << std::endl;
-        
-        // Try GPU first with filters parameter
         if (pimpl_->gpu_accelerator->demosaic_bayer_amaze(raw_buffer, rgb_buffer, filters, cam_mul, maximum_value)) {
             std::cout << "✅ GPU AMaZE demosaic completed successfully" << std::endl;
             return true;
@@ -190,7 +189,8 @@ bool Accelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
                                         const char (&xtrans)[6][6],
                                         const float (&color_matrix)[3][4],
                                         uint16_t maximum_value) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
+    //if (should_use_gpu()) {
+    if (false) {
         std::cout << "🎯 Trying GPU X-Trans 3-pass demosaic..." << std::endl;
         if (pimpl_->gpu_accelerator->demosaic_xtrans_3pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value)) {
             std::cout << "✅ GPU X-Trans 3-pass demosaic successful" << std::endl;
@@ -208,10 +208,9 @@ bool Accelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
                                         const char (&xtrans)[6][6],
                                         const float (&color_matrix)[3][4],
                                         uint16_t maximum_value) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
+    //if (should_use_gpu()) {
+    if (false) { // Temporarily disable GPU for testing
         std::cout << "🎯 Trying GPU X-Trans 1-pass demosaic..." << std::endl;
-        
-        // Try GPU X-Trans 1-pass implementation
         if (pimpl_->gpu_accelerator->demosaic_xtrans_1pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value)) {
             std::cout << "✅ GPU X-Trans 1-pass demosaic completed successfully" << std::endl;
             return true;
@@ -227,8 +226,7 @@ bool Accelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
 bool Accelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
                                             ImageBufferFloat& rgb_output,
                                             const float wb_multipliers[4]) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
-        std::cout << "🎯 Trying GPU white balance on RAW..." << std::endl;
+    if (should_use_gpu()) {
         // GPU accelerator needs to be updated to accept ImageBufferFloat
         // For now, fallback to CPU
         std::cout << "⚠️  GPU not yet updated for ImageBufferFloat, falling back to CPU" << std::endl;
@@ -243,8 +241,16 @@ bool Accelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
 bool Accelerator::convert_color_space(const ImageBufferFloat& rgb_input,
                                       ImageBufferFloat& rgb_output,
                                       const float transform[3][4]) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
-        std::cout << "🎯 Trying GPU camera matrix color conversion..." << std::endl;
+    if (should_use_gpu()) {
+        std::cout << "🎯 Trying GPU convert color space..." << std::endl;
+        if (pimpl_->gpu_accelerator->convert_color_space(rgb_input, rgb_output, transform)) {
+            std::cout << "✅ GPU convert color space completed successfully" << std::endl;
+            return true;
+        } else {
+            std::cout << "⚠️  GPU convert color space failed, falling back to CPU" << std::endl;
+        }
+
+
         // GPU accelerator needs to be updated for camera matrix support
         // For now, fallback to CPU
         std::cout << "⚠️  GPU not yet updated for camera matrix, falling back to CPU" << std::endl;
@@ -259,11 +265,25 @@ bool Accelerator::gamma_correct(const ImageBufferFloat& rgb_input,
                                float gamma_power,
                                float gamma_slope,
                                int output_color_space) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
-        std::cout << "🎯 Trying GPU gamma correction..." << std::endl;
-        // GPU accelerator needs to be updated to accept ImageBufferFloat
-        // For now, fallback to CPU
-        std::cout << "⚠️  GPU not yet updated for ImageBufferFloat, falling back to CPU" << std::endl;
+
+    if (gamma_power == 1.f && gamma_slope == 1.f) {
+        std::cout << "ℹ️  Gamma power and slope are 1.0, skipping gamma correction" << std::endl;
+        return true;
+    } else
+    if (gamma_power > 0.f && gamma_slope > 0.f) {
+        std::cout << "ℹ️ Both gamma power and slope are set, custom gamma corrention" << std::endl;
+        std::cout << "   Gamma power: " << gamma_power << " slope: " << gamma_slope << std::endl;
+        output_color_space = -1;
+    }
+
+    if (should_use_gpu()) {
+        std::cout << "🎯 Trying GPU gamma correct..." << std::endl;
+        if (pimpl_->gpu_accelerator->gamma_correct(rgb_input, rgb_output, gamma_power, gamma_slope, output_color_space)) {
+            std::cout << "✅ GPU gamma correct completed successfully" << std::endl;
+            return true;
+        } else {
+            std::cout << "⚠️  GPU gamma correct failed, falling back to CPU" << std::endl;
+        }
     }
     
     std::cout << "🔧 Using CPU gamma correction" << std::endl;
@@ -271,8 +291,7 @@ bool Accelerator::gamma_correct(const ImageBufferFloat& rgb_input,
 }
 
 bool Accelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
-    if (pimpl_->gpu_accelerator->is_available() && pimpl_->use_gpu_acceleration) {
-        std::cout << "🎯 Trying GPU pre-interpolation..." << std::endl;
+    if (should_use_gpu()) {
         // GPU accelerator needs to be updated for pre-interpolation
         // For now, fallback to CPU immediately
         std::cout << "⚠️  GPU not yet updated for pre-interpolation, falling back to CPU" << std::endl;
@@ -282,7 +301,5 @@ bool Accelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, c
     return pimpl_->cpu_accelerator->pre_interpolate(image_buffer, filters, xtrans, half_size);
 }
 
-// Note: Pipeline processing has been moved to libraw_wrapper.cpp
-// This class now serves as a pure CPU/GPU dispatch layer
 
 } // namespace libraw_enhanced

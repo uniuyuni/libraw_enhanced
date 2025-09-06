@@ -4,12 +4,11 @@
 // rawpy/LibRaw互換のEnum値定義（C++版）
 //
 
-#pragma once
-
-namespace libraw_enhanced {
+#ifndef __constants_h__
+#define __constants_h__
 
 // Demosaic Algorithm Constants (rawpy/LibRaw compatible)
-enum class DemosaicAlgorithm : int {
+enum DemosaicAlgorithm : int {
     Linear = 0,                    // Linear/Bilinear interpolation (LibRaw quality=0)
     VNG = 1,                      // Variable Number of Gradients (LibRaw quality=1)
     PPG = 2,                      // Patterned Pixel Grouping (LibRaw quality=2)
@@ -26,7 +25,7 @@ enum class DemosaicAlgorithm : int {
 };
 
 // Color Space Constants (rawpy/LibRaw compatible)
-enum class ColorSpace : int {
+enum ColorSpace : int {
     Raw = 0,                     // LIBRAW_COLORSPACE_NotFound
     sRGB = 1,                   // LIBRAW_COLORSPACE_sRGB
     AdobeRGB = 2,               // LIBRAW_COLORSPACE_AdobeRGB
@@ -39,5 +38,4 @@ enum class ColorSpace : int {
 };
 
 
-
-} // namespace libraw_enhanced
+#endif // __constants_h__s

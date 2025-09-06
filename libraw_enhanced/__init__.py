@@ -67,24 +67,6 @@ from .constants import (
     DemosaicAlgorithm
 )
 
-# Pipeline functionality (optional)
-try:
-    from .pipeline_builder import (
-        PipelineBuilder,
-        Pipeline, 
-        ProcessingStep,
-        ProcessingStepType,
-        ProcessingMethod,
-        create_standard_pipeline,
-        create_high_quality_pipeline,
-        create_fast_pipeline
-    )
-    _PIPELINE_AVAILABLE = True
-except ImportError as e:
-    _PIPELINE_AVAILABLE = False
-    # Pipeline functionality is optional and not yet implemented
-    pass
-
 # Platform and capability detection
 def get_platform_info():
     """プラットフォーム情報の取得"""
@@ -94,7 +76,6 @@ def get_platform_info():
         "machine": platform.machine(),
         "python_version": platform.python_version(),
         "core_available": _CORE_AVAILABLE,
-        "pipeline_available": _PIPELINE_AVAILABLE,
     }
     
     if _CORE_AVAILABLE:
@@ -103,10 +84,10 @@ def get_platform_info():
             info.update(build_info)
             
             info["apple_silicon"] = _core.is_apple_silicon()
-            info["gpu_available"] = _core.is_gpu_available()
+            info["available"] = _core.is_available()
             
-            if info["gpu_available"]:
-                info["metal_devices"] = _core.get_metal_device_list()
+            if info["available"]:
+                info["devices"] = _core.get_device_list()
             
         except (AttributeError, RuntimeError):
             pass
@@ -125,11 +106,11 @@ def is_apple_silicon():
     import platform
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
-def is_gpu_available():
+def is_available():
     """Metal加速の可用性チェック"""
     if _CORE_AVAILABLE:
         try:
-            return _core.is_gpu_available()
+            return _core.is_available()
         except AttributeError:
             pass
     
@@ -164,7 +145,6 @@ __all__ = [
     
     # Platform detection  
     "is_apple_silicon",
-    "is_gpu_available",
     "get_platform_info",
     "get_version_info",
     
@@ -175,19 +155,6 @@ __all__ = [
     "NoiseReduction",
     "DemosaicAlgorithm",
 ]
-
-# Pipeline exports (conditional)
-if _PIPELINE_AVAILABLE:
-    __all__.extend([
-        "PipelineBuilder",
-        "Pipeline",
-        "ProcessingStep", 
-        "ProcessingStepType",
-        "ProcessingMethod",
-        "create_standard_pipeline",
-        "create_high_quality_pipeline", 
-        "create_fast_pipeline",
-    ])
 
 # Initialization and startup checks
 def _initialize_package():
@@ -203,7 +170,7 @@ def _initialize_package():
         return
     
     # Apple Silicon特有の最適化情報
-    if is_apple_silicon() and is_gpu_available():
+    if is_apple_silicon() and is_available():
         # デバッグモード以外では非表示
         import os
         if os.environ.get("LIBRAW_ENHANCED_DEBUG"):

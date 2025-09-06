@@ -85,39 +85,28 @@ public:
     // Gamma correction method
     bool gamma_correct(const ImageBufferFloat& rgb_input,
                         ImageBufferFloat& rgb_output,
-                        float gamma_power = 2.2f,
-                        float gamma_slope = 4.5f,
+                        float gamma_power = 0.f, //2.2f,
+                        float gamma_slope = 0.f, // 4.5f,
                         int output_color_space = 1);
                            
     double get_last_processing_time() const;
     size_t get_memory_usage() const;
     void set_debug_mode(bool enable);
     std::string get_device_info() const;
-    
-    // Border interpolation method (moved to public for GPU fallback)
-    void border_interpolate(const ImageBufferFloat& raw_buffer, uint32_t filters, int border);
-    
-private:
-    float apply_srgb_gamma_encode(float linear_value) const;
-    float apply_pure_power_gamma_encode(float linear_value, float power) const;
-    float apply_rec2020_gamma_encode(float linear_value) const;
-    float apply_aces_gamma_encode(float linear_value) const;
-
-    static constexpr float rgb_cam_default_[3][4] = {
-        {1.f, 0.f, 0.f, 0.f},
-        {0.f, 1.f, 0.f, 0.f},
-        {0.f, 0.f, 1.f, 0.f}
-    };
- 
+        
+private: 
     bool initialized_ = false;
     bool debug_mode_ = false;
     double last_processing_time_ = 0.0;
     std::string device_name_ = "Apple Silicon CPU";
-    BufferManager buffer_manager_;
-};
 
-bool is_apple_silicon();
-bool is_accelerate_available();
-std::vector<std::string> get_cpu_device_list();
+    float apply_srgb_gamma_encode(float linear_value) const;
+    float apply_aces_gamma_encode(float linear_value) const;
+    float apply_rec2020_gamma_encode(float linear_value) const;
+    float apply_pure_power_gamma_encode(float linear_value, float power) const;
+    float apply_pure_power_gamma_encode_with_slope(float v, float p, float s) const;
+    
+    void border_interpolate(const ImageBufferFloat& raw_buffer, uint32_t filters, int border);
+};
 
 } // namespace libraw_enhanced

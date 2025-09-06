@@ -58,7 +58,7 @@ def process_raw_file(raw_path, output_dir):
                     "half_size": False,
                     "output_bps": 32,
                     "demosaic_algorithm": 10,  # AMaZE
-                    "use_gpu_acceleration": False
+                    "use_gpu_acceleration": True
                 }
             },
         ]

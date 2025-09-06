@@ -67,8 +67,8 @@ public:
                             
     bool gamma_correct(const ImageBufferFloat& rgb_input,
                       ImageBufferFloat& rgb_output,
-                      float gamma_power = 2.2f,
-                      float gamma_slope = 4.5f,
+                      float gamma_power = 0.f, //2.2f,
+                      float gamma_slope = 0.f, // 4.5f,
                       int output_color_space = 1);
 
 private:

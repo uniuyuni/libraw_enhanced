@@ -109,10 +109,7 @@ public:
     // Metal関連メソッド（実装はlibraw_wrapper.cppで定義）
     void set_processing_params(const ProcessingParams& params);
     void enable_gpu_acceleration(bool enable);
-    bool is_gpu_available() const;
-    std::string get_metal_device_info() const;
-    
-    // REMOVED: void enable_custom_pipeline(bool enable); - unused custom pipeline feature
+    std::string get_device_info() const; 
 #endif
 
 private:
@@ -161,7 +158,7 @@ ProcessingParams create_params_from_rawpy_args(
     float exp_preserve_highlights = 0.0f,
     
     // Gamma and scaling
-    const std::pair<float, float>& gamma = {2.222f, 4.5f},
+    const std::pair<float, float>& gamma = {0.f, 0.f}, //{2.222f, 4.5f},
     bool no_auto_scale = false,
     
     // Color correction parameters
@@ -181,7 +178,7 @@ ProcessingParams create_params_from_rawpy_args(
 
 // Platform detection functions
 bool is_apple_silicon();
-std::vector<std::string> get_metal_device_list();
+std::vector<std::string> get_device_list();
 
 #endif
 

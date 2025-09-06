@@ -168,21 +168,6 @@ SUPPORTED_RAW_EXTENSIONS = {
     '.yin',                # Alcatel
 }
 
-# Default processing parameters
-DEFAULT_PROCESSING_PARAMS = {
-    'use_camera_wb': True,
-    'half_size': False,
-    'four_color_rgb': False,
-    'output_color': ColorSpace.sRGB,
-    'output_bps': 8,
-    'bright': 1.0,
-    'highlight_mode': HighlightMode.Clip,
-    'gamma': (2.222, 4.5),
-    'metal_acceleration': True,
-    'demosaic_algorithm': DemosaicAlgorithm.VNG,
-    'noise_reduction': NoiseReduction.Off,
-}
-
 # Apple Silicon specific constants
 APPLE_SILICON_CHIPS = {
     'M1', 'M1 Pro', 'M1 Max', 'M1 Ultra',
@@ -208,10 +193,6 @@ def is_raw_file(filepath):
     """RAWファイルかどうかを判定"""
     from pathlib import Path
     return Path(filepath).suffix.lower() in SUPPORTED_RAW_EXTENSIONS
-
-def get_default_params():
-    """デフォルト処理パラメータを取得"""
-    return DEFAULT_PROCESSING_PARAMS.copy()
 
 def validate_color_space(color_space):
     """カラースペースの有効性チェック"""
@@ -246,7 +227,6 @@ __all__ = [
     
     # Constants
     'SUPPORTED_RAW_EXTENSIONS',
-    'DEFAULT_PROCESSING_PARAMS',
     'APPLE_SILICON_CHIPS',
     'METAL_MAX_TEXTURE_SIZE',
     'METAL_TILE_SIZE',

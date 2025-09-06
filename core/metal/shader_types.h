@@ -20,8 +20,10 @@
 #endif
 
 #define UINT2 uint2
+#define FLOAT4 float4
 #else
 #define UINT2 vector_uint2
+#define FLOAT4 vector_float4
 #endif
 
 typedef struct {
@@ -70,7 +72,8 @@ typedef struct {
 typedef struct {
     uint32_t width;
     uint32_t height;
-    float transform[3][4];   // 3x4 color transformation matrix
+    FLOAT4 transform[3];
+    //float transform[3][4];   // 3x4 color transformation matrix
 } ColorSpaceParams;
 
 typedef struct {

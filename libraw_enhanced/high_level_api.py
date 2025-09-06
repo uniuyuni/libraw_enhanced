@@ -151,7 +151,7 @@ class RawImage:
                    exp_preserve_highlights: float = 0.0,
                    
                    # Gamma and scaling
-                   gamma: Tuple[float, float] = (2.222, 4.5),
+                   gamma: Tuple[float, float] = (0.0, 0.0), # (2.222, 4.5),
                    no_auto_scale: bool = False,
                    
                    # NEW: Color correction parameters (rawpy compatible)
@@ -227,7 +227,6 @@ class RawImage:
             # LibRaw Enhanced extensions
             metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
             use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
-            custom_pipeline: Custom processing pipeline (future)
             
         Returns:
             numpy.ndarray: Processed RGB image array (height, width, channels)
@@ -474,12 +473,12 @@ class RawImage:
         Returns:
             dict: 最適化機能の利用可能性
         """
-        from . import is_gpu_available, is_apple_selicon
+        from . import is_available, is_apple_selicon
         
         return {
             'accelerate_available': True,  # Accelerate framework is always available on macOS
             'apple_silicon': is_apple_selicon(),
-            'gpu_available': is_gpu_available(),
+            'available': is_available(),
         }
     
     def __repr__(self):

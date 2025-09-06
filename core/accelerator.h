@@ -89,8 +89,8 @@ struct ProcessingParams {
     float exp_preserve_highlights = 0.0f;  // Highlight preservation (0.0-1.0)
     
     // Gamma correction parameters
-    float gamma_power = 2.222f;
-    float gamma_slope = 4.5f;
+    float gamma_power = 0.f; // 2.222f;
+    float gamma_slope = 0.f; // 4.5f;
     bool no_auto_scale = false;
     
     // Color correction parameters
@@ -105,7 +105,7 @@ struct ProcessingParams {
     std::string bad_pixels_path;
     
     // Acceleration settings
-    bool use_gpu_acceleration = true;   // Use GPU Metal acceleration
+    bool use_gpu_acceleration = false;   // Use GPU Metal acceleration
     
     ProcessingParams() {
         // Initialize color matrix to identity
@@ -192,12 +192,9 @@ public:
     // Initialization and device info
     bool initialize();
     bool is_available() const;
-    bool is_gpu_available() const;
 
     std::string get_device_info() const;
     void set_debug_mode(bool enable) { /* Simplified debug mode */ }
-    size_t get_memory_usage() const { return 0; }  // Simplified memory usage
-    double get_last_processing_time() const { return 0.0; }  // Simplified timing
     
     // GPU acceleration control
     void set_use_gpu_acceleration(bool enable);
@@ -265,8 +262,8 @@ public:
     // Gamma correction method
     bool gamma_correct(const ImageBufferFloat& rgb_input,
                         ImageBufferFloat& rgb_output,
-                        float gamma_power = 2.2f,
-                        float gamma_slope = 4.5f,
+                        float gamma_power = 0.f, //2.2f,
+                        float gamma_slope = 0.f, //4.5f,
                         int output_color_space = 1); // 1=sRGB, 2=Adobe RGB, etc.
 
 private:
@@ -274,7 +271,7 @@ private:
     std::unique_ptr<Impl> pimpl_;
     
     // GPU/CPU selection logic
-    bool should_use_gpu(const ProcessingParams& params) const;
+    bool should_use_gpu() const;
 };
 
 } // namespace libraw_enhanced

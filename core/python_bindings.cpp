@@ -272,21 +272,14 @@ PYBIND11_MODULE(_core, m) {
                 self.set_processing_params(params);
             })
         .def("enable_gpu_acceleration", &LibRawWrapper::enable_gpu_acceleration)
-        .def("is_gpu_available", &LibRawWrapper::is_gpu_available)
-        .def("get_metal_device_info", &LibRawWrapper::get_metal_device_info)
-        // REMOVED: .def("enable_custom_pipeline", &LibRawWrapper::enable_custom_pipeline, - unused custom pipeline feature
+        .def("get_device_info", &LibRawWrapper::get_device_info)
 #endif
         ;
 
     // ヘルパー関数のバインディング
 #ifdef __arm64__
     m.def("is_apple_silicon", &is_apple_silicon, "Check if running on Apple Silicon");
-    // REMOVED: Global is_gpu_available function - use LibRawWrapper.is_gpu_available() instead
-    m.def("is_gpu_available", []() { 
-        // Return basic Apple Silicon check instead of creating GPU instances
-        return is_apple_silicon();
-    }, "Check if GPU might be available (basic check)");
-    m.def("get_metal_device_list", &get_metal_device_list, "Get list of Metal devices");
+    m.def("get_device_list", &get_device_list, "Get list of devices");
     
     m.def("create_params_from_rawpy_args", &create_params_from_rawpy_args,
           "Create ProcessingParams from complete rawpy-compatible arguments",
@@ -328,7 +321,7 @@ PYBIND11_MODULE(_core, m) {
           py::arg("exp_preserve_highlights") = 0.0f,
           
           // Gamma and scaling
-          py::arg("gamma") = std::make_pair(2.222f, 4.5f),
+          py::arg("gamma") = std::make_pair(0.f, 0.f), //std::make_pair(2.222f, 4.5f),
           py::arg("no_auto_scale") = false,
           
           // Color correction parameters
@@ -348,8 +341,8 @@ PYBIND11_MODULE(_core, m) {
 #else
     // Metal非対応環境用のスタブ関数
     m.def("is_apple_silicon", []() { return false; }, "Check if running on Apple Silicon (always false on non-Apple platforms)");
-    m.def("is_gpu_available", []() { return false; }, "Check if GPU is available (always false on non-Apple platforms)");
-    m.def("get_metal_device_list", []() { return std::vector<std::string>(); }, "Get list of Metal devices (empty on non-Apple platforms)");
+    m.def("is_available", []() { return false; }, "Check if available (always false on non-Apple platforms)");
+    m.def("get_device_list", []() { return std::vector<std::string>(); }, "Get list of Metal devices (empty on non-Apple platforms)");
 #endif
 
     // 定数のバインディング

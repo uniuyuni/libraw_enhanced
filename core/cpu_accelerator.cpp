@@ -34,6 +34,27 @@ bool CPUAccelerator::is_available() const { return initialized_; }
 void CPUAccelerator::release_resources() { initialized_ = false; }
 
 //===================================================================
+// Pre-interpolation
+//===================================================================
+
+bool CPUAccelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
+    if (!image_buffer.is_valid()) return false;
+    uint16_t (*image)[4] = image_buffer.image;
+    size_t width = image_buffer.width, height = image_buffer.height;
+    std::cout << "🔧 Pre-interpolation: " << width << "x" << height << " (filters=" << filters << ", half_size=" << half_size << ")" << std::endl;
+    if (half_size && filters == FILTERS_XTRANS) {
+        size_t row, col;
+        for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
+        break_outer:
+        for (; row < height; row += 3)
+            for (size_t col_start = (col - 1) % 3 + 1; col_start < width - 1; col_start += 3)
+                for (int c = 0; c < 3; c += 2)
+                    image[row * width + col_start][c] = (image[row * width + col_start - 1][c] + image[row * width + col_start + 1][c]) >> 1;
+    }
+    return true;
+}
+
+//===================================================================
 // Demosaic function for linear interpolation
 //===================================================================
 
@@ -2667,6 +2688,9 @@ bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageB
     return true;
 }
 
+//===================================================================
+// ホワイトバランス
+//===================================================================
 
 bool CPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
                                         ImageBufferFloat& rgb_output,
@@ -2709,6 +2733,10 @@ bool CPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
 #endif
 }
 
+//===================================================================
+// カラースペース変換
+//===================================================================
+
 bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, const float transform[3][4]) {
 
     if (!initialized_) return false;
@@ -2731,6 +2759,10 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
     return true;
 }
 
+//===================================================================
+// ガンマ補正
+//===================================================================
+
 bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, float gamma_power, float gamma_slope, int output_color_space) {
 
     if (!initialized_) return false;
@@ -2746,24 +2778,31 @@ bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
         std::memcpy(rgb_output.image, rgb_input.image, rgb_input.width * rgb_input.height * 3 * sizeof(float));
     }
 
-    if (output_color_space == (int)ColorSpace::Raw || output_color_space == (int)ColorSpace::XYZ) {
-        std::cout << "🔄 Gamma correction skipped for linear color space " << output_color_space << " (Raw/XYZ)" << std::endl;
-        return true;
-    }
-
     std::cout << "🎯 Gamma Correction: color_space=" << output_color_space << ", γ=" << gamma_power << ", slope=" << gamma_slope << std::endl;
     for (size_t i = 0; i < rgb_input.width * rgb_input.height; i++) {
         float* pixel = rgb_output.image[i];
         for (int c = 0; c < 3; c++) {
             float linear_value = pixel[c], gamma_corrected;
             switch (output_color_space) {
-            case 1: case 7: gamma_corrected = apply_srgb_gamma_encode(linear_value); break;
-            case 2: case 3: gamma_corrected = apply_pure_power_gamma_encode(linear_value, 2.2f); break;
-            case 4:         gamma_corrected = apply_pure_power_gamma_encode(linear_value, 1.8f); break;
-            case 6:         gamma_corrected = apply_aces_gamma_encode(linear_value); break;
-            case 8:         gamma_corrected = apply_rec2020_gamma_encode(linear_value); break;
+            case ColorSpace::sRGB:
+            case ColorSpace::P3D65:
+                gamma_corrected = apply_srgb_gamma_encode(linear_value);
+                break;
+            case ColorSpace::AdobeRGB:
+            case ColorSpace::WideGamutRGB:
+                gamma_corrected = apply_pure_power_gamma_encode(linear_value, 2.222f);
+                break;
+            case ColorSpace::ProPhotoRGB:
+               gamma_corrected = apply_pure_power_gamma_encode(linear_value, 1.8f);
+               break;
+            case ColorSpace::ACES:
+                gamma_corrected = apply_aces_gamma_encode(linear_value);
+                break;
+            case ColorSpace::Rec2020:
+                gamma_corrected = apply_rec2020_gamma_encode(linear_value);
+                break;
             default:
-                gamma_corrected = (linear_value < 1.0f / gamma_slope) ? linear_value * gamma_slope : std::pow(linear_value, 1.0f / gamma_power);
+                gamma_corrected = apply_pure_power_gamma_encode_with_slope(linear_value, gamma_power, gamma_slope);
                 break;
             }
             pixel[c] = gamma_corrected;
@@ -2778,37 +2817,36 @@ size_t CPUAccelerator::get_memory_usage() const { return 0; }
 void CPUAccelerator::set_debug_mode(bool enable) { debug_mode_ = enable; }
 std::string CPUAccelerator::get_device_info() const { return device_name_; }
 
+//===================================================================
+// ガンマ補正関数
+//===================================================================
 
-
-bool CPUAccelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
-    if (!image_buffer.is_valid()) return false;
-    uint16_t (*image)[4] = image_buffer.image;
-    size_t width = image_buffer.width, height = image_buffer.height;
-    std::cout << "🔧 Pre-interpolation: " << width << "x" << height << " (filters=" << filters << ", half_size=" << half_size << ")" << std::endl;
-    if (half_size && filters == 9) {
-        size_t row, col;
-        for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
-        break_outer:
-        for (; row < height; row += 3)
-            for (size_t col_start = (col - 1) % 3 + 1; col_start < width - 1; col_start += 3)
-                for (int c = 0; c < 3; c += 2)
-                    image[row * width + col_start][c] = (image[row * width + col_start - 1][c] + image[row * width + col_start + 1][c]) >> 1;
-    }
-    return true;
+float CPUAccelerator::apply_srgb_gamma_encode(float v) const {
+    return (v <= 0.0031308f) ? 12.92f * v : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
 }
 
-float CPUAccelerator::apply_srgb_gamma_encode(float v) const { return (v <= 0.0031308f) ? 12.92f * v : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f; }
-float CPUAccelerator::apply_pure_power_gamma_encode(float v, float p) const { return std::pow(std::max(0.0f, v), 1.0f / p); }
-float CPUAccelerator::apply_rec2020_gamma_encode(float v) const {
-    const float a = 1.09929682680944f, b = 0.09929682680944f;
-    return (v < b / 4.5f) ? 4.5f * v : a * std::pow(v, 0.45f) - (a - 1.0f);
-}
 float CPUAccelerator::apply_aces_gamma_encode(float v) const {
     if (v <= 0.0f) return 0.0f;
     const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
     return std::max(0.0f, std::min(1.0f, (v * (a * v + b)) / (v * (c * v + d) + e)));
 }
 
+float CPUAccelerator::apply_rec2020_gamma_encode(float v) const {
+    const float a = 1.09929682680944f, b = 0.09929682680944f;
+    return (v < b / 4.5f) ? 4.5f * v : a * std::pow(v, 0.45f) - (a - 1.0f);
+}
+
+float CPUAccelerator::apply_pure_power_gamma_encode(float v, float p) const {
+    return std::pow(std::max(0.0f, v), 1.0f / p);
+}
+
+float CPUAccelerator::apply_pure_power_gamma_encode_with_slope(float v, float p, float s) const {
+    return (v < 1.0f / s) ? v * s : std::pow(v, 1.0f / p);
+}
+
+//===================================================================
+// 境界補間
+//===================================================================
 
 void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint32_t filters, int border_int) {
     const size_t width = rgb_buffer.width, height = rgb_buffer.height;
