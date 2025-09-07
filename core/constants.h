@@ -32,7 +32,7 @@ enum ColorSpace : int {
     WideGamutRGB = 3,           // LIBRAW_COLORSPACE_WideGamutRGB
     ProPhotoRGB = 4,            // LIBRAW_COLORSPACE_ProPhotoRGB
     XYZ = 5,                    // rawpy互換値（LibRawには直接対応なし）
-    ACES = 6,                   // rawpy拡張
+    ACEScg = 6,                 // rawpy拡張
     P3D65 = 7,                  // rawpy拡張
     Rec2020 = 8,                // rawpy拡張
 };

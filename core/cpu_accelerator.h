@@ -91,12 +91,10 @@ public:
                            
     double get_last_processing_time() const;
     size_t get_memory_usage() const;
-    void set_debug_mode(bool enable);
     std::string get_device_info() const;
         
 private: 
     bool initialized_ = false;
-    bool debug_mode_ = false;
     double last_processing_time_ = 0.0;
     std::string device_name_ = "Apple Silicon CPU";
 

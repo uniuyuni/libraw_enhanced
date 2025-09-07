@@ -82,9 +82,9 @@ kernel void gamma_correct(
     case ColorSpace::ProPhotoRGB: // ProPhoto RGB
         rgb_out = apply_pure_power_gamma_encode(rgb_in, 1.8f);
         break;
-    case ColorSpace::ACES: // ACES
-        rgb_out = apply_aces_gamma_encode(rgb_in);
-        break;
+    //case ColorSpace::ACES: // ACES
+    //    rgb_out = apply_aces_gamma_encode(rgb_in);
+    //    break;
     case ColorSpace::Rec2020: // Rec. 2020
         rgb_out = apply_rec2020_gamma_encode(rgb_in);
         break;

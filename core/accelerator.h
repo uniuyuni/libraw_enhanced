@@ -72,7 +72,7 @@ struct ProcessingParams {
     float user_wb[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // RGBG multipliers
     
     // Color space and output parameters
-    int output_color_space = 1;  // 1: sRGB, 2: Adobe RGB, 3: ProPhoto RGB, 4: XYZ, 5: ACES
+    int output_color_space = 1;
     float color_matrix[9];
     
     // Brightness and exposure parameters
@@ -192,9 +192,7 @@ public:
     // Initialization and device info
     bool initialize();
     bool is_available() const;
-
     std::string get_device_info() const;
-    void set_debug_mode(bool enable) { /* Simplified debug mode */ }
     
     // GPU acceleration control
     void set_use_gpu_acceleration(bool enable);

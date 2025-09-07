@@ -41,7 +41,7 @@ bool CPUAccelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters
     if (!image_buffer.is_valid()) return false;
     uint16_t (*image)[4] = image_buffer.image;
     size_t width = image_buffer.width, height = image_buffer.height;
-    std::cout << "🔧 Pre-interpolation: " << width << "x" << height << " (filters=" << filters << ", half_size=" << half_size << ")" << std::endl;
+    std::cout << "📋 Pre-interpolation: " << width << "x" << height << " (filters=" << filters << ", half_size=" << half_size << ")" << std::endl;
     if (half_size && filters == FILTERS_XTRANS) {
         size_t row, col;
         for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
@@ -61,7 +61,6 @@ bool CPUAccelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters
 bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
     if (!initialized_) return false;
 
-    std::cout << "🔧 Starting simple bilinear interpolation demosaic..." << std::endl;
     const size_t width = raw_buffer.width, height = raw_buffer.height;
 
     // まず RAW データをコピー（各ピクセルのネイティブカラーのみ）
@@ -139,10 +138,7 @@ bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
         }
     }
 
-    std::cout << "✅ Simple bilinear interpolation completed successfully" << std::endl;
-    
     // 境界補間 - ENABLED for fair CPU vs GPU comparison
-    std::cout << "🔧 Applying CPU border interpolation for fair GPU comparison" << std::endl;
     border_interpolate(rgb_buffer, filters, 1);
     
     return true;
@@ -343,7 +339,6 @@ const float AAHD_Processor::yuv_coeff[3][3] = {
 float AAHD_Processor::gammaLUT[0x10000] = {-1.f};
 
 void AAHD_Processor::hide_hots() {
-    std::cout << "🔧 AAHD: Hide hot pixels..." << std::endl;
     
     int iwidth = raw_buffer_.width;
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
@@ -394,7 +389,6 @@ void AAHD_Processor::hide_hots() {
 }
 
 void AAHD_Processor::make_ahd_greens() {
-    std::cout << "🔧 AAHD: Interpolate green channel..." << std::endl;
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         make_ahd_gline(static_cast<int>(i));
     }
@@ -431,7 +425,6 @@ void AAHD_Processor::make_ahd_gline(int i) {
 }
 
 void AAHD_Processor::make_ahd_rb() {
-    std::cout << "🔧 AAHD: Interpolate red/blue channels..." << std::endl;
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         make_ahd_rb_hv(static_cast<int>(i));
     }
@@ -496,7 +489,6 @@ void AAHD_Processor::make_ahd_rb_last(int i) {
 }
 
 void AAHD_Processor::evaluate_ahd() {
-    std::cout << "🔧 AAHD: Evaluate interpolation directions..." << std::endl;
     int hvdir[4] = {Pw, Pe, Pn, Ps};
     
     for (int d = 0; d < 2; ++d) {
@@ -534,7 +526,6 @@ void AAHD_Processor::evaluate_ahd() {
 }
 
 void AAHD_Processor::refine_hv_dirs() {
-    std::cout << "🔧 AAHD: Refine horizontal/vertical directions..." << std::endl;
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         refine_ihv_dirs(static_cast<int>(i));
     }
@@ -561,7 +552,6 @@ void AAHD_Processor::refine_hv_dirs(int i, int js) {
 }
 
 void AAHD_Processor::combine_image() {
-    std::cout << "🔧 AAHD: Combine final image..." << std::endl;
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         for (size_t j = 0; j < raw_buffer_.width; ++j) {
             int moff = nr_offset(static_cast<int>(i) + nr_margin, static_cast<int>(j) + nr_margin);
@@ -573,13 +563,11 @@ void AAHD_Processor::combine_image() {
             rgb_buffer_.image[img_off][2] = (float)rgb_ahd[d][moff][2] / maximum_value_;
         }
     }
-    std::cout << "✅ AAHD processing completed" << std::endl;
 }
 
 bool CPUAccelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
 
     if (!initialized_) return false;
-    std::cout << "🔧 Starting AAHD (Adaptive AHD) demosaic..." << std::endl;
         
     AAHD_Processor aahd_proc(raw_buffer, rgb_buffer, filters, maximum_value);
     aahd_proc.hide_hots();
@@ -588,10 +576,8 @@ bool CPUAccelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer, ImageBuf
     aahd_proc.evaluate_ahd();
     aahd_proc.refine_hv_dirs();
     aahd_proc.combine_image();
-    std::cout << "✅ AAHD demosaic completed successfully" << std::endl;
     
     // ✨デモザイク後境界補間✨: 最終処理で境界を修正
-    std::cout << "🔧 Post-demosaic border interpolation for AAHD (2px border)..." << std::endl;
     border_interpolate(rgb_buffer, filters, 2);
     
     return true;
@@ -1024,10 +1010,6 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
         }
     }
     
-    // 手順3: 境界複製を無効化（同一値問題の原因）
-    // replicate_border_generic<float>(work_image, width, height, 6);
-    std::cout << "🔧 DCB: Skipping border replication to avoid identical pixel issue" << std::endl;
-
     // 手順4: 完全なDCBアルゴリズムを実行
     DCB_Processor dcb_proc(work_image, static_cast<int>(width), static_cast<int>(height), filters, maximum_value);
     dcb_proc.run_dcb(iterations, dcb_enhance);
@@ -1039,10 +1021,8 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
         rgb_buffer.image[i][1] = work_image[i][1] / (float)maximum_value;
         rgb_buffer.image[i][2] = work_image[i][2] / (float)maximum_value;
     }
-    std::cout << "✅ DCB demosaic completed successfully (Clean Class Implementation)" << std::endl;
     
     // ✨デモザイク後境界補間✨: 最終処理で境界を修正
-    std::cout << "🔧 Post-demosaic border interpolation for DCB (3px border)..." << std::endl;
     border_interpolate(rgb_buffer, filters, 3);
     
     return true;
@@ -1566,9 +1546,6 @@ bool CPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
     std::chrono::duration<double> diff = end_time - start_time;
     last_processing_time_ = diff.count();
     
-    std::cout << "✅ AMaZE demosaic completed successfully in " << last_processing_time_ << " seconds." << std::endl;
-    
-    std::cout << "🔧 Post-demosaic border interpolation for AMaZE..." << std::endl;
     border_interpolate(rgb_buffer, filters, 4);
     
     return true;
@@ -1778,8 +1755,6 @@ public:
     }
 
     void run_3pass() {
-        std::cout << "🔧 Starting 3-pass XTrans demosaic..." << std::endl;
-
         constexpr int ts = 114;
         
         constexpr short orth[12] = { 1, 0, 0, 1, -1, 0, 0, -1, 1, 0, 0, 1 };
@@ -2584,8 +2559,6 @@ public:
 
    // 1-pass fast demosaic - RawTherapee's exact fast_xtrans_interpolate
     void run_1pass() {
-        std::cout << "🔧 Starting 1-pass XTrans demosaic (fast)..." << std::endl;
-        
         // Border interpolation first (RawTherapee does this first)
         xtrans_border_interpolate(1);
         
@@ -2725,7 +2698,6 @@ bool CPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
     //float zero = 0.0f, one = 1.0f;
     //vDSP_vclip(data, 1, &zero, &one, data, 1, pixel_count * 3);
     
-    std::cout << "✅ White balance applied successfully using vDSP" << std::endl;
     return true;
 #else
     // Apple Silicon 以外のためのフォールバック実装
@@ -2746,7 +2718,7 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
         std::cerr << "❌ Invalid or mismatched buffers for color space conversion" << std::endl;
         return false;
     }
-    std::cout << "🎯 Camera matrix-based color space conversion" << std::endl;
+
     const size_t pixel_count = rgb_input.width * rgb_input.height;
     for (size_t i = 0; i < pixel_count; i++) {
         const float* in = rgb_input.image[i];
@@ -2755,7 +2727,6 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
         out[1] = fmaxf(0.0f, fminf(1.0f, transform[1][0] * in[0] + transform[1][1] * in[1] + transform[1][2] * in[2] + transform[1][3]));
         out[2] = fmaxf(0.0f, fminf(1.0f, transform[2][0] * in[0] + transform[2][1] * in[1] + transform[2][2] * in[2] + transform[2][3]));
     }
-    std::cout << "✅ Camera matrix color conversion completed" << std::endl;
     return true;
 }
 
@@ -2795,9 +2766,9 @@ bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
             case ColorSpace::ProPhotoRGB:
                gamma_corrected = apply_pure_power_gamma_encode(linear_value, 1.8f);
                break;
-            case ColorSpace::ACES:
-                gamma_corrected = apply_aces_gamma_encode(linear_value);
-                break;
+            //case ColorSpace::ACES:
+            //    gamma_corrected = apply_aces_gamma_encode(linear_value);
+            //    break;
             case ColorSpace::Rec2020:
                 gamma_corrected = apply_rec2020_gamma_encode(linear_value);
                 break;
@@ -2808,13 +2779,11 @@ bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
             pixel[c] = gamma_corrected;
         }
     }
-    std::cout << "✅ Gamma correction applied successfully" << std::endl;
     return true;
 }
 
 double CPUAccelerator::get_last_processing_time() const { return last_processing_time_; }
 size_t CPUAccelerator::get_memory_usage() const { return 0; }
-void CPUAccelerator::set_debug_mode(bool enable) { debug_mode_ = enable; }
 std::string CPUAccelerator::get_device_info() const { return device_name_; }
 
 //===================================================================
@@ -2832,8 +2801,8 @@ float CPUAccelerator::apply_aces_gamma_encode(float v) const {
 }
 
 float CPUAccelerator::apply_rec2020_gamma_encode(float v) const {
-    const float a = 1.09929682680944f, b = 0.09929682680944f;
-    return (v < b / 4.5f) ? 4.5f * v : a * std::pow(v, 0.45f) - (a - 1.0f);
+    const float a = 1.09929682680944f, b = 0.018053968510807f;
+    return (v < b) ? 4.5f * v : a * std::pow(v, 0.45f) - (a - 1.0f);
 }
 
 float CPUAccelerator::apply_pure_power_gamma_encode(float v, float p) const {

@@ -74,22 +74,13 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;
-    
-    // Shader management - 新しい遅延ロード方式
-    bool load_shaders();
-    std::string load_shader_file(const std::string& filename);
-    std::string load_all_shader_sources();
-    bool compile_individual_shaders();
-    bool create_compute_pipelines();
-    
+        
     // 遅延ロード + メモリキャッシュ方式
 #ifdef __OBJC__
     id<MTLComputePipelineState> get_pipeline(const std::string& shader_name);  // 必要時にパイプライン取得
     id<MTLLibrary> compile_and_cache_shader(const std::string& shader_name);   // 個別シェーダーコンパイル（メモリキャッシュのみ）
-#endif
-    
-    // XTrans 3-pass helper functions
-    void calculate_allhex_and_sg(const char (&xtrans)[6][6], short allhex_out[2][3][3][8], uint16_t* sgrow_out, uint16_t* sgcol_out);
+    std::string load_shader_file(const std::string& filename);
+#endif    
 };
 
 } // namespace libraw_enhanced

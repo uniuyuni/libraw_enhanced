@@ -60,7 +60,11 @@ public:
     
     ColorTransformMatrix compute_transform(const char* make, const char* model, int output_color_space) {
         ColorTransformMatrix result;
-        
+
+        if (output_color_space < 0 || output_color_space > 8) {
+            output_color_space = 1; // Default to sRGB
+        }
+
         try {
             // Get LibRaw make index
             unsigned make_idx = get_libraw_make_index(make);
@@ -76,6 +80,7 @@ public:
             int matrix_found = libraw_instance.adobe_coeff(make_idx, model, 0);
             
             if (matrix_found > 0) {
+
                 // Convert cam_xyz from float[4][3] to double[4][3] for cam_xyz_coeff
                 double cam_xyz_double[4][3];
                 for (int i = 0; i < 4; i++) {
@@ -84,59 +89,22 @@ public:
                     }
                 }
 
-/*
-                // transform white point
-                static constexpr double transform_wp_from_d65[][3][3] = {
-                    {
-                        {1.0, 0.0, 0.0},
-                        {0.0, 1.0, 0.0},
-                        {0.0, 0.0, 1.0}
-                    },                
-                    // D65 to D50 (Bradford変換)
-                    {
-                        {1.0478112, 0.0228866, -0.0501270},
-                        {0.0295424, 0.9904844, -0.0170491},
-                        {-0.0092345, 0.0150436, 0.7521316}
-                    },
-                    // D65 to D60 (Bradford変換)
-                    {
-                        {1.0130340, 0.0061053, -0.0149710},
-                        {0.0076983, 0.9981650, -0.0050320},
-                        {-0.0028413, 0.0046851, 0.9245070}
-                    },
-                };
-                static constexpr int color_space_wp[] = {
-                    0, 0, 0, 1, 1, 0, 2, 0, 0,
-                };
-                if (output_color_space < 9) {
-                    int tn = color_space_wp[output_color_space];
-
-                    double temp[4][3];
-                    memcpy(temp, cam_xyz_double, sizeof(temp));
-                    
-                    for (int i = 0; i < 4; i++) {
-                        for (int j = 0; j < 3; j++) {
-                            cam_xyz_double[i][j] = 0;
-                            for (int k = 0; k < 3; k++) {
-                                cam_xyz_double[i][j] += temp[i][k] * transform_wp_from_d65[tn][k][j];
-                            }
-                        }
-                    }
-                }
-*/                
                 // Now use LibRaw's cam_xyz_coeff to compute rgb_cam properly
                 // This is the correct LibRaw pipeline that handles color science properly
-                cam_xyz_coeff(result.transform, cam_xyz_double, 3);
-                
+                double cam_xyz_x[3][4];
+                cam_xyz_coeff(cam_xyz_x, cam_xyz_double);
+
+                // convert white point
+                double cam_xyz_xwp[3][4];
+                convert_white_point(cam_xyz_xwp, cam_xyz_x, output_color_space);
+
                 // Apply output color space conversion if not raw
-                if (output_color_space != 1) {
-                    apply_output_colorspace_transform(result.transform, output_color_space);
-                }
+                apply_output_colorspace_transform(result.transform, cam_xyz_xwp, output_color_space);
                 
                 result.valid = true;
                 
                 // Optional: Log successful matrix retrieval for debugging
-                std::cout << "Found camera matrix for " << make << " " << model << " (cam_xyz_coeff)" << std::endl;
+                std::cout << "📋 Found camera matrix for " << make << " " << model << " (cam_xyz_coeff)" << std::endl;
                 
             } else {
                 result.valid = false;
@@ -144,7 +112,7 @@ public:
             }
             
         } catch (const std::exception& e) {
-            std::cerr << "Error computing camera matrix: " << e.what() << std::endl;
+            std::cerr << "❌ computing camera matrix: " << e.what() << std::endl;
             result.valid = false;
         }
         
@@ -153,13 +121,21 @@ public:
     
 private:
     // XYZ to RGB transformation matrix (from LibRaw_constants::xyz_rgb)
-    static constexpr double xyz_rgb[3][3] = {
+/*
+    static constexpr double xyz_rgb[4][3] = {
         {0.4124564, 0.3575761, 0.1804375},
         {0.2126729, 0.7151522, 0.0721750}, 
-        {0.0193339, 0.1191920, 0.9503041}
+        {0.0193339, 0.1191920, 0.9503041},
+        {0.0, 0.0, 0.0}
     };
-    
-    void pseudoinverse(double in[4][3], double out[4][3], int size) {
+*/
+    static constexpr double xyz_rgb[4][3] = {
+        {1.0, 0.0, 0.0},
+        {0.0, 1.0, 0.0}, 
+        {0.0, 0.0, 1.0},
+        {0.0, 0.0, 0.0},
+    };    
+    void pseudoinverse(double out[4][3], double in[4][3]) {
         double work[3][6], num;
         int i, j, k;
 
@@ -167,7 +143,7 @@ private:
             for (j = 0; j < 6; j++)
                 work[i][j] = (j == i + 3) ? 1.0 : 0.0;
             for (j = 0; j < 3; j++)
-                for (k = 0; k < size && k < 4; k++)
+                for (k = 0; k < 3; k++)
                     work[i][j] += in[k][i] * in[k][j];
         }
         
@@ -185,113 +161,188 @@ private:
             }
         }
         
-        for (i = 0; i < size && i < 4; i++)
-            for (j = 0; j < 3; j++)
-                for (out[i][j] = k = 0; k < 3; k++)
+        for (i = 0; i < 3; i++) {
+            for (j = 0; j < 3; j++) {
+                out[i][j] = 0.0;
+                for (k = 0; k < 3; k++) {
                     out[i][j] += work[j][k + 3] * in[i][k];
+                }
+            }
+        }
+        for (i = 0; i < 3; ++i) {
+            out[3][i] = in[3][i];
+        }
     }
-    
+
+    void print_matrix(const double* matrix, int rows, int cols, const char* name) {
+        std::cout << name << ":\n";
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                std::cout << matrix[i * cols + j] << " ";
+            }
+            std::cout << "\n";
+        }
+        std::cout << "\n";
+    }
+
     // LibRaw cam_xyz_coeff function implementation  
-    void cam_xyz_coeff(float rgb_cam[3][4], double cam_xyz[4][3], int colors) {
-        double cam_rgb[4][3], inverse[4][3], num;
+    void cam_xyz_coeff(double cam_xyz_x[3][4], double cam_xyz[4][3]) {
+        double temp[4][3], inverse[4][3], num;
         int i, j, k;
 
         // Multiply out XYZ colorspace         
-        for (i = 0; i < colors && i < 4; i++) {
+        for (i = 0; i < 4; i++) {
             for (j = 0; j < 3; j++) {
-                cam_rgb[i][j] = 0.0;
+                temp[i][j] = 0.0;
                 for (k = 0; k < 3; k++)
-                    cam_rgb[i][j] += cam_xyz[i][k] * xyz_rgb[k][j];
+                    temp[i][j] += cam_xyz[i][k] * xyz_rgb[k][j];
+//                    temp[i][j] += xyz_rgb[i][k] * cam_xyz[k][j];
             }
         }
 
         // Normalize cam_rgb so that cam_rgb * (1,1,1) is (1,1,1,1)
-        for (i = 0; i < colors && i < 4; i++) {
+        for (i = 0; i < 3; i++) {
             for (num = j = 0; j < 3; j++)
-                num += cam_rgb[i][j];
+                num += temp[i][j];
             if (num > 0.00001) {
                 for (j = 0; j < 3; j++)
-                    cam_rgb[i][j] /= num;
+                    temp[i][j] /= num;
             } else {
                 for (j = 0; j < 3; j++)
-                    cam_rgb[i][j] = 0.0;
+                    temp[i][j] = 0.0;
             }
         }
         
         // Compute pseudoinverse
-        pseudoinverse(cam_rgb, inverse, colors);
+        pseudoinverse(inverse, temp);
         
         // Set rgb_cam matrix
-        for (i = 0; i < 3; i++)
-            for (j = 0; j < colors && j < 4; j++)
-                rgb_cam[i][j] = (float)inverse[j][i];
+        for (i = 0; i < 3; i++) {
+            for (j = 0; j < 3; j++) {
+                cam_xyz_x[i][j] = inverse[j][i];
+            }
+            cam_xyz_x[i][3] = inverse[3][i];
+        }
     }
 
-    void apply_output_colorspace_transform(float transform[3][4], int output_color_space) {
+    void convert_white_point(double cam_xyz_xwp[3][4], double cam_xyz[3][4], int output_color_space) {
+        // transform white point
+        static constexpr double transform_wp_from_d65[][3][3] = {
+            {
+                {1.0, 0.0, 0.0},
+                {0.0, 1.0, 0.0},
+                {0.0, 0.0, 1.0}
+            },                
+            // D65 to D50 (Bradford変換)
+            {
+                {1.0478112, 0.0228866, -0.0501270},
+                {0.0295424, 0.9904844, -0.0170491},
+                {-0.0092345, 0.0150436, 0.7521316}
+            },
+            // D65 to D60 (Bradford変換)
+            {
+                {1.0130340, 0.0061053, -0.0149710},
+                {0.0076983, 0.9981650, -0.0050320},
+                {-0.0028413, 0.0046851, 0.9245070}
+            },
+            // D50 to D65
+            {
+                { 0.955473421488075, -0.023098454948164,  0.063259243200570 },
+                { -0.028369709333863, 1.009995398081287,  0.021041441191917 },
+                { 0.012314014864481, -0.020507649298898,  1.330365926242124 }
+            },
+            // D50 to D60
+            {
+                { 1.062161, -0.026054,  0.003893 },
+                { -0.010960, 0.997641,  0.013319 },
+                { 0.001229, -0.003340,  1.102111 }
+            },
+        };
+        static constexpr int color_space_wp[] = {
+            0, 3, 3, 0, 0, 3, 4, 3, 3,
+//          0, 0, 0, 1, 1, 0, 2, 0, 0,
+        };
+
+        if (output_color_space < 8) {
+            int tn = color_space_wp[output_color_space];
+            
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 4; j++) {
+                    cam_xyz_xwp[i][j] = 0;
+                    for (int k = 0; k < 3; k++) {
+                        cam_xyz_xwp[i][j] += transform_wp_from_d65[tn][i][k] * cam_xyz[k][j];
+                    }
+                }
+            }
+        }
+    }
+
+    void apply_output_colorspace_transform(float transform[3][4], double cam_xyz_xwp[3][4], int output_color_space) {
         // Complete color space matrices (XYZ->RGB conversion matrices)
         // Based on constants.py ColorSpace definitions (0-8)
-        static const double output_matrices[][3][3] = {
+        static constexpr double output_matrices[][3][3] = {
             // 0: Raw (identity - linear passthrough)
-            {{1,0,0}, {0,1,0}, {0,0,1}},
-            
+            {
+                {1.0, 0.0, 0.0},
+                {0.0, 1.0, 0.0},
+                {0.0, 0.0, 1.0}
+            },                
             // 1: sRGB (ITU-R BT.709 / IEC 61966-2-1)
-            {{3.2404542, -1.5371385, -0.4985314},
-             {-0.9692660, 1.8760108, 0.0415560},
-             {0.0556434, -0.2040259, 1.0572252}},
-            
+            {
+                {3.2404542, -1.5371385, -0.4985314},
+                {-0.9692660, 1.8760108, 0.0415560},
+                {0.0556434, -0.2040259, 1.0572252}
+            },
             // 2: Adobe RGB (1998)
-            {{2.0413690, -0.5649464, -0.3446944},
-             {-0.9692660, 1.8760108, 0.0415560},
-             {0.0134474, -0.1183897, 1.0154096}},
-            
+            {
+                {2.0413690, -0.5649464, -0.3446944},
+                {-0.9692660, 1.8760108, 0.0415560},
+                {0.0134474, -0.1183897, 1.0154096}
+            },
             // 3: Wide Gamut RGB
-            {{1.4628067, -0.1840623, -0.2743606},
-             {-0.5217933, 1.4472381, 0.0677227},
-             {0.0349342, -0.0968930, 1.2884099}},
-            
+            {
+                {1.4628067, -0.1840623, -0.2743606},
+                {-0.5217933, 1.4472381, 0.0677227},
+                {0.0349342, -0.0968930, 1.2884099}
+            },
             // 4: ProPhoto RGB (ROMM RGB)
-            {{1.3459433, -0.2556075, -0.0511118},
-             {-0.5445989, 1.5081673, 0.0205351},
-             {0.0000000, 0.0000000, 1.2118128}},
-            
+            {
+                {1.3459433, -0.2556075, -0.0511118},
+                {-0.5445989, 1.5081673, 0.0205351},
+                {0.0000000, 0.0000000, 1.2118128}
+            },
             // 5: XYZ (identity - linear XYZ passthrough)
-            {{1,0,0}, {0,1,0}, {0,0,1}},
-            
-            // 6: ACES AP1 (Academy Color Encoding System)
-            {{1.7166511, -0.3556708, -0.2533663},
-             {-0.6666844, 1.6164812, 0.0157685},
-             {0.0176399, -0.0427706, 0.9421031}},
-            
+            {
+                {1.0, 0.0, 0.0},
+                {0.0, 1.0, 0.0},
+                {0.0, 0.0, 1.0}
+            },                
+            // 6: ACEScg AP1 (Academy Color Encoding System)
+            {
+                { 1.641379, -0.324803, -0.236425 },
+                { -0.663662, 1.615332, 0.016756 },
+                { 0.011721, -0.008284, 0.988395 }
+            },
             // 7: Display P3 (DCI-P3 D65)
-            {{2.4934969, -0.9313836, -0.4027108},
-             {-0.8294890, 1.7626641, 0.0236247},
-             {0.0358458, -0.0761724, 0.9568845}},
-            
+            {
+                {2.4934969, -0.9313836, -0.4027108},
+                {-0.8294890, 1.7626641, 0.0236247},
+                {0.0358458, -0.0761724, 0.9568845}
+            },
             // 8: Rec.2020 (ITU-R BT.2020)
-            {{1.7166511, -0.3556708, -0.2533663},
-             {-0.6666844, 1.6164812, 0.0157685},
-             {0.0176399, -0.0427706, 0.9421031}}
+            {
+                {1.7166511, -0.3556708, -0.2533663},
+                {-0.6666844, 1.6164812, 0.0157685},
+                {0.0176399, -0.0427706, 0.9421031}
+            },
         };
-        
-        if (output_color_space < 0 || output_color_space > 8) {
-            output_color_space = 1; // Default to sRGB
-        }
-        
-        // Check for linear color spaces that should skip matrix transformation
-        if (output_color_space == 0 || output_color_space == 5) {
-            // Raw (0) and XYZ (5) - linear passthrough, no additional matrix needed
-            return;
-        }
-        
+
         // Apply output color space transformation: out_cam = output_matrix * rgb_cam
-        float temp[3][4];
-        memcpy(temp, transform, sizeof(temp));
-        
         for (int i = 0; i < 3; i++) {
             for (int j = 0; j < 4; j++) {
                 transform[i][j] = 0;
                 for (int k = 0; k < 3; k++) {
-                    transform[i][j] += output_matrices[output_color_space][i][k] * temp[k][j];
+                    transform[i][j] += output_matrices[output_color_space][i][k] * cam_xyz_xwp[k][j];
                 }
             }
         }

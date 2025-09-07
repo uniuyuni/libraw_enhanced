@@ -57,7 +57,6 @@ void convert_float_to_uint8(const ImageBufferFloat& rgb_buffer, uint8_t* dst) {
 class LibRawWrapper::Impl {
 public:
     LibRaw processor;
-    bool debug_mode = false;
     ProcessingTimes timing_info;  // 処理時間情報
     
 #ifdef __arm64__
@@ -267,9 +266,7 @@ public:
             apply_wb_xtrans(raw_buffer, wb_multipliers, xtrans, sensor_maximum);
         } else {
             apply_wb_bayer(raw_buffer, wb_multipliers, filters, sensor_maximum);
-        }
-        
-        std::cout << "✅ CFA-aware white balance completed" << std::endl;
+        }        
     }
     
     // Bayer CFA white balance implementation
@@ -279,8 +276,6 @@ public:
         uint32_t filters,
         float sensor_maximum
     ) {
-        std::cout << "🔧 Applying Bayer CFA white balance..." << std::endl;
-        
         const size_t total_pixels = raw_buffer.width * raw_buffer.height;
         size_t processed_pixels = 0;
         
@@ -318,7 +313,7 @@ public:
             }
         }
         
-        std::cout << "✅ Bayer WB processed " << processed_pixels << " pixels" << std::endl;
+        std::cout << "✅ Bayer WB processed " << processed_pixels << " pixels. completed" << std::endl;
     }
     
     // X-Trans CFA white balance implementation
@@ -328,8 +323,6 @@ public:
         const char xtrans[6][6],
         float sensor_maximum
     ) {
-        std::cout << "🔧 Applying X-Trans CFA white balance..." << std::endl;
-        
         const size_t total_pixels = raw_buffer.width * raw_buffer.height;
         size_t processed_pixels = 0;
         
@@ -356,7 +349,7 @@ public:
             }
         }
         
-        std::cout << "✅ X-Trans WB processed " << processed_pixels << " pixels" << std::endl;
+        std::cout << "✅ X-Trans WB processed " << processed_pixels << " pixels. completed" << std::endl;
     }
 
     //===============================================================
@@ -446,31 +439,8 @@ public:
         char (&xtrans)[6][6] = processor.imgdata.idata.xtrans;        
         std::cout << "🔍 Filters value: " << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
 
-        /*
-        if (filters > 0xff) {
-            for (uint32_t row = 0; row < raw_buffer.height; ++row) {
-                for (uint32_t col = 0; col < raw_buffer.width; ++col) {
-                    char c = fcol_bayer(row, col, filters);
-                    if (c == 1) {
-                        uint32_t idx = row * raw_buffer.width + col;
-                        if (raw_buffer.image[idx][1] < 1000) {
-                            raw_buffer.image[idx][1] = 1000;
-                        } else
-                        if (raw_buffer.image[idx][1] > processor.imgdata.color.maximum-1000) {
-                            //raw_buffer.image[idx][1] = (raw_buffer.image[idx][0] + raw_buffer.image[idx][2]) / 2;
-                            raw_buffer.image[idx][1] = processor.imgdata.color.maximum-1000;
-                        }
-                    }
-                }
-            }
-        }
-        */
-
         // Apply green matching for Bayer sensors (after black level, before demosaic)
         apply_green_matching(raw_buffer, filters);
-
-        // EXPERIMENTAL: Apply CFA-aware white balance before demosaic
-        std::cout << "🧪 EXPERIMENTAL: Applying pre-demosaic white balance..." << std::endl;
         
         // Calculate white balance multipliers (same logic as original)
         float effective_wb[4];
@@ -508,19 +478,14 @@ public:
             sensor_max
         );
 
-        // Step 2: Apply pre-interpolation processing
-        std::cout << "🔧 Applying pre-interpolation processing..." << std::endl;
-        bool pre_success = accelerator->pre_interpolate(raw_buffer, filters, xtrans, params.half_size);
-        if (!pre_success) {
-            std::cerr << "❌ Pre-interpolation processing failed" << std::endl;
+        // Apply pre-interpolation processing
+        if (false == accelerator->pre_interpolate(raw_buffer, filters, xtrans, params.half_size)) {
             return false;
         }
-        std::cout << "✅ Pre-interpolation completed successfully" << std::endl;
 
-        // Step 3: Camera matrix-based color space conversion (reuse float_rgb buffer)
+        // Camera matrix-based color space conversion (reuse float_rgb buffer)
         const char* camera_make = processor.imgdata.idata.make;
         const char* camera_model = processor.imgdata.idata.model;        
-        std::cout << "📷 Camera: " << camera_make << " " << camera_model << std::endl;
         
         // Get camera-specific color transformation matrix
         ColorTransformMatrix camera_matrix = compute_camera_transform(camera_make, camera_model, (int)ColorSpace::XYZ);
@@ -1028,11 +993,7 @@ public:
         start_timer();
         int result = processor.open_file(filename.c_str());
         timing_info.file_load_time = get_elapsed_time();
-        
-        if (debug_mode) {
-            std::cout << "⏱️  File load time: " << timing_info.file_load_time << "s" << std::endl;
-        }
-        
+                
         return result;
     }
     
@@ -1040,10 +1001,6 @@ public:
         start_timer();
         int result = processor.unpack();
         timing_info.unpack_time = get_elapsed_time();
-        
-        if (debug_mode) {
-            std::cout << "⏱️  Unpack time: " << timing_info.unpack_time << "s" << std::endl;
-        }
         
         return result;
     }
@@ -1083,20 +1040,14 @@ public:
             rgb_buffer.width = processor.imgdata.sizes.iwidth;   // Use processed width, not raw width
             rgb_buffer.height = processor.imgdata.sizes.iheight; // Use processed height, not raw height
             rgb_buffer.channels = 3;
-            
-            // Allocate output buffer - CRITICAL: allocate for float32, then convert to uint8
-            size_t float_elements = rgb_buffer.width * rgb_buffer.height * 3;
+            size_t float_elements = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
             rgb_buffer_image.resize(float_elements); // Resize vector to hold float data
             rgb_buffer.image = reinterpret_cast<float (*)[3]>(rgb_buffer_image.data());
             
             // Use unified processing pipeline
             if (process_raw_to_rgb(raw_buffer, rgb_buffer, current_params)) {
                 timing_info.total_time = get_elapsed_time();
-                
-                if (debug_mode) {
-                    std::cout << "⏱️  Total unified pipeline processing time: " << timing_info.total_time << "s" << std::endl;
-                }
-                
+                                
                 return LIBRAW_SUCCESS;
             } else {
                 std::cout << "❌ Unified pipeline failed, NO FALLBACK (testing mode)" << std::endl;
@@ -1111,9 +1062,6 @@ public:
         
         // Fall back to standard LibRaw CPU processing (DISABLED)
         // int result = processor.dcraw_process();
-        // if (debug_mode) {
-        //     std::cout << "⏱️  Total LibRaw dcraw_process time: " << timing_info.total_time << "s" << std::endl;
-        // }
         // return result;
     }
     
@@ -1128,13 +1076,11 @@ public:
         
 #ifdef __arm64__
         // Check if we have Metal-processed data
-        std::cout << "🔧 LibRaw_Wrapper rgb_buffer: " << rgb_buffer.image << " width: " << rgb_buffer.width << " height: " << rgb_buffer.height << std::endl;
         if (rgb_buffer.is_valid()) {
             result.width = rgb_buffer.width;
             result.height = rgb_buffer.height;
             result.channels = rgb_buffer.channels;
 
-            std::cout << "🔧 LibRaw_Wrapper output bps:" << current_params.output_bps << std::endl;
             switch(current_params.output_bps) {
             case 8:     result.bits_per_sample = 8;     break;
             case 16:    result.bits_per_sample = 16;    break;
@@ -1175,11 +1121,6 @@ public:
         return result;
     }
     
-    void set_debug_mode(bool enable) {
-        debug_mode = enable;
-        // Debug mode setting simplified
-    }
-
 #ifdef __arm64__
     void set_processing_params(const ProcessingParams& params) {
         current_params = params;
@@ -1472,16 +1413,12 @@ ProcessedImageData LibRawWrapper::get_processed_image() {
     return pimpl->get_processed_image();
 }
 
-void LibRawWrapper::set_debug_mode(bool enable) {
-    pimpl->set_debug_mode(enable);
-}
-
 #ifdef __arm64__
 void LibRawWrapper::set_processing_params(const ProcessingParams& params) {
     pimpl->set_processing_params(params);
 }
 
-void LibRawWrapper::enable_gpu_acceleration(bool enable) {
+void LibRawWrapper::set_gpu_acceleration(bool enable) {
     pimpl->accelerator->set_use_gpu_acceleration(enable);
 }
 

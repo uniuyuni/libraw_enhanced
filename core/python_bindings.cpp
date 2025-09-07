@@ -265,13 +265,12 @@ PYBIND11_MODULE(_core, m) {
         .def("get_camera_model", &LibRawWrapper::get_camera_model)
         .def("process_with_dict", &LibRawWrapper::process_with_dict)
         .def("close", &LibRawWrapper::close)
-        .def("set_debug_mode", &LibRawWrapper::set_debug_mode)
 #ifdef __arm64__
         .def("set_processing_params", 
             [](LibRawWrapper& self, const ProcessingParams& params) {
                 self.set_processing_params(params);
             })
-        .def("enable_gpu_acceleration", &LibRawWrapper::enable_gpu_acceleration)
+        .def("set_gpu_acceleration", &LibRawWrapper::set_gpu_acceleration)
         .def("get_device_info", &LibRawWrapper::get_device_info)
 #endif
         ;

@@ -102,13 +102,12 @@ public:
                                          const std::map<std::string, std::string>& string_params);
     
     // 設定メソッド
-    void set_debug_mode(bool enable);
     void close();
     
 #ifdef __arm64__
     // Metal関連メソッド（実装はlibraw_wrapper.cppで定義）
     void set_processing_params(const ProcessingParams& params);
-    void enable_gpu_acceleration(bool enable);
+    void set_gpu_acceleration(bool enable);
     std::string get_device_info() const; 
 #endif
 

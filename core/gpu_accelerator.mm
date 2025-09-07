@@ -24,11 +24,6 @@ using namespace simd;
 
 namespace libraw_enhanced {
 
-// Global GPU state for Apple Silicon optimization
-static id<MTLDevice> g_metal_device = nil;
-static id<MTLCommandQueue> g_command_queue = nil;
-static id<MTLLibrary> g_shader_library = nil;
-
 class GPUAccelerator::Impl {
 public:
 #ifdef __OBJC__
@@ -53,224 +48,23 @@ bool GPUAccelerator::initialize() {
     
 #ifdef __OBJC__
     @autoreleasepool {
-        std::cout << "[DEBUG] Initializing GPU..." << std::endl;
+        std::cout << "🚀 Initializing GPU..." << std::endl;
         pimpl_->device = MTLCreateSystemDefaultDevice();
         if (!pimpl_->device) {
-            // このログが出れば、Metal自体が使えない環境
-            std::cout << "[DEBUG] FAILED: MTLCreateSystemDefaultDevice() returned nil." << std::endl;
+            std::cout << "❌ FAILED: MTLCreateSystemDefaultDevice() returned nil." << std::endl;
             return false;
         }
-        std::cout << "[DEBUG] Metal device created: " << [[pimpl_->device name] UTF8String] << std::endl;
+        std::cout << "📋 Metal device created: " << [[pimpl_->device name] UTF8String] << std::endl;
         
         pimpl_->command_queue = [pimpl_->device newCommandQueue];
         if (!pimpl_->command_queue) {
-            std::cout << "[DEBUG] FAILED: newCommandQueue() returned nil." << std::endl;
+            std::cout << "❌ FAILED: newCommandQueue() returned nil." << std::endl;
             return false;
         }
-        std::cout << "[DEBUG] Command queue created." << std::endl;
-        
-        if (!load_shaders()) {
-            // このログが出れば、シェーダーの読み込みかコンパイルに失敗している
-            std::cout << "[DEBUG] FAILED: load_shaders() returned false." << std::endl;
-            return false;
-        }
-        
-        g_metal_device = pimpl_->device;
-        // ...
-        std::cout << "[DEBUG] GPU Initialization SUCCESSFUL." << std::endl;
-        return true;
-    }
-#else
-    return false;
-#endif
-}
-
-bool GPUAccelerator::load_shaders() {
-#ifdef __OBJC__
-    @autoreleasepool {
-        // バンドル内のデフォルトライブラリを取得する
-        pimpl_->library = [pimpl_->device newDefaultLibrary];
-        
-        if (!pimpl_->library) {
-            std::cout << "[DEBUG] .metallib not found or failed to load. Trying to compile from source..." << std::endl;
-            if (!compile_individual_shaders()) {
-                // このログが出れば、ソースからのコンパイルに失敗
-                std::cout << "[DEBUG] FAILED: compile_individual_shaders() returned false." << std::endl;
-                return false;
-            }
-        }
-        
-        if (!pimpl_->library) {
-            // このログが出れば、最終的にライブラリが作成できなかった
-            std::cout << "[DEBUG] FAILED: Shader library is still nil after all attempts." << std::endl;
-            return false;
-        }
-        std::cout << "[DEBUG] Shader library loaded/compiled successfully." << std::endl;
-        
-        // 既存の一括パイプライン作成をスキップ (遅延ロード方式使用)
-        /*
-        std::cout << "[DEBUG] Creating compute pipelines..." << std::endl;
-        if (!create_compute_pipelines()) {
-            std::cout << "[DEBUG] ❌ create_compute_pipelines() FAILED" << std::endl;
-            return false;
-        }
-        std::cout << "[DEBUG] ✅ create_compute_pipelines() SUCCESS" << std::endl;
-        */
-        
-        std::cout << "[DEBUG] ✨ Using lazy-load shader compilation for optimal performance" << std::endl;
+        std::cout << "📋 Command queue created." << std::endl;
         
         pimpl_->initialized = true;
-        pimpl_->device_info = std::string([pimpl_->device.name UTF8String]) + " (GPU)";
-        
-        return true;
-    }
-#else
-    return false;
-#endif
-}
-
-std::string GPUAccelerator::load_shader_file(const std::string& filename) {
-    std::vector<std::string> possible_paths = {
-        std::string("core/metal/") + filename,
-        std::string("../core/metal/") + filename,
-        std::string("../../core/metal/") + filename,
-    };
-    
-    for (const auto& full_path : possible_paths) {
-        std::ifstream file(full_path);
-        if (file.is_open()) {
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            return buffer.str();
-        }
-    }
-    
-    return "";
-}
-
-
-bool GPUAccelerator::compile_individual_shaders() {
-#ifdef __OBJC__
-    @autoreleasepool {
-        NSError* error = nil;
-        
-        // シェーダーファイルを読み込んで結合
-        std::string combined_source;
-        
-        // ヘッダーファイルを最初に追加
-        std::string types_header = load_shader_file("shader_types.h");
-        std::string common_header = load_shader_file("shader_common.h");
-        
-        if (types_header.empty() || common_header.empty()) {
-            std::cout << "[DEBUG] Failed to load shader headers." << std::endl;
-            return false;
-        }
-        
-        combined_source += types_header + "\n";
-        combined_source += common_header + "\n";
-        
-        // シェーダーファイルを追加
-        std::vector<std::string> shader_files = {
-            "demosaic_bayer_linear.metal",
-            "demosaic_bayer_amaze.metal",
-            "demosaic_bayer_border.metal",
-            "demosaic_xtrans_1pass.metal",
-            "demosaic_xtrans_3pass.metal",
-            "demosaic_xtrans_border.metal",
-            "apply_white_balance.metal",
-            "convert_color_space.metal",
-            "gamma_correction.metal"
-        };
-        
-        for (const auto& filename : shader_files) {
-            std::string source = load_shader_file(filename);
-            if (source.empty()) {
-                std::cout << "[DEBUG] Failed to load shader: " << filename << std::endl;
-                continue;
-            }
-            
-            // インクルード文を削除
-            size_t pos;
-            while ((pos = source.find("#include \"shader_types.h\"")) != std::string::npos) {
-                source.erase(pos, strlen("#include \"shader_types.h\""));
-            }
-            while ((pos = source.find("#include \"shader_common.h\"")) != std::string::npos) {
-                source.erase(pos, strlen("#include \"shader_common.h\""));
-            }
-            
-            combined_source += "// --- " + filename + " ---\n";
-            combined_source += source + "\n\n";
-        }
-        
-        // メタルソースをコンパイル（最適化オプション付き）
-        NSString* nsSource = [NSString stringWithUTF8String:combined_source.c_str()];
-        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-        
-        // MTLLanguageVersionの互換性対応
-        if (@available(macOS 11.0, *)) {
-            options.languageVersion = MTLLanguageVersion2_3;
-        } else {
-            options.languageVersion = MTLLanguageVersion2_0; // macOS 10.15+対応
-        }
-        
-        // 最適化オプション設定
-        options.fastMathEnabled = YES;  // 高速数学演算（精度より速度優先）
-        
-        // プリプロセッサ定義で最適化マクロを追加
-        NSMutableDictionary* preprocessorMacros = [[NSMutableDictionary alloc] init];
-        preprocessorMacros[@"METAL_OPTIMIZED"] = @"1";
-        preprocessorMacros[@"FAST_MATH"] = @"1";
-        // Apple Silicon向け最適化
-        preprocessorMacros[@"APPLE_M1_OPTIMIZED"] = @"1";
-        options.preprocessorMacros = preprocessorMacros;
-        
-        pimpl_->library = [pimpl_->device newLibraryWithSource:nsSource
-                                                      options:options
-                                                        error:&error];
-        
-        if (error) {
-            std::cout << "[DEBUG] Metal shader compilation failed: " 
-                      << [[error localizedDescription] UTF8String] << std::endl;
-            return false;
-        }
-        
-        if (!pimpl_->library) {
-            std::cout << "[DEBUG] Failed to create Metal library." << std::endl;
-            return false;
-        }
-        
-        return true;
-    }
-#else
-    return false;
-#endif
-}
-
-bool GPUAccelerator::create_compute_pipelines() {
-#ifdef __OBJC__
-    @autoreleasepool {
-        NSError* error = nil;
-        
-        auto createPipeline = [&](NSString* functionName) -> id<MTLComputePipelineState> {
-            id<MTLFunction> function = [pimpl_->library newFunctionWithName:functionName];
-            if (!function) {
-                // どの関数が見つからなかったかを出力
-                std::cerr << "Failed to find Metal function: " << [functionName UTF8String] << std::endl;
-                return nil;
-            }
-            id<MTLComputePipelineState> pipeline = [pimpl_->device newComputePipelineStateWithFunction:function error:&error];
-            if (!pipeline) {
-                // パイプライン作成時にエラーが発生した場合、その内容を出力
-                std::cerr << "Failed to create pipeline state for function: " << [functionName UTF8String]
-                        << ", error: " << [[error localizedDescription] UTF8String] << std::endl;
-            }
-            return pipeline;
-        };
-
-        // 遅延ローディングシステムを使用するため、パイプラインは初期化時には作成しない
-        // 各パイプラインは get_pipeline() で必要時に作成される
-        std::cout << "[DEBUG] ✨ Pipeline lazy loading system initialized" << std::endl;
-
+        std::cout << "✅ GPU Initialization SUCCESSFUL." << std::endl;
         return true;
     }
 #else
@@ -286,8 +80,6 @@ std::string GPUAccelerator::get_device_info() const {
     return pimpl_->device_info;
 }
 
-// --- Demosaic Implementations ---
-
 //===================================================================
 // Demosaic Bayer Liner
 //===================================================================
@@ -300,7 +92,7 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
     id<MTLComputePipelineState> bayer_linear_pipeline = get_pipeline("demosaic_bayer_linear");
     id<MTLComputePipelineState> bayer_border_pipeline = get_pipeline("demosaic_bayer_border");
     if (!bayer_linear_pipeline || !bayer_border_pipeline) {
-        std::cerr << "[ERROR] Failed to get bayer linear pipelines" << std::endl;
+        std::cerr << "❌ Failed to get bayer linear pipelines" << std::endl;
         return false;
     }
     
@@ -384,7 +176,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
     id<MTLComputePipelineState> bayer_amaze_pipeline = get_pipeline("demosaic_bayer_amaze");
     id<MTLComputePipelineState> bayer_border_pipeline = get_pipeline("demosaic_bayer_border");
     if (!bayer_amaze_pipeline || !bayer_border_pipeline) {
-        std::cerr << "[ERROR] Failed to get bayer amaze/border pipelines" << std::endl;
+        std::cerr << "❌ Failed to get bayer amaze/border pipelines" << std::endl;
         return false;
     }
     
@@ -542,7 +334,7 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
     id<MTLComputePipelineState> xtrans_1pass_pipeline = get_pipeline("demosaic_xtrans_1pass");
     id<MTLComputePipelineState> xtrans_border_pipeline = get_pipeline("demosaic_xtrans_border");
     if (!xtrans_1pass_pipeline || !xtrans_border_pipeline) {
-        std::cerr << "[ERROR] Failed to get X-Trans 1pass pipelines" << std::endl;
+        std::cerr << "❌ Failed to get X-Trans 1pass pipelines" << std::endl;
         return false;
     }
     
@@ -637,7 +429,7 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
     id<MTLComputePipelineState> xtrans_3pass_pipeline = get_pipeline("demosaic_xtrans_3pass");
     id<MTLComputePipelineState> xtrans_border_pipeline = get_pipeline("demosaic_xtrans_border");
     if (!xtrans_3pass_pipeline || !xtrans_border_pipeline) {
-        std::cerr << "[ERROR] Failed to get X-Trans 3pass pipelines" << std::endl;
+        std::cerr << "❌ Failed to get X-Trans 3pass pipelines" << std::endl;
         return false;
     }
     
@@ -820,7 +612,7 @@ bool GPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input, Imag
     // 遅延ローディングでパイプライン取得
     id<MTLComputePipelineState> apply_white_balance_pipeline = get_pipeline("apply_white_balance");
     if (!apply_white_balance_pipeline) {
-        std::cerr << "[ERROR] Failed to get apply white balance pipeline" << std::endl;
+        std::cerr << "❌ Failed to get apply white balance pipeline" << std::endl;
         return false;
     }
     
@@ -883,7 +675,7 @@ bool GPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
     // 遅延ローディングでパイプライン取得
     id<MTLComputePipelineState> convert_color_space_pipeline = get_pipeline("convert_color_space");
     if (!convert_color_space_pipeline) {
-        std::cerr << "[ERROR] Failed to get convert color space pipeline" << std::endl;
+        std::cerr << "❌ Failed to get convert color space pipeline" << std::endl;
         return false;
     }
      
@@ -953,7 +745,7 @@ bool GPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
     // 遅延ローディングでパイプライン取得
     id<MTLComputePipelineState> gamma_correct_pipeline = get_pipeline("gamma_correct");
     if (!gamma_correct_pipeline) {
-        std::cerr << "[ERROR] Failed to get gamma correct pipeline" << std::endl;
+        std::cerr << "❌ Failed to get gamma correct pipeline" << std::endl;
         return false;
     }
     
@@ -1141,7 +933,25 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
     }
 }
 
-// get_cache_path関数削除済み - ファイルキャッシュ未実装
+std::string GPUAccelerator::load_shader_file(const std::string& filename) {
+    std::vector<std::string> possible_paths = {
+        std::string("core/metal/") + filename,
+        std::string("../core/metal/") + filename,
+        std::string("../../core/metal/") + filename,
+    };
+    
+    for (const auto& full_path : possible_paths) {
+        std::ifstream file(full_path);
+        if (file.is_open()) {
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            return buffer.str();
+        }
+    }
+    
+    return "";
+}
+
 #endif
 
 } // namespace libraw_enhanced
