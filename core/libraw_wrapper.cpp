@@ -1,4 +1,3 @@
-
 #include "libraw_wrapper.h"
 #include "constants.h"
 #include <iostream>
@@ -12,47 +11,9 @@
 #ifdef __arm64__
 #include "accelerator.h"
 #include "camera_matrices.h"
-#ifdef __OBJC__
-#import <Metal/Metal.h>
-#endif
 #endif
 
 namespace libraw_enhanced {
-
-void convert_float_to_float(const ImageBufferFloat& rgb_buffer, float* dst) {
-    size_t count = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
-    
-    float* src = reinterpret_cast<float*>(rgb_buffer.image);
-    for (size_t i = 0; i < count; i++) {
-        float val = *src++;
-        val = std::max(0.0f, std::min(1.f, val));
-        *dst++ = val;
-    }
-}
-
-void convert_float_to_uint16(const ImageBufferFloat& rgb_buffer, uint16_t* dst) {
-    size_t count = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
-    const float scale = 65535.f;
-    
-    float* src = reinterpret_cast<float*>(rgb_buffer.image);
-    for (size_t i = 0; i < count; i++) {
-        float val = *src++ * scale;
-        val = std::max(0.0f, std::min(scale, val));
-        *dst++ = static_cast<uint8_t>(val + 0.5f);
-    }
-}
-
-void convert_float_to_uint8(const ImageBufferFloat& rgb_buffer, uint8_t* dst) {
-    size_t count = rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels;
-    const float scale = 255.f;
-    
-    float* src = reinterpret_cast<float*>(rgb_buffer.image);
-    for (size_t i = 0; i < count; i++) {
-        float val = *src++ * scale;
-        val = std::max(0.0f, std::min(scale, val));
-        *dst++ = static_cast<uint8_t>(val + 0.5f);
-    }
-}
 
 class LibRawWrapper::Impl {
 public:
@@ -432,7 +393,7 @@ public:
         apply_black_level_correction(raw_buffer);
 
         // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
-        adjust_maximum(raw_buffer, params.adjust_maximum_thr);
+        //adjust_maximum(raw_buffer, params.adjust_maximum_thr);
 
         // set filters and xtrans
         uint32_t filters = processor.imgdata.idata.filters;        
@@ -466,9 +427,11 @@ public:
             effective_wb[3] = params.user_wb[3];
             std::cout << "👤 Using user/default WB:" << std::endl;
         }
+        //effective_wb[1] = std::sqrt(effective_wb[1]);
+        //effective_wb[3] = std::sqrt(effective_wb[3]);
         
         // Determine CFA type and apply appropriate WB processing
-        float sensor_max = static_cast<float>(processor.imgdata.color.maximum);
+        float sensor_max = 65535;//static_cast<float>(processor.imgdata.color.maximum);
         
         apply_white_balance_to_cfa_data(
             raw_buffer, 
@@ -477,6 +440,10 @@ public:
             xtrans, 
             sensor_max
         );
+
+
+        // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
+        adjust_maximum(raw_buffer, params.adjust_maximum_thr);
 
         // Apply pre-interpolation processing
         if (false == accelerator->pre_interpolate(raw_buffer, filters, xtrans, params.half_size)) {
@@ -502,7 +469,6 @@ public:
             std::cerr << "❌ Demosaic processing failed" << std::endl;
             return false;
         }
-
 
         // EXPERIMENTAL: White balance moved to pre-demosaic (COMMENTED OUT)
         // Step 6: Apply white balance to RAW data (float32 interface)        
@@ -539,6 +505,16 @@ public:
             return false;
         }
 */        
+        // Step 6.5: Highlight recovery (after gamma correction, before final output)
+        if (params.highlight_mode > 2) {
+            std::cout << "🔧 Applying highlight recovery (mode " << params.highlight_mode << ")..." << std::endl;
+            if (!recover_highlights(rgb_buffer, params.highlight_mode)) {
+                std::cerr << "❌ Highlight recovery failed" << std::endl;
+                return false;
+            }
+            std::cout << "✅ Highlight recovery completed" << std::endl;
+        }
+        //correct_magenta_cast(rgb_buffer, 0.7);
 
         // Get camera-specific color transformation matrix
         camera_matrix = compute_camera_transform(camera_make, camera_model, params.output_color_space);        
@@ -556,16 +532,13 @@ public:
             std::cerr << "❌ Gamma correction failed" << std::endl;
             return false;
         }
-        
-        // Step 6.5: Highlight recovery (after gamma correction, before final output)
-        if (params.highlight_mode > 2) {
-            std::cout << "🔧 Applying highlight recovery (mode " << params.highlight_mode << ")..." << std::endl;
-            if (!recover_highlights(rgb_buffer, params.highlight_mode)) {
-                std::cerr << "❌ Highlight recovery failed" << std::endl;
-                return false;
-            }
-            std::cout << "✅ Highlight recovery completed" << std::endl;
+/*        
+        for (uint i = 0; i < rgb_buffer.width * rgb_buffer.height; ++i) {
+            rgb_buffer.image[i][0] *= 0.3;
+            rgb_buffer.image[i][1] *= 0.3;
+            rgb_buffer.image[i][2] *= 0.3;
         }
+*/
         
         std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully" << std::endl;
         return true;
@@ -1241,150 +1214,109 @@ public:
         return result;
     }
     
-    
     // LibRaw recover_highlights equivalent for float32 processing
     bool recover_highlights(ImageBufferFloat& rgb_buffer, int highlight_mode) {
         std::cout << "🔧 Starting highlight recovery (float32)..." << std::endl;
         
-        highlight_mode = 4;
-        if (highlight_mode <= 2) {
-            return true; // No highlight recovery needed
-        }
-        
-        const float grow = std::pow(2.0f, 4.0f - highlight_mode);
-        const int SCALE = 4; // Fixed scale factor
-        
-        // Calculate saturation thresholds for each channel
-        float hsat[4];
-        const float max_value = 1.0f; // For float32 [0,1] range
-        const auto& pre_mul = processor.imgdata.color.pre_mul;
-        
-        for (int c = 0; c < 4; c++) {
-            hsat[c] = 0.95f * max_value * pre_mul[c]; // 95% of max as saturation threshold
-        }
-        
-        // Find the channel with minimum pre_mul (reference channel)
-        int kc = 0;
-        for (int c = 1; c < 3; c++) {
-            if (pre_mul[kc] < pre_mul[c]) {
-                kc = c;
-            }
-        }
-        
+        const auto& pre_mul = processor.imgdata.color.cam_mul;
         const size_t width = rgb_buffer.width;
         const size_t height = rgb_buffer.height;
         const size_t channels = rgb_buffer.channels;
+/*        
+        // Calculate white balance ratios
+        float wb_ratios[3];
+        float max_pre_mul = 0.f;
+        for (int c = 0; c < 3; c++) {
+            if (pre_mul[c] > max_pre_mul) max_pre_mul = pre_mul[c];
+        }        
+        for (int c = 0; c < 3; c++) {
+            wb_ratios[c] = pre_mul[c] / max_pre_mul;
+        }
+        //wb_ratios[1] = std::sqrt(wb_ratios[1]);
+        std::cout << "　 wb_ratios: " << wb_ratios[0] << ", " << wb_ratios[1] << ", " << wb_ratios[2] << std::endl;
+*/        
+        // Define saturation threshold (95% of maximum value)
+        const float saturation_threshold = 0.65f;
+        int recovered_pixels = 0;
         
-        const size_t high = height / SCALE;
-        const size_t wide = width / SCALE;
-        
-        // Allocate highlight recovery map
-        std::vector<float> map(high * wide, 0.0f);
-        
-        // Process each color channel (except reference channel)
-        for (int c = 0; c < (int)channels; c++) {
-            if (c == kc) continue;
-            
-            std::cout << "🔧 Processing channel " << c << " for highlight recovery..." << std::endl;
-            
-            // Clear map for this channel
-            std::fill(map.begin(), map.end(), 0.0f);
-            
-            // Calculate initial ratios for saturated regions
-            for (size_t mrow = 0; mrow < high; mrow++) {
-                for (size_t mcol = 0; mcol < wide; mcol++) {
-                    float sum = 0.0f, wgt = 0.0f;
-                    int count = 0;
-                    
-                    // Sample the SCALE x SCALE block
-                    for (size_t row = mrow * SCALE; row < (mrow + 1) * SCALE && row < height; row++) {
-                        for (size_t col = mcol * SCALE; col < (mcol + 1) * SCALE && col < width; col++) {
-                            const size_t pixel_idx = row * width + col;
-                            const float pixel_c = rgb_buffer.image[pixel_idx][c];
-                            const float pixel_kc = rgb_buffer.image[pixel_idx][kc];
-                            
-                            // Check if pixel is saturated in channel c but not in reference channel
-                            if (pixel_c >= hsat[c] * 0.99f && pixel_kc > 0.8f * max_value) {
-                                sum += pixel_c;
-                                wgt += pixel_kc;
-                                count++;
-                            }
-                        }
-                    }
-                    
-                    // If entire block is saturated, calculate ratio
-                    if (count == SCALE * SCALE) {
-                        map[mrow * wide + mcol] = (wgt > 0) ? sum / wgt : 1.0f;
-                    }
-                }
-            }
-            
-            // Iteratively fill gaps in the map using neighbor averaging
-            for (int spread = static_cast<int>(32 / grow); spread > 0; spread--) {
-                bool changed = false;
-                std::vector<float> temp_map = map;
-                
-                for (size_t mrow = 0; mrow < high; mrow++) {
-                    for (size_t mcol = 0; mcol < wide; mcol++) {
-                        if (map[mrow * wide + mcol] != 0.0f) continue;
-                        
-                        float sum = 0.0f;
-                        int count = 0;
-                        
-                        // Check 8-connected neighbors
-                        const int dir[8][2] = {{-1,-1}, {-1,0}, {-1,1}, {0,1}, {1,1}, {1,0}, {1,-1}, {0,-1}};
-                        
-                        for (int d = 0; d < 8; d++) {
-                            int y = static_cast<int>(mrow) + dir[d][0];
-                            int x = static_cast<int>(mcol) + dir[d][1];
-                            
-                            if (y >= 0 && y < static_cast<int>(high) && 
-                                x >= 0 && x < static_cast<int>(wide) && 
-                                map[y * wide + x] > 0) {
-                                int weight = 1 + (d & 1); // Diagonal neighbors get weight 2, orthogonal get weight 1
-                                sum += weight * map[y * wide + x];
-                                count += weight;
-                            }
-                        }
-                        
-                        if (count > 3) {
-                            temp_map[mrow * wide + mcol] = (sum + grow) / (count + grow);
-                            changed = true;
-                        }
-                    }
-                }
-                
-                map = temp_map;
-                if (!changed) break;
-            }
-            
-            // Fill remaining zeros with 1.0
-            for (size_t i = 0; i < map.size(); i++) {
-                if (map[i] == 0.0f) map[i] = 1.0f;
-            }
-            
-            // Apply highlight recovery to the image
-            for (size_t mrow = 0; mrow < high; mrow++) {
-                for (size_t mcol = 0; mcol < wide; mcol++) {
-                    const float ratio = map[mrow * wide + mcol];
-                    
-                    for (size_t row = mrow * SCALE; row < (mrow + 1) * SCALE && row < height; row++) {
-                        for (size_t col = mcol * SCALE; col < (mcol + 1) * SCALE && col < width; col++) {
-                            const size_t pixel_idx = row * width + col;
-                            
-                            if (rgb_buffer.image[pixel_idx][c] >= hsat[c] * 0.99f) {
-                                float val = rgb_buffer.image[pixel_idx][kc] * ratio;
-                                if (rgb_buffer.image[pixel_idx][c] < val) {
-                                    rgb_buffer.image[pixel_idx][c] = std::min(val, max_value);
-                                }
-                            }
-                        }
-                    }
+        // Process each pixel
+        for (size_t y = 0; y < height; y++) {
+            for (size_t x = 0; x < width; x++) {
+                const size_t pixel_idx = y * width + x;
+                float* pixel = rgb_buffer.image[pixel_idx];
+
+                if (pixel[0] >= saturation_threshold && pixel[2] >= saturation_threshold) {
+                    float sp = (pixel[0] < pixel[2])? pixel[0] : pixel[2];
+                    float sl = (std::min(sp, 1.f) - saturation_threshold) / (saturation_threshold);
+                    pixel[0] = pixel[0] * (1.f-sl) + (pixel[0] * saturation_threshold) * sl;
+                    pixel[2] = pixel[2] * (1.f-sl) + (pixel[2] * saturation_threshold) * sl;
+                    pixel[1] = (pixel[0] + pixel[2]) * 0.5f;
+                    recovered_pixels++;
                 }
             }
         }
         
-        std::cout << "✅ Highlight recovery completed successfully" << std::endl;
+        std::cout << "✅ Highlight recovery completed. Recovered " << recovered_pixels << " pixels." << std::endl;
+        return true;
+    }
+
+    bool correct_magenta_cast(ImageBufferFloat& rgb_buffer, float threshold) {
+        std::cout << "🔧 Correcting magenta cast in highlights..." << std::endl;
+        
+        const size_t width = rgb_buffer.width;
+        const size_t height = rgb_buffer.height;
+        int corrected_pixels = 0;
+        
+        // ホワイトバランス係数を取得
+        const auto& pre_mul = processor.imgdata.color.cam_mul;
+        float wb_ratios[3];
+        float max_pre_mul = 0.0f;
+        for (int c = 0; c < 3; c++) {
+            if (pre_mul[c] > max_pre_mul) max_pre_mul = pre_mul[c];
+        }
+        for (int c = 0; c < 3; c++) {
+            wb_ratios[c] = pre_mul[c] / max_pre_mul;
+        }
+        
+        // マゼンタ被りを検出して補正
+        for (size_t y = 0; y < height; y++) {
+            for (size_t x = 0; x < width; x++) {
+                const size_t pixel_idx = y * width + x;
+                float* pixel = rgb_buffer.image[pixel_idx];
+                
+                // ハイライト領域かどうかをチェック（明るさが閾値以上）
+                float brightness = (pixel[0] + pixel[1] + pixel[2]) / 3.0f;
+                if (brightness < threshold) continue;
+                
+                // マゼンタ被りを検出（RとBがGより強い）
+                float r_g_ratio = pixel[0] / (pixel[1] + 1e-6f); // ゼロ除算防止
+                float b_g_ratio = pixel[2] / (pixel[1] + 1e-6f);
+                
+                // マゼンタ被りの閾値
+                const float magenta_threshold = 1.2f; // RとBがGより20%以上強い
+                
+                if (r_g_ratio > magenta_threshold && b_g_ratio > magenta_threshold) {
+                    // ホワイトバランス比率に基づいて補正
+                    float target_ratio_r = wb_ratios[0] / wb_ratios[1];
+                    float target_ratio_b = wb_ratios[2] / wb_ratios[1];
+                    
+                    // 現在の比率と目標比率の中間値を取る（強度はadjust_strengthで制御）
+                    const float adjust_strength = 0.7f; // 補正の強度（0.0-1.0）
+                    float new_r_g_ratio = (1.0f - adjust_strength) * r_g_ratio + adjust_strength * target_ratio_r;
+                    float new_b_g_ratio = (1.0f - adjust_strength) * b_g_ratio + adjust_strength * target_ratio_b;
+                    
+                    // 緑チャンネルを基準に赤と青を調整
+                    float base_g = pixel[1];
+                    pixel[0] = std::min(base_g * new_r_g_ratio, 1.0f);
+                    pixel[2] = std::min(base_g * new_b_g_ratio, 1.0f);
+                    
+                    corrected_pixels++;
+                }
+            }
+        }
+        
+        std::cout << "✅ Magenta cast correction completed. Corrected " 
+                << corrected_pixels << " pixels." << std::endl;
         return true;
     }
 #endif
@@ -1413,7 +1345,6 @@ ProcessedImageData LibRawWrapper::get_processed_image() {
     return pimpl->get_processed_image();
 }
 
-#ifdef __arm64__
 void LibRawWrapper::set_processing_params(const ProcessingParams& params) {
     pimpl->set_processing_params(params);
 }
@@ -1711,7 +1642,5 @@ std::vector<std::string> get_device_list() {
     
     return device_list;
 }
-
-#endif
 
 } // namespace libraw_enhanced

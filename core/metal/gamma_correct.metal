@@ -39,13 +39,16 @@ inline float3 apply_rec2020_gamma_encode(float3 linear_value) {
 
 // Pure power gamma encode
 inline float3 apply_pure_power_gamma_encode(float3 linear_value, float power) {
-    return pow(max(0.f, linear_value), 1.0f / power);
+    return pow(linear_value, 1.0f / power);
 }
 
 // Pure power gamma encode with slope support
 inline float3 apply_pure_power_gamma_encode_with_slope(float3 linear_value, float power, float slope) {
-    float threshold = slope / power;
-    
+    if (slope <= 0.f) {
+        return apply_pure_power_gamma_encode(linear_value, power);
+    }
+
+    float threshold = slope / power;    
     return select(pow((power * linear_value + (1.0f - slope)) / power, 1.0f / power),
                   power * linear_value / slope,
                   linear_value < threshold);
@@ -94,7 +97,7 @@ kernel void gamma_correct(
     }
     
     // 結果を書き込み
-    rgb_out = clamp(rgb_out, 0.0f, 1.0f);
+    //rgb_out = clamp(rgb_out, 0.0f, 1.0f);
     rgb_output[pixel_idx + 0] = rgb_out.r;
     rgb_output[pixel_idx + 1] = rgb_out.g;
     rgb_output[pixel_idx + 2] = rgb_out.b;

@@ -215,7 +215,7 @@ PYBIND11_MODULE(_core, m) {
                 uint8_t* out_ptr = static_cast<uint8_t*>(array_8.request().ptr);
 
                 for (size_t i = 0; i < height * width * channels; i++) {
-                    *out_ptr++ = *in_ptr++ * 255.0f + 0.5f;
+                    *out_ptr++ = std::clamp(*in_ptr++, 0.f, 1.f) * 255.0f + 0.5f;
                 }
                 return array_8;
             
@@ -226,17 +226,27 @@ PYBIND11_MODULE(_core, m) {
                 uint16_t* out_ptr = static_cast<uint16_t*>(array_16.request().ptr);
 
                 for (size_t i = 0; i < height * width * channels; i++) {
-                    *out_ptr++ = *in_ptr++ * 65535.0f + 0.5f;
+                    *out_ptr++ = std::clamp(*in_ptr++, 0.f, 1.f) * 65535.0f + 0.5f;
                 }
                 return array_16;
 
             } else {
                 // Return as float32 array for 32-bit data
+                py::array_t<float> array_32({height, width, channels});
+                float* in_ptr = self.data;
+                float* out_ptr = static_cast<float*>(array_32.request().ptr);
+
+                for (size_t i = 0; i < height * width * channels; i++) {
+                    *out_ptr++ = std::clamp(*in_ptr++, 0.f, 1.f);
+                }
+                return array_32;
+/*
                 return py::array_t<float>(
                     {height, width, channels},
                     {sizeof(float) * width * channels, sizeof(float) * channels, sizeof(float)},
                     self.data
                 );
+*/
             }
         }, "Convert to numpy array with proper shape and dtype")
         .def_property_readonly("data", 

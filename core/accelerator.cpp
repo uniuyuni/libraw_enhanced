@@ -107,7 +107,6 @@ bool Accelerator::demosaic_compute(const ImageBuffer& raw_buffer,
                 return demosaic_xtrans_3pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
         }
     } else {
-    
         // Map algorithm to specific methods using enum constants
         switch (algorithm) {
             case static_cast<int>(DemosaicAlgorithm::Linear): 
@@ -339,7 +338,7 @@ bool Accelerator::gamma_correct(const ImageBufferFloat& rgb_input,
     } else
     if (gamma_power > 0.f && gamma_slope > 0.f) {
         std::cout << "ℹ️ Both gamma power and slope are set, custom gamma corrention" << std::endl;
-        std::cout << "   Gamma power: " << gamma_power << " slope: " << gamma_slope << std::endl;
+        std::cout << "　 Gamma power: " << gamma_power << " slope: " << gamma_slope << std::endl;
         output_color_space = -1;
     }
 

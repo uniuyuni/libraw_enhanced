@@ -2806,10 +2806,11 @@ float CPUAccelerator::apply_rec2020_gamma_encode(float v) const {
 }
 
 float CPUAccelerator::apply_pure_power_gamma_encode(float v, float p) const {
-    return std::pow(std::max(0.0f, v), 1.0f / p);
+    return std::pow(v, 1.0f / p);
 }
 
 float CPUAccelerator::apply_pure_power_gamma_encode_with_slope(float v, float p, float s) const {
+    if (s <= 0.f) return std::pow(v, 1.0f / p);
     return (v < 1.0f / s) ? v * s : std::pow(v, 1.0f / p);
 }
 

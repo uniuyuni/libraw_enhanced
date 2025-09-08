@@ -36,7 +36,7 @@ kernel void convert_color_space(
     };
     
     // 結果をクランプして出力
-    //packed_float3 result = clamp(rgb_out, 0.0f, 1.0f);
+    //rgb_out = clamp(rgb_out, 0.0f, 1.0f);
     rgb_output[pixel_idx + 0] = rgb_out.x;
     rgb_output[pixel_idx + 1] = rgb_out.y;
     rgb_output[pixel_idx + 2] = rgb_out.z;
