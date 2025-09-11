@@ -153,7 +153,7 @@ bool Accelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer,
         std::cout << "✅ CPU Linear demosaic completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU Linear demosaic failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU Linear demosaic failed" << std::endl;
     return false;
 }
 
@@ -173,7 +173,7 @@ bool Accelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
         std::cout << "✅ CPU AAHD demosaic completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU AAHD demosaic failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU AAHD demosaic failed" << std::endl;
     return false;
 }
 
@@ -195,7 +195,7 @@ bool Accelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
         std::cout << "✅ CPU DCB demosaic completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU DCB demosaic failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU DCB demosaic failed" << std::endl;
     return false;
 }
 
@@ -219,7 +219,7 @@ bool Accelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
         std::cout << "✅ CPU AMaZE demosaic completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU AMaZE demosaic failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU AMaZE demosaic failed" << std::endl;
     return false;
 }
 
@@ -247,7 +247,7 @@ bool Accelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
         std::cout << "✅ CPU X-Trans 1-pass demosaic completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU X-Trans 1-pass demosaic failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU X-Trans 1-pass demosaic failed" << std::endl;
     return false;
 }
 
@@ -271,7 +271,7 @@ bool Accelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         std::cout << "✅ CPU X-Trans 3-pass demosaic successful" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU X-Trans 3-pass demosaic failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU X-Trans 3-pass demosaic failed" << std::endl;
     return false;
 }
 
@@ -314,7 +314,7 @@ bool Accelerator::convert_color_space(const ImageBufferFloat& rgb_input,
         std::cout << "✅ CPU convert color space completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU convert color space failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU convert color space failed" << std::endl;
     return false;
 }
 
@@ -356,9 +356,34 @@ bool Accelerator::gamma_correct(const ImageBufferFloat& rgb_input,
         std::cout << "✅ CPU gamma correct completed successfully" << std::endl;
         return true;
     }
-    std::cout << "❌ CPU gamma correct failed, falling back to CPU" << std::endl;
+    std::cout << "❌ CPU gamma correct failed" << std::endl;
     return false;
 }
 
+//===================================================================
+// Gamma Correct
+//===================================================================
+
+bool Accelerator::tone_mapping(const ImageBufferFloat& rgb_input,
+                               ImageBufferFloat& rgb_output,
+                               float after_scale) {
+
+    if (should_use_gpu()) {
+        std::cout << "🎯 Trying GPU tone mapping..." << std::endl;
+        if (pimpl_->gpu_accelerator->tone_mapping(rgb_input, rgb_output, after_scale)) {
+            std::cout << "✅ GPU tone mapping completed successfully" << std::endl;
+            return true;
+        }
+        std::cout << "⚠️ GPU tone mapping failed, falling back to CPU" << std::endl;
+    }
+    
+    std::cout << "🔧 Using CPU tone mapping" << std::endl;
+    if (pimpl_->cpu_accelerator->tone_mapping(rgb_input, rgb_output, after_scale)) {
+        std::cout << "✅ CPU tone mapping completed successfully" << std::endl;
+        return true;
+    }
+    std::cout << "❌ CPU tone mapping failed" << std::endl;
+    return false;
+}
 
 } // namespace libraw_enhanced

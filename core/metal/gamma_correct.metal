@@ -4,6 +4,7 @@
 // GPU port of cpu_accelerator.cpp gamma_correct
 //
 
+#include "shader_types.h"
 #include "shader_common.h"
 #include "../constants.h"
 

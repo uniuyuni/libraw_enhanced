@@ -803,6 +803,73 @@ bool GPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
 }
 
 //===================================================================
+// トーンマッピング
+//===================================================================
+
+bool GPUAccelerator::tone_mapping(const ImageBufferFloat& rgb_input,
+                        ImageBufferFloat& rgb_output,
+                        float after_scale) {
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    id<MTLComputePipelineState> tone_mapping_pipeline = get_pipeline("tone_mapping");
+    if (!tone_mapping_pipeline) {
+        std::cerr << "❌ Failed to get tone_mapping pipeline" << std::endl;
+        return false;
+    }
+    
+    @autoreleasepool {
+        size_t pixel_count = rgb_input.width * rgb_input.height;
+        size_t buffer_size = pixel_count * 3 * sizeof(float);
+        
+        id<MTLBuffer> input_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_input.image[0][0]
+                                                            length:buffer_size
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        
+        id<MTLBuffer> output_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_output.image[0][0]
+                                                            length:buffer_size
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        
+        ToneMappingParams params = {
+            static_cast<uint32_t>(rgb_input.width),
+            static_cast<uint32_t>(rgb_input.height),
+            after_scale
+        };
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+                                                            length:sizeof(params)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        
+        id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        
+        [encoder setComputePipelineState:tone_mapping_pipeline];
+        [encoder setBuffer:input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:output_buffer offset:0 atIndex:1];
+        [encoder setBuffer:params_buffer offset:0 atIndex:2];
+        
+        MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
+        MTLSize thread_group_size = MTLSizeMake(32, 32, 1);
+        
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+
+        [encoder endEncoding];        
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+
+        return true;
+    }
+#else
+    return false;
+#endif
+}
+
+//===================================================================
 // 遅延ロード + キャッシュ方式の新しいシェーダー管理
 //===================================================================
 

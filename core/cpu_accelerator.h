@@ -88,7 +88,11 @@ public:
                         float gamma_power = 0.f, //2.2f,
                         float gamma_slope = 0.f, // 4.5f,
                         int output_color_space = 1);
-                           
+
+    bool tone_mapping(const ImageBufferFloat& rgb_input,
+                            ImageBufferFloat& rgb_output,
+                            float after_scale);
+
     double get_last_processing_time() const;
     size_t get_memory_usage() const;
     std::string get_device_info() const;

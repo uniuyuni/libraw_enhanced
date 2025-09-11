@@ -2862,4 +2862,36 @@ void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint
     std::cout << "✅ LibRaw-exact border interpolation completed" << std::endl;
 }
 
+//===================================================================
+// トーンマッピング
+//===================================================================
+
+bool CPUAccelerator::tone_mapping(const ImageBufferFloat& rgb_input,
+                               ImageBufferFloat& rgb_output,
+                               float after_scale) {
+
+        auto acesToneMap = [](float x) {
+            static constexpr float a = 2.51f;
+            static constexpr float b = 0.03f;
+            static constexpr float c = 2.43f;
+            static constexpr float d = 0.59f;
+            static constexpr float e = 0.14f;
+            
+            return (x * (a * x + b)) / (x * (c * x + d) + e);
+        };
+
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (size_t idx = 0; idx < rgb_output.width * rgb_output.height; ++idx) {
+            float* in = rgb_input.image[idx];
+            float* out = rgb_output.image[idx];
+
+            out[0] = acesToneMap(in[0]) * after_scale;
+            out[1] = acesToneMap(in[1]) * after_scale;
+            out[2] = acesToneMap(in[2]) * after_scale;
+        }
+        return true;
+   }
+
 } // namespace libraw_enhanced

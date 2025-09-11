@@ -71,6 +71,10 @@ public:
                       float gamma_slope = 0.f, // 4.5f,
                       int output_color_space = 1);
 
+    bool tone_mapping(const ImageBufferFloat& rgb_input,
+                            ImageBufferFloat& rgb_output,
+                            float after_scale);
+
 private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;

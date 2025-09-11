@@ -84,4 +84,10 @@ typedef struct {
     uint32_t output_color_space; // Color space identifier
 } GammaParams;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float after_scale;
+} ToneMappingParams;
+
 #endif /* shader_types_h */

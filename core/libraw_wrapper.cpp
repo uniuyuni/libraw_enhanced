@@ -17,6 +17,126 @@
 
 namespace libraw_enhanced {
 
+class MicroContrastEnhancer {
+private:    
+    // ガウシアンカーネルの生成
+    std::vector<std::vector<float>> createGaussianKernel(int size, float sigma) {
+        std::vector<std::vector<float>> kernel(size, std::vector<float>(size));
+        float sum = 0.0f;
+        int center = size / 2;
+        
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                float x = i - center;
+                float y = j - center;
+                kernel[i][j] = exp(-(x*x + y*y) / (2.0f * sigma * sigma));
+                sum += kernel[i][j];
+            }
+        }
+        
+        // 正規化
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                kernel[i][j] /= sum;
+            }
+        }
+        
+        return kernel;
+    }
+    
+    // 輝度値の計算 (RGB → Luminance)
+    inline float getLuminance(float r, float g, float b) {
+        return 0.299f * r + 0.587f * g + 0.114f * b;
+    }
+    
+    // ガウシアンブラーの適用
+    void applyGaussianBlur(ImageBufferFloat& rgb_buffer, float (*blurred)[3], 
+                          const std::vector<std::vector<float>>& kernel) {
+        const int width = rgb_buffer.width;
+        const int height = rgb_buffer.height;
+        const float (*image)[3] = rgb_buffer.image;
+        int kernel_size = kernel.size();
+        int kernel_center = kernel_size / 2;
+        
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                
+                for (int ky = 0; ky < kernel_size; ky++) {
+                    for (int kx = 0; kx < kernel_size; kx++) {
+                        int px = std::clamp(x + kx - kernel_center, 0, width - 1);
+                        int py = std::clamp(y + ky - kernel_center, 0, height - 1);
+                        
+                        int idx = py * width + px;
+                        float weight = kernel[ky][kx];
+                        
+                        r += image[idx][0] * weight;
+                        g += image[idx][1] * weight;
+                        b += image[idx][2] * weight;
+                    }
+                }
+                
+                int idx = y * width + x;
+                blurred[idx][0] = r;
+                blurred[idx][1] = g;
+                blurred[idx][2] = b;
+            }
+        }
+    }
+    
+public:    
+    // メインの処理関数
+    void enhanceMicroContrast(ImageBufferFloat& rgb_buffer, float threshold, float contrast_strength) {
+        const int width = rgb_buffer.width;
+        const int height = rgb_buffer.height;
+        float (*image)[3] = rgb_buffer.image;
+
+        // 処理用のバッファを確保
+        std::vector<float> blurred_data(height * width * 3);
+        float (*blurred)[3] = reinterpret_cast<float(*)[3]>(blurred_data.data());
+        
+        // ガウシアンカーネルの生成（マイクロコントラスト用）
+        auto kernel = createGaussianKernel(5, 1.f);
+        
+        // ハイライト領域の輝度差を明確にする
+        float scale = 1.2f;
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (int i = 0; i < width * height; i++) {
+            // しきい値以上の領域のみ処理
+            if (image[i][1] > 1.f) {
+                image[i][0] = std::pow(std::max(image[i][0], 0.f), scale);
+                image[i][1] = std::pow(std::max(image[i][1], 0.f), scale);
+                image[i][2] = std::pow(std::max(image[i][2], 0.f), scale);
+            }
+        }
+
+        // ガウシアンブラーの適用
+        applyGaussianBlur(rgb_buffer, blurred, kernel);
+        
+        // マイクロコントラストの適用
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (int i = 0; i < width * height; i++) {
+            //float luminance = getLuminance(image[i][0], image[i][1], image[i][2]);
+            
+            // しきい値以上の領域のみ処理
+            if (image[i][1] >= threshold) {
+                // マイクロコントラストを適用
+                image[i][0] = image[i][0] + (image[i][0] - blurred[i][0]) * contrast_strength;
+                image[i][1] = image[i][1] + (image[i][1] - blurred[i][1]) * contrast_strength;
+                image[i][2] = image[i][2] + (image[i][2] - blurred[i][2]) * contrast_strength;
+            }
+        }
+
+    }
+};
+
 class LibRawWrapper::Impl {
 public:
     LibRaw processor;
@@ -162,6 +282,9 @@ public:
         
         int processed_pixels = 0;
         
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int j = oj + 2; j < height - margin; j += 2) {
             for (int i = oi + 2; i < width - margin; i += 2) {
                 // Ensure we don't go out of bounds
@@ -243,6 +366,9 @@ public:
         size_t processed_pixels = 0;
         
         // Process each pixel in the raw buffer
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
             int row = pixel_idx / raw_buffer.width;
             int col = pixel_idx % raw_buffer.width;
@@ -290,6 +416,9 @@ public:
         size_t processed_pixels = 0;
         
         // Process each pixel in the raw buffer
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
             int row = pixel_idx / raw_buffer.width;
             int col = pixel_idx % raw_buffer.width;
@@ -342,6 +471,9 @@ public:
             size_t total_pixels = raw_buffer.width * raw_buffer.height;
             uint16_t max_value = 0;
             
+#ifdef _OPENMP
+            #pragma omp parallel for collapse(2)
+#endif
             for (size_t i = 0; i < total_pixels; i++) {
                 for (int c = 0; c < 4; c++) {
                     uint16_t val = raw_buffer.image[i][c];
@@ -467,12 +599,22 @@ public:
             return false;
         }
 
+        float threshold = (float)processor.imgdata.color.maximum / (float)processor.imgdata.color.data_maximum * 0.75;
+
         // Highlight recovery
-        float max_val;
         if (params.highlight_mode > 2) {
-            max_val = recover_highlights(rgb_buffer, (float)processor.imgdata.color.maximum / (float)processor.imgdata.color.data_maximum * 0.75);
+            recover_highlights(rgb_buffer, threshold);
         }
-        tone_mapping(max_val, 1.f);
+
+        // Highlight detail recovery
+        if (params.highlight_mode > 3) {
+            MicroContrastEnhancer enhancer;
+            enhancer.enhanceMicroContrast(rgb_buffer, threshold, 1.2f);
+            enhancer.enhanceMicroContrast(rgb_buffer, threshold * 3.f, 1.8f);
+        }
+
+        // Tone mapping
+        accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
 
         // Get camera-specific color transformation matrix
         camera_matrix = compute_camera_transform(camera_make, camera_model, params.output_color_space);
@@ -1169,7 +1311,6 @@ public:
     bool recover_highlights(ImageBufferFloat& rgb_buffer, float saturation_threshold) {
         std::cout << "🔧 Starting highlight recovery... sat: " << saturation_threshold << std::endl;
         
-        const auto& pre_mul = processor.imgdata.color.cam_mul;
         const size_t width = rgb_buffer.width;
         const size_t height = rgb_buffer.height;
         const size_t channels = rgb_buffer.channels;
@@ -1183,8 +1324,9 @@ public:
             if (pixel[0] >= saturation_threshold &&
                 pixel[2] >= saturation_threshold)
             {
-                highlight.push_back(idx);   // ハイライト
-
+                {
+                    highlight.push_back(idx);   // ハイライト
+                }
                 if (pixel[0] <  0.95f &&
                     pixel[1] >= saturation_threshold && pixel[1] < 0.95f &&
                     pixel[2] <  0.95f)
@@ -1211,7 +1353,7 @@ public:
             const int idx = *it;
             float* pixel = rgb_buffer.image[idx];
 
-            for (size_t i = 0; i < 3; ++i) {
+            for (size_t i = 0; i < channels; ++i) {
                 if (pixel[i] > max_val) {
                     max_val = pixel[i];
                 }
@@ -1253,13 +1395,13 @@ public:
         std::shuffle(white.begin(), white.end(), g);
         for (std::deque<int>::iterator it = white.begin(); it != white.end(); ++it) {
             const int idx = *it;
-            int x = idx / width;
-            int y = idx % width;
-            if (x <= 0 || x >= width -1 || y <= 0 || y >= height -1) {
+            size_t x = idx / width;
+            size_t y = idx % width;
+            if (x <= 0 || x >= width -2 || y <= 0 || y >= height -2) {
                 continue;
             }
 
-            for (size_t c = 0; c < 3; ++c) {
+            for (size_t c = 0; c < channels; ++c) {
                 float avg = image[idx - width - 1][c]
                           + image[idx - width + 0][c]
                           + image[idx - width + 1][c]
@@ -1276,37 +1418,6 @@ public:
         return max_val;
     }
 
-    void tone_mapping(float max_val, float scale) {
-        std::cout << "🔧 Starting Tone mapping..." << std::endl;
-
-        auto acesToneMap = [](float x, float maxVal) {
-            static constexpr float a = 2.51f;
-            static constexpr float b = 0.03f;
-            static constexpr float c = 2.43f;
-            static constexpr float d = 0.59f;
-            static constexpr float e = 0.14f;
-            
-            return (x * (a * x + b)) / (x * (c * x + d) + e);
-        };
-
-        float k = 4.f / max_val; // なるべく1.0に近づけるための係数
-        float after_max_val = 0.f;
-        for (size_t idx = 0; idx < rgb_buffer.width * rgb_buffer.height; ++idx) {
-            float* pixel = rgb_buffer.image[idx];
-
-            pixel[0] = acesToneMap(pixel[0], max_val) * scale;
-            pixel[1] = acesToneMap(pixel[1], max_val) * scale;
-            pixel[2] = acesToneMap(pixel[2], max_val) * scale;
-
-            for(size_t c = 0; c < 3; ++c) {
-                if (pixel[c] > after_max_val) {
-                    after_max_val = pixel[c];
-                }
-            }
-        }
-        std::cout << "　 After max value: "  << after_max_val << std::endl;
-        std::cout << "✅ Tone Mapping completed." << std::endl;
-   }
 #endif
 };
 

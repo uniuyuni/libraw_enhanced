@@ -10,6 +10,8 @@ import time
 import numpy as np
 from pathlib import Path
 from PIL import Image
+import pyvips
+import exiftool
 
 # プロジェクトルートをPythonパスに追加
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -52,13 +54,15 @@ def process_raw_file(raw_path, output_dir):
         # 複数の処理パラメータでテスト
         test_configs = [
             {
-                "name": "AMaZE CPU",
+                "name": "AMaZE CPU ProPhotoRGB",
                 "params": {
                     "use_camera_wb": True,
                     "half_size": False,
                     "output_bps": 32,
-                    "demosaic_algorithm": 10,  # AMaZE
-                    "use_gpu_acceleration": True
+                    "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,  # AMaZE
+                    "use_gpu_acceleration": True,
+                    "output_color": lre.ColorSpace.ProPhotoRGB,
+                    "highlight_mode": 4,
                 }
             },
         ]
@@ -202,36 +206,48 @@ def process_raw_file(raw_path, output_dir):
                     print(f"📊 Output shape: {rgb.shape}")
                     print(f"📊 Output dtype: {rgb.dtype}")
                     print(f"📈 Value range: [{np.min(rgb)}, {np.max(rgb)}]")
-                    
-                    # 8bitに変換
-                    if rgb.dtype == np.uint16:
-                        rgb_8bit = (rgb / 255).astype(np.uint8)
-                    elif rgb.dtype == np.float32:
-                        rgb_8bit = (rgb * 255).astype(np.uint8)
-                    else:
-                        rgb_8bit = rgb.astype(np.uint8)
-                    
-                    # PIL Imageに変換
-                    if len(rgb_8bit.shape) == 3:
-                        img = Image.fromarray(rgb_8bit, 'RGB')
-                    else:
-                        print(f"⚠️ Unexpected image shape: {rgb_8bit.shape}")
-                        continue
-                    
+
                     # JPGファイル名生成
                     base_name = raw_path.stem
-                    jpg_filename = f"{base_name}_{config['name']}.jpg"
-                    jpg_path = output_dir / jpg_filename
-                    
+                    save_filename = f"{base_name}_{config['name']}.jpg"
+                    save_path = output_dir / save_filename
+
+                    profile_name = [
+                        "",
+                        "icc/sRGB IEC61966-2.1.icc",
+                        "icc/Adobe RGB (1998).icc",
+                        "icc/WideGamut RGB.icc",
+                        "icc/ProPhoto RGB.icc",
+                        "icc/XYZD65.icc",
+                        "icc/ACEScg.icc",
+                        "icc/Display P3.icc",
+                        "icc/ITU-R BT.2020.icc",
+                    ]
+
+                    # データ読み込み
+                    vips = pyvips.Image.new_from_array((rgb * 255).astype(np.uint8))
+
+                    # iccプロファイル読み込み
+                    #with open(profile_name[config['params']['output_color']], 'rb') as f:
+                    #    icc_bytes = f.read()
+                    print(f"💾 load icc: {profile_name[config['params']['output_color']]}")
+
+                    #vips = vips.icc_import(input_profile=profile_name[config['params']['output_color']])
+
                     # JPG保存
-                    img.save(jpg_path, 'JPEG', quality=95)
-                    print(f"💾 Saved: {jpg_path}")
-                    
+                    vips.write_to_file(save_path, Q=95, profile=profile_name[config['params']['output_color']])
+                    #vips.write_to_file(save_path, Q=95)
+                    print(f"💾 Saved: {save_path}")
+                    """
+                    with exiftool.ExifTool() as et:
+                        # exiftoolのコマンドラインオプションと同様に、ICCプロファイルのバイナリを指定して埋め込みます
+                        et.execute("-icc_profile<={}".format(profile_name[config['params']['output_color']]), f"{save_path}")
+                    """                                     
                     results.append({
                         'config': config['name'],
                         'success': True,
                         'process_time': process_time,
-                        'output_path': jpg_path,
+                        'output_path': save_path,
                         'shape': rgb.shape,
                         'value_range': [np.min(rgb), np.max(rgb)]
                     })
