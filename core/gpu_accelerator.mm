@@ -878,16 +878,147 @@ bool GPUAccelerator::tone_mapping(const ImageBufferFloat& rgb_input,
 }
 
 //===================================================================
+// マイクロコントラスト
+//===================================================================
+
+bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
+                                            ImageBufferFloat& rgb_output,
+                                            float threshold,
+                                            float strength,
+                                            float target_contrast) {
+
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    //id<MTLComputePipelineState> preprocess_pipeline = get_pipeline("enhance_micro_contrast", "preprocess_enhance_micro_contrast");
+    id<MTLComputePipelineState> enhance_micro_contrast_pipeline = get_pipeline("enhance_micro_contrast");
+    //if (!preprocess_pipeline || !enhance_micro_contrast_pipeline) {
+    if (!enhance_micro_contrast_pipeline) {
+        std::cerr << "❌ Failed to get enhance micro contrast pipeline" << std::endl;
+        return false;
+    }
+    
+    @autoreleasepool {
+        size_t pixel_count = rgb_input.width * rgb_input.height;
+        
+        id<MTLBuffer> input_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_input.image[0][0]
+                                                            length:pixel_count * 3 * sizeof(float)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        
+        id<MTLBuffer> I_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];        
+        vector_float3* I = (vector_float3 *)[I_buffer contents];
+
+        id<MTLBuffer> local_mean_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
+                                                            options:MTLResourceStorageModePrivate];
+
+        id<MTLBuffer> local_var_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
+                                                            options:MTLResourceStorageModePrivate];
+
+        id<MTLBuffer> output_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_output.image[0][0]
+                                                            length:pixel_count * 3 * sizeof(float)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        
+        EnhanceMicroContrastParams params = {
+            static_cast<uint32_t>(rgb_input.width),
+            static_cast<uint32_t>(rgb_input.height),
+            threshold,
+            strength,
+            target_contrast,
+            0.f
+        };
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+                                                            length:sizeof(params)
+                                                            options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        
+        MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
+        MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
+
+        MTLTextureDescriptor *texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                                            width:NSUInteger(rgb_input.width)
+                                                            height:NSUInteger(rgb_input.height)
+                                                            mipmapped:NO];
+        texDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> I_texture = [I_buffer newTextureWithDescriptor:texDesc
+                                                            offset:0
+                                                            bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
+        id<MTLTexture> local_mean_texture = [local_mean_buffer newTextureWithDescriptor:texDesc
+                                                            offset:0
+                                                            bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
+        id<MTLTexture> local_var_texture = [local_var_buffer newTextureWithDescriptor:texDesc
+                                                            offset:0
+                                                            bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
+
+        MPSImageGaussianBlur *gaussianBlur = [[MPSImageGaussianBlur alloc] initWithDevice:pimpl_->device sigma:5.f / 3.7f];
+        
+        id<MTLCommandBuffer> command_buffer;
+
+        // 局所平均の計算
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (uint32_t idx = 0; idx < pixel_count; ++idx) {
+            I[idx] = {rgb_input.image[idx][0], rgb_input.image[idx][1], rgb_input.image[idx][2]};
+        }
+        command_buffer = [pimpl_->command_queue commandBuffer];
+        [gaussianBlur encodeToCommandBuffer:command_buffer sourceTexture:I_texture destinationTexture:local_mean_texture];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+
+        // 局所標準偏差の計算（前半）
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (uint32_t idx = 0; idx < pixel_count; ++idx) {
+            I[idx] = I[idx] * I[idx];
+        }
+        command_buffer = [pimpl_->command_queue commandBuffer];  
+        [gaussianBlur encodeToCommandBuffer:command_buffer sourceTexture:I_texture destinationTexture:local_var_texture];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+
+        command_buffer = [pimpl_->command_queue commandBuffer];
+        id<MTLComputeCommandEncoder> post_encoder = [command_buffer computeCommandEncoder];
+        [post_encoder setComputePipelineState:enhance_micro_contrast_pipeline];
+        [post_encoder setBuffer:input_buffer offset:0 atIndex:0];
+        [post_encoder setBuffer:local_mean_buffer offset:0 atIndex:1];
+        [post_encoder setBuffer:local_var_buffer offset:0 atIndex:2];
+        [post_encoder setBuffer:output_buffer offset:0 atIndex:3];
+        [post_encoder setBuffer:params_buffer offset:0 atIndex:4];
+        [post_encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+        [post_encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];        
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+
+        return true;
+    }
+#else
+    return false;
+#endif
+}
+
+//===================================================================
 // 遅延ロード + キャッシュ方式の新しいシェーダー管理
 //===================================================================
 
 #ifdef __OBJC__
-id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shader_name) {
+id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shader_name, std::string func_name) {
     @autoreleasepool {
         // パイプラインキャッシュから探して原始的に実装
         static std::unordered_map<std::string, id<MTLComputePipelineState>> pipeline_cache;
+
+        if (func_name.empty()) {
+            func_name = shader_name;
+        }
         
-        auto it = pipeline_cache.find(shader_name);
+        auto it = pipeline_cache.find(func_name);
         if (it != pipeline_cache.end() && it->second != nil) {
             std::cout << "[DEBUG] Using cached pipeline: " << shader_name << std::endl;
             return it->second;
@@ -904,7 +1035,7 @@ id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shad
         }
         
         // 3. ライブラリから関数取得
-        NSString* function_name = [NSString stringWithUTF8String:shader_name.c_str()];
+        NSString* function_name = [NSString stringWithUTF8String:func_name.c_str()];
         id<MTLFunction> function = [library newFunctionWithName:function_name];
         
         if (!function) {
@@ -926,7 +1057,7 @@ id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shad
         }
         
         // 5. キャッシュに保存
-        pipeline_cache[shader_name] = pipeline;
+        pipeline_cache[func_name] = pipeline;
         std::cout << "[DEBUG] Pipeline compiled and cached: " << shader_name << std::endl;
         
         return pipeline;

@@ -17,126 +17,6 @@
 
 namespace libraw_enhanced {
 
-class MicroContrastEnhancer {
-private:    
-    // ガウシアンカーネルの生成
-    std::vector<std::vector<float>> createGaussianKernel(int size, float sigma) {
-        std::vector<std::vector<float>> kernel(size, std::vector<float>(size));
-        float sum = 0.0f;
-        int center = size / 2;
-        
-        for (int i = 0; i < size; i++) {
-            for (int j = 0; j < size; j++) {
-                float x = i - center;
-                float y = j - center;
-                kernel[i][j] = exp(-(x*x + y*y) / (2.0f * sigma * sigma));
-                sum += kernel[i][j];
-            }
-        }
-        
-        // 正規化
-        for (int i = 0; i < size; i++) {
-            for (int j = 0; j < size; j++) {
-                kernel[i][j] /= sum;
-            }
-        }
-        
-        return kernel;
-    }
-    
-    // 輝度値の計算 (RGB → Luminance)
-    inline float getLuminance(float r, float g, float b) {
-        return 0.299f * r + 0.587f * g + 0.114f * b;
-    }
-    
-    // ガウシアンブラーの適用
-    void applyGaussianBlur(ImageBufferFloat& rgb_buffer, float (*blurred)[3], 
-                          const std::vector<std::vector<float>>& kernel) {
-        const int width = rgb_buffer.width;
-        const int height = rgb_buffer.height;
-        const float (*image)[3] = rgb_buffer.image;
-        int kernel_size = kernel.size();
-        int kernel_center = kernel_size / 2;
-        
-#ifdef _OPENMP
-        #pragma omp parallel for collapse(2)
-#endif
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                float r = 0.0f, g = 0.0f, b = 0.0f;
-                
-                for (int ky = 0; ky < kernel_size; ky++) {
-                    for (int kx = 0; kx < kernel_size; kx++) {
-                        int px = std::clamp(x + kx - kernel_center, 0, width - 1);
-                        int py = std::clamp(y + ky - kernel_center, 0, height - 1);
-                        
-                        int idx = py * width + px;
-                        float weight = kernel[ky][kx];
-                        
-                        r += image[idx][0] * weight;
-                        g += image[idx][1] * weight;
-                        b += image[idx][2] * weight;
-                    }
-                }
-                
-                int idx = y * width + x;
-                blurred[idx][0] = r;
-                blurred[idx][1] = g;
-                blurred[idx][2] = b;
-            }
-        }
-    }
-    
-public:    
-    // メインの処理関数
-    void enhanceMicroContrast(ImageBufferFloat& rgb_buffer, float threshold, float contrast_strength) {
-        const int width = rgb_buffer.width;
-        const int height = rgb_buffer.height;
-        float (*image)[3] = rgb_buffer.image;
-
-        // 処理用のバッファを確保
-        std::vector<float> blurred_data(height * width * 3);
-        float (*blurred)[3] = reinterpret_cast<float(*)[3]>(blurred_data.data());
-        
-        // ガウシアンカーネルの生成（マイクロコントラスト用）
-        auto kernel = createGaussianKernel(5, 1.f);
-        
-        // ハイライト領域の輝度差を明確にする
-        float scale = 1.2f;
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (int i = 0; i < width * height; i++) {
-            // しきい値以上の領域のみ処理
-            if (image[i][1] > 1.f) {
-                image[i][0] = std::pow(std::max(image[i][0], 0.f), scale);
-                image[i][1] = std::pow(std::max(image[i][1], 0.f), scale);
-                image[i][2] = std::pow(std::max(image[i][2], 0.f), scale);
-            }
-        }
-
-        // ガウシアンブラーの適用
-        applyGaussianBlur(rgb_buffer, blurred, kernel);
-        
-        // マイクロコントラストの適用
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (int i = 0; i < width * height; i++) {
-            //float luminance = getLuminance(image[i][0], image[i][1], image[i][2]);
-            
-            // しきい値以上の領域のみ処理
-            if (image[i][1] >= threshold) {
-                // マイクロコントラストを適用
-                image[i][0] = image[i][0] + (image[i][0] - blurred[i][0]) * contrast_strength;
-                image[i][1] = image[i][1] + (image[i][1] - blurred[i][1]) * contrast_strength;
-                image[i][2] = image[i][2] + (image[i][2] - blurred[i][2]) * contrast_strength;
-            }
-        }
-
-    }
-};
-
 class LibRawWrapper::Impl {
 public:
     LibRaw processor;
@@ -490,8 +370,123 @@ public:
     }
 
     //===============================================================
+    // LibRaw recover_highlights equivalent for float32 processing
+    //===============================================================
+
+    bool recover_highlights(ImageBufferFloat& rgb_buffer, float saturation_threshold) {
+        std::cout << "🔧 Starting highlight recovery... sat: " << saturation_threshold << std::endl;
+        
+        const size_t width = rgb_buffer.width;
+        const size_t height = rgb_buffer.height;
+        const size_t channels = rgb_buffer.channels;
+
+        // ハイライト部のR/G, B/G比を求める
+        float grf = 0.f, gbf = 0.f, count = 0.f;
+        std::deque<int> highlight;  // ついでに処理ハイライト処理するピクセルインデクスを保持
+        for (size_t idx = 0; idx < width * height; ++idx) {
+            float* pixel = rgb_buffer.image[idx];
+
+            if (pixel[0] >= saturation_threshold &&
+                pixel[2] >= saturation_threshold)
+            {
+                {
+                    highlight.push_back(idx);   // ハイライト
+                }
+                if (pixel[0] <  0.95f &&
+                    pixel[1] >= saturation_threshold && pixel[1] < 0.95f &&
+                    pixel[2] <  0.95f)
+                {
+                    // ハイライトだが、白飛びしてないピクセルの比率を平均化する
+                    grf += pixel[0] / pixel[1];
+                    gbf += pixel[2] / pixel[1];
+                    count += 1.f;
+                }
+            }
+        }
+        if (count > 0.f) {
+            grf /= count;
+            gbf /= count;
+        } else {
+            grf = 1.f;
+            gbf = 1.f;
+        }
+
+        // highlight処理
+        std::deque<int> white;  // ついでに完全白飛び部分処理するピクセルインデクスを保持
+        float max_val = 0.f;
+        for (std::deque<int>::iterator it = highlight.begin(); it != highlight.end(); ++it) {
+            const int idx = *it;
+            float* pixel = rgb_buffer.image[idx];
+
+            for (size_t i = 0; i < channels; ++i) {
+                if (pixel[i] > max_val) {
+                    max_val = pixel[i];
+                }
+            }
+
+//            if (pixel[0] >= 0.95f || pixel[2] >= 0.95f) {
+//                if (pixel[0] > pixel[2]) {
+//                    pixel[1] = pixel[0] / grf;
+//                    pixel[1] = pixel[2] / gbf;
+//                } else {
+//                    pixel[1] = pixel[2] / gbf;
+//                    pixel[1] = pixel[0] / grf;
+//                }
+//                pixel[1] = (pixel[0] + pixel[2]) * 0.5f;
+                pixel[1] = (pixel[0] / grf + pixel[2] / gbf) * 0.5f;
+//            }
+
+            float sp = (pixel[0] < pixel[2])? pixel[0] : pixel[2];
+            float sl = (std::min(sp, 1.f) - saturation_threshold) / (saturation_threshold);
+/*
+            pixel[0] = pixel[0] * (1.f-sl) + (pixel[0] * saturation_threshold) * sl;
+            pixel[2] = pixel[2] * (1.f-sl) + (pixel[2] * saturation_threshold) * sl;
+            pixel[1] = (pixel[0] + pixel[2]) * 0.5f;
+*/
+            pixel[0] = pixel[0] * (1.f-sl) + (pixel[1] * grf) * sl;
+            pixel[2] = pixel[2] * (1.f-sl) + (pixel[1] * gbf) * sl;
+            pixel[1] = (pixel[0] / grf + pixel[2] / gbf) * 0.5f;
+
+            if (pixel[1] >= 0.95f) {
+                white.push_back(idx);   // 白飛び
+            }
+        }
+        std::cout << "　 Before max value: " << max_val << std::endl;
+
+        // 白飛び部分のピクセルを馴染ませる
+        float (*image)[3] = rgb_buffer.image;
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(white.begin(), white.end(), g);
+        for (std::deque<int>::iterator it = white.begin(); it != white.end(); ++it) {
+            const int idx = *it;
+            size_t x = idx / width;
+            size_t y = idx % width;
+            if (x <= 0 || x >= width -2 || y <= 0 || y >= height -2) {
+                continue;
+            }
+
+            for (size_t c = 0; c < channels; ++c) {
+                float avg = image[idx - width - 1][c]
+                          + image[idx - width + 0][c]
+                          + image[idx - width + 1][c]
+                          + image[idx - 1][c]
+                          + image[idx + 1][c]
+                          + image[idx + width - 1][c]
+                          + image[idx + width + 0][c]
+                          + image[idx + width + 1][c];
+                image[idx][c] = avg * (1.f / 8.f);
+            }
+        }
+
+        std::cout << "✅ Highlight recovery completed. Highlight: " << highlight.size() << " pixels.  White: " << white.size() << " pixels." << std::endl;
+        return max_val;
+    }
+
+    //===============================================================
     // Main RAW to RGB processing pipeline
     //===============================================================
+    
     bool process_raw_to_rgb(ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const ProcessingParams& params) {
         std::cout << "🎯 Starting unified RAW→RGB processing pipeline" << std::endl;
         std::cout << "📋 Parameters: demosaic=" << params.demosaic_algorithm << std::endl;
@@ -587,22 +582,20 @@ public:
             return false;
         }
 
-        float threshold = maximum_result.maximum / maximum_result.data_maximum * 0.75;
+        float threshold = maximum_result.maximum / maximum_result.data_maximum ;
 
         // Highlight recovery
         if (params.highlight_mode > 2) {
-            recover_highlights(rgb_buffer, threshold);
-        }
-
-        // Highlight detail recovery
-        if (params.highlight_mode > 3) {
-            MicroContrastEnhancer enhancer;
-            enhancer.enhanceMicroContrast(rgb_buffer, threshold, 1.2f);
-            enhancer.enhanceMicroContrast(rgb_buffer, threshold * 3.f, 1.8f);
+            recover_highlights(rgb_buffer, threshold * 0.75);
         }
 
         // Tone mapping
         accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
+
+        // Highlight detail recovery
+        if (params.highlight_mode > 3) {
+            accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, 0.06f);
+        }
 
         // Get camera-specific color transformation matrix
         camera_matrix = compute_camera_transform(camera_make, camera_model, params.output_color_space);
@@ -1070,7 +1063,6 @@ public:
             set_processing_params(defaults);
         }
         
-#ifdef __arm64__
         // Use unified pipeline for accelerated processing
         if (accelerator && accelerator->is_available()) {
             std::cout << "🚀 Using unified accelerated pipeline (automatic GPU/CPU selection)" << std::endl;
@@ -1079,7 +1071,6 @@ public:
             std::cout << "🔧 Converting raw sensor data to processed image format..." << std::endl;
             int raw2image_result = convert_raw_to_image();
             if (raw2image_result != 0) {
-                std::cerr << "❌ Raw to image conversion failed: " << raw2image_result << std::endl;
                 return false;
             }
             
@@ -1101,14 +1092,14 @@ public:
             // Use unified processing pipeline
             if (process_raw_to_rgb(raw_buffer, rgb_buffer, current_params)) {
                 timing_info.total_time = get_elapsed_time();
-                                
                 return LIBRAW_SUCCESS;
+
             } else {
                 std::cout << "❌ Unified pipeline failed, NO FALLBACK (testing mode)" << std::endl;
                 return LIBRAW_UNSPECIFIED_ERROR;  // フォールバック無効
             }
         }
-#endif
+
         // FALLBACK DISABLED FOR TESTING
         std::cout << "❌ LibRaw dcraw_process fallback DISABLED for testing" << std::endl;
         timing_info.total_time = get_elapsed_time();
@@ -1293,119 +1284,7 @@ public:
                   ptr);
         
         return result;
-    }
-    
-    // LibRaw recover_highlights equivalent for float32 processing
-    bool recover_highlights(ImageBufferFloat& rgb_buffer, float saturation_threshold) {
-        std::cout << "🔧 Starting highlight recovery... sat: " << saturation_threshold << std::endl;
-        
-        const size_t width = rgb_buffer.width;
-        const size_t height = rgb_buffer.height;
-        const size_t channels = rgb_buffer.channels;
-
-        // ハイライト部のR/G, B/G比を求める
-        float grf = 0.f, gbf = 0.f, count = 0.f;
-        std::deque<int> highlight;  // ついでに処理ハイライト処理するピクセルインデクスを保持
-        for (size_t idx = 0; idx < width * height; ++idx) {
-            float* pixel = rgb_buffer.image[idx];
-
-            if (pixel[0] >= saturation_threshold &&
-                pixel[2] >= saturation_threshold)
-            {
-                {
-                    highlight.push_back(idx);   // ハイライト
-                }
-                if (pixel[0] <  0.95f &&
-                    pixel[1] >= saturation_threshold && pixel[1] < 0.95f &&
-                    pixel[2] <  0.95f)
-                {
-                    // ハイライトだが、白飛びしてないピクセルの比率を平均化する
-                    grf += pixel[0] / pixel[1];
-                    gbf += pixel[2] / pixel[1];
-                    count += 1.f;
-                }
-            }
-        }
-        if (count > 0.f) {
-            grf /= count;
-            gbf /= count;
-        } else {
-            grf = 1.f;
-            gbf = 1.f;
-        }
-
-        // highlight処理
-        std::deque<int> white;  // ついでに完全白飛び部分処理するピクセルインデクスを保持
-        float max_val = 0.f;
-        for (std::deque<int>::iterator it = highlight.begin(); it != highlight.end(); ++it) {
-            const int idx = *it;
-            float* pixel = rgb_buffer.image[idx];
-
-            for (size_t i = 0; i < channels; ++i) {
-                if (pixel[i] > max_val) {
-                    max_val = pixel[i];
-                }
-            }
-
-//            if (pixel[0] >= 0.95f || pixel[2] >= 0.95f) {
-//                if (pixel[0] > pixel[2]) {
-//                    pixel[1] = pixel[0] / grf;
-//                    pixel[1] = pixel[2] / gbf;
-//                } else {
-//                    pixel[1] = pixel[2] / gbf;
-//                    pixel[1] = pixel[0] / grf;
-//                }
-//                pixel[1] = (pixel[0] + pixel[2]) * 0.5f;
-                pixel[1] = (pixel[0] / grf + pixel[2] / gbf) * 0.5f;
-//            }
-
-            float sp = (pixel[0] < pixel[2])? pixel[0] : pixel[2];
-            float sl = (std::min(sp, 1.f) - saturation_threshold) / (saturation_threshold);
-/*
-            pixel[0] = pixel[0] * (1.f-sl) + (pixel[0] * saturation_threshold) * sl;
-            pixel[2] = pixel[2] * (1.f-sl) + (pixel[2] * saturation_threshold) * sl;
-            pixel[1] = (pixel[0] + pixel[2]) * 0.5f;
-*/
-            pixel[0] = pixel[0] * (1.f-sl) + (pixel[1] * grf) * sl;
-            pixel[2] = pixel[2] * (1.f-sl) + (pixel[1] * gbf) * sl;
-            pixel[1] = (pixel[0] / grf + pixel[2] / gbf) * 0.5f;
-
-            if (pixel[1] >= 0.95f) {
-                white.push_back(idx);   // 白飛び
-            }
-        }
-        std::cout << "　 Before max value: " << max_val << std::endl;
-
-        // 白飛び部分のピクセルを馴染ませる
-        float (*image)[3] = rgb_buffer.image;
-        std::random_device rd;
-        std::mt19937 g(rd());
-        std::shuffle(white.begin(), white.end(), g);
-        for (std::deque<int>::iterator it = white.begin(); it != white.end(); ++it) {
-            const int idx = *it;
-            size_t x = idx / width;
-            size_t y = idx % width;
-            if (x <= 0 || x >= width -2 || y <= 0 || y >= height -2) {
-                continue;
-            }
-
-            for (size_t c = 0; c < channels; ++c) {
-                float avg = image[idx - width - 1][c]
-                          + image[idx - width + 0][c]
-                          + image[idx - width + 1][c]
-                          + image[idx - 1][c]
-                          + image[idx + 1][c]
-                          + image[idx + width - 1][c]
-                          + image[idx + width + 0][c]
-                          + image[idx + width + 1][c];
-                image[idx][c] = avg * (1.f / 8.f);
-            }
-        }
-
-        std::cout << "✅ Highlight recovery completed. Highlight: " << highlight.size() << " pixels.  White: " << white.size() << " pixels." << std::endl;
-        return max_val;
-    }
-
+    }    
 #endif
 };
 

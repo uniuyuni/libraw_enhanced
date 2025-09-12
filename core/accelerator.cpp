@@ -372,7 +372,7 @@ bool Accelerator::gamma_correct(const ImageBufferFloat& rgb_input,
 }
 
 //===================================================================
-// Gamma Correct
+// Tone Mapping
 //===================================================================
 
 bool Accelerator::tone_mapping(const ImageBufferFloat& rgb_input,
@@ -394,6 +394,33 @@ bool Accelerator::tone_mapping(const ImageBufferFloat& rgb_input,
         return true;
     }
     std::cout << "❌ CPU tone mapping failed" << std::endl;
+    return false;
+}
+
+//===================================================================
+// Enhance Micro Contrast
+//===================================================================
+
+bool Accelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
+                                    ImageBufferFloat& rgb_output,
+                                    float threshold,
+                                    float strength,
+                                    float target_contrast) {
+    if (should_use_gpu()) {
+        std::cout << "🎯 Trying GPU enhance micro contrast..." << std::endl;
+        if (pimpl_->gpu_accelerator->enhance_micro_contrast(rgb_input, rgb_output, threshold, strength, target_contrast)) {
+            std::cout << "✅ GPU enhance micro contrast completed successfully" << std::endl;
+            return true;
+        }
+        std::cout << "⚠️ GPU enhance micro contrast failed, falling back to CPU" << std::endl;
+    }
+    
+    std::cout << "🔧 Using CPU enhance micro contrast" << std::endl;
+    if (pimpl_->cpu_accelerator->enhance_micro_contrast(rgb_input, rgb_output, threshold, strength, target_contrast)) {
+        std::cout << "✅ CPU enhance micro contrast completed successfully" << std::endl;
+        return true;
+    }
+    std::cout << "❌ CPU enhance micro contrast failed" << std::endl;
     return false;
 }
 

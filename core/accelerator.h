@@ -266,9 +266,17 @@ public:
                         float gamma_slope = 0.f, //4.5f,
                         int output_color_space = 1); // 1=sRGB, 2=Adobe RGB, etc.
     
+    // Tone Mapping method
     bool tone_mapping(const ImageBufferFloat& rgb_input,
                         ImageBufferFloat& rgb_output,
                         float after_scale);
+
+    // Enhance Micro Contrast
+    bool enhance_micro_contrast(const ImageBufferFloat& rgb_input,
+                        ImageBufferFloat& rgb_output,
+                        float threshold,
+                        float strength,
+                        float target_contrast=0.06);
 
 private:
     class Impl;

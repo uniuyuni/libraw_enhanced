@@ -92,4 +92,13 @@ typedef struct {
     float after_scale;
 } ToneMappingParams;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float threshold;
+    float strength;
+    float target_contrast;
+    float max_local_std; // metalが書き込むワーク 0.f 初期化
+} EnhanceMicroContrastParams;
+
 #endif /* shader_types_h */

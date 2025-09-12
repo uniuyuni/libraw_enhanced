@@ -76,13 +76,20 @@ public:
                             ImageBufferFloat& rgb_output,
                             float after_scale);
 
+    bool enhance_micro_contrast(const ImageBufferFloat& rgb_input,
+                            ImageBufferFloat& rgb_output,
+                            float threshold,
+                            float strength,
+                            float target_contrast);
+
 private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;
         
     // 遅延ロード + メモリキャッシュ方式
 #ifdef __OBJC__
-    id<MTLComputePipelineState> get_pipeline(const std::string& shader_name);  // 必要時にパイプライン取得
+
+    id<MTLComputePipelineState> get_pipeline(const std::string& shader_name, std::string func_name="");  // 必要時にパイプライン取得
     id<MTLLibrary> compile_and_cache_shader(const std::string& shader_name);   // 個別シェーダーコンパイル（メモリキャッシュのみ）
     std::string load_shader_file(const std::string& filename);
 #endif    

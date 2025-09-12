@@ -15,6 +15,7 @@
 #include <Accelerate/Accelerate.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#include <simd/simd.h>
 #endif
 #endif
 
@@ -46,7 +47,7 @@ bool CPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
     if (!initialized_) return false;
 
     // 引数チェック
-    if (!rgb_buffer.is_valid() || !rgb_buffer.is_valid()) {
+    if (!raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         std::cerr << "❌ Invalid or mismatched buffers for white balance" << std::endl;
         return false;
     }
@@ -2918,29 +2919,236 @@ void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint
 bool CPUAccelerator::tone_mapping(const ImageBufferFloat& rgb_input,
                                ImageBufferFloat& rgb_output,
                                float after_scale) {
+                                
+    if (!initialized_) return false;
 
-        auto acesToneMap = [](float x) {
-            static constexpr float a = 2.51f;
-            static constexpr float b = 0.03f;
-            static constexpr float c = 2.43f;
-            static constexpr float d = 0.59f;
-            static constexpr float e = 0.14f;
-            
-            return (x * (a * x + b)) / (x * (c * x + d) + e);
-        };
+    // 引数チェック
+    if (!rgb_input.is_valid() || !rgb_output.is_valid()) {
+        std::cerr << "❌ Invalid or mismatched buffers for tone mapping" << std::endl;
+        return false;
+    }
+
+    auto acesToneMap = [](float x) {
+        static constexpr float a = 2.51f;
+        static constexpr float b = 0.03f;
+        static constexpr float c = 2.43f;
+        static constexpr float d = 0.59f;
+        static constexpr float e = 0.14f;
+        
+        return (x * (a * x + b)) / (x * (c * x + d) + e);
+    };
 
 #ifdef _OPENMP
-        #pragma omp parallel for
+    #pragma omp parallel for
 #endif
-        for (size_t idx = 0; idx < rgb_output.width * rgb_output.height; ++idx) {
-            float* in = rgb_input.image[idx];
-            float* out = rgb_output.image[idx];
+    for (size_t idx = 0; idx < rgb_output.width * rgb_output.height; ++idx) {
+        float* in = rgb_input.image[idx];
+        float* out = rgb_output.image[idx];
 
-            out[0] = acesToneMap(in[0]) * after_scale;
-            out[1] = acesToneMap(in[1]) * after_scale;
-            out[2] = acesToneMap(in[2]) * after_scale;
+        out[0] = acesToneMap(in[0]) * after_scale;
+        out[1] = acesToneMap(in[1]) * after_scale;
+        out[2] = acesToneMap(in[2]) * after_scale;
+    }
+    return true;
+}
+
+//===================================================================
+// ハイライトのマイクロコントラスト強調
+//===================================================================
+
+namespace { // This file is for internal use only
+
+// ガウシアンカーネルの生成
+std::vector<std::vector<float>> create_gaussian_kernel(int size, float sigma) {
+    std::vector<std::vector<float>> kernel(size, std::vector<float>(size));
+    float sum = 0.0f;
+    int center = size / 2;
+    
+    for (int i = 0; i < size; i++) {
+        for (int j = 0; j < size; j++) {
+            float x = i - center;
+            float y = j - center;
+            kernel[i][j] = exp(-(x*x + y*y) / (2.0f * sigma * sigma));
+            sum += kernel[i][j];
         }
-        return true;
-   }
+    }
+    
+    // 正規化
+    for (int i = 0; i < size; i++) {
+        for (int j = 0; j < size; j++) {
+            kernel[i][j] /= sum;
+        }
+    }
+    
+    return kernel;
+}
+
+// 輝度値の計算 (RGB → Luminance)
+inline float getLuminance(float r, float g, float b) {
+    return 0.299f * r + 0.587f * g + 0.114f * b;
+}
+  
+// ガウシアンブラーの適用
+void apply_gaussian_blur(const vector_float3* image, vector_float3* blurred, int width, int height,
+                        const std::vector<std::vector<float>>& kernel) {
+    int kernel_size = kernel.size();
+    int kernel_center = kernel_size / 2;
+    
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            vector_float3 rgb = simd_make_float3(0.f);
+            
+            for (int ky = 0; ky < kernel_size; ky++) {
+                for (int kx = 0; kx < kernel_size; kx++) {
+                    uint32_t px = std::clamp(x + kx - kernel_center, 0, width - 1);
+                    uint32_t py = std::clamp(y + ky - kernel_center, 0, height - 1);
+
+                    float weight = kernel[ky][kx];
+                    rgb += image[py * width + px] * weight;
+                }
+            }
+            blurred[y * width + x] = rgb;
+        }
+    }
+}   
+
+} // namespace
+
+bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
+                                            ImageBufferFloat& rgb_output,
+                                            float threshold,
+                                            float strength,
+                                            float target_contrast) {
+    if (!initialized_) return false;
+
+    // 引数チェック
+    if (!rgb_input.is_valid() || !rgb_output.is_valid()) {
+        std::cerr << "❌ Invalid or mismatched buffers for enhance micro contrast" << std::endl;
+        return false;
+    }
+    
+    uint32_t width = rgb_input.width;
+    uint32_t height = rgb_input.height;
+
+    std::vector<vector_float3> I_data(height * width);
+    vector_float3* I = I_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        I[idx] = simd_make_float3(rgb_input.image[idx][0], rgb_input.image[idx][1], rgb_input.image[idx][2]);
+    }
+
+    int kernel_size = 5;
+
+    // カーネル作成
+    auto kernel = create_gaussian_kernel(kernel_size, 1.f);
+
+    // 局所平均の計算
+    std::vector<vector_float3> local_mean_data(height * width);
+    vector_float3* local_mean = local_mean_data.data();
+    apply_gaussian_blur(I, local_mean, width, height, kernel);
+
+    // 局所標準偏差の計算
+    std::vector<vector_float3> Ixx2_data(height * width);
+    vector_float3* Ixx2 = Ixx2_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        Ixx2[idx] = I[idx] * I[idx];
+    }
+    std::vector<vector_float3> local_var_data(height * width);
+    vector_float3* local_var = local_var_data.data();
+    apply_gaussian_blur(Ixx2, local_var, width, height, kernel);
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        local_var[idx] = local_var[idx] - local_mean[idx] * local_mean[idx];
+    }
+
+    // コントラストマップの正規化
+    std::vector<vector_float3> local_std_data(height * width);
+    vector_float3* local_std = local_std_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        local_std[idx][0] = std::sqrt(std::max(local_var[idx][0], 0.f));
+        local_std[idx][1] = std::sqrt(std::max(local_var[idx][1], 0.f));
+        local_std[idx][2] = std::sqrt(std::max(local_var[idx][2], 0.f));
+    }
+
+    float max_local_std = 0.f;
+    for (const auto& v : local_std_data) {
+        max_local_std = std::max(max_local_std, std::max(std::max(v[0], v[1]), v[2]));
+    }
+
+    std::vector<vector_float3> contrast_map_data(height * width);
+    vector_float3* contrast_map = contrast_map_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        contrast_map[idx] = local_std[idx] / max_local_std;
+    }
+
+    // 強調係数の計算 - コントラストが低い領域ほど強く強調
+    std::vector<vector_float3> enhance_factor_data(height * width);
+    vector_float3* enhance_factor = enhance_factor_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        enhance_factor[idx] = {
+            (contrast_map[idx][0] < target_contrast)? strength * (target_contrast - contrast_map[idx][0]) / target_contrast : 0.f,
+            (contrast_map[idx][1] < target_contrast)? strength * (target_contrast - contrast_map[idx][1]) / target_contrast : 0.f,
+            (contrast_map[idx][2] < target_contrast)? strength * (target_contrast - contrast_map[idx][2]) / target_contrast : 0.f
+        };
+    }
+
+    // 高周波成分の抽出
+    std::vector<vector_float3> high_freq_data(height * width);
+    vector_float3* high_freq = high_freq_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        high_freq[idx] = I[idx] - local_mean[idx];
+    }
+
+    // 適応的な強調
+    std::vector<vector_float3> enhanced_high_freq_data(height * width);
+    vector_float3* enhanced_high_freq = enhanced_high_freq_data.data();
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        enhanced_high_freq[idx] = high_freq[idx] * (1.f + enhance_factor[idx]);
+    }
+
+    // 画像の再構成
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (uint32_t idx = 0; idx < width * height; ++idx) {
+        if (I[idx][1] >= threshold) {
+            rgb_output.image[idx][0] = local_mean[idx][0] + enhanced_high_freq[idx][0];
+            rgb_output.image[idx][1] = local_mean[idx][1] + enhanced_high_freq[idx][1];
+            rgb_output.image[idx][2] = local_mean[idx][2] + enhanced_high_freq[idx][2];
+        } else {
+            rgb_output.image[idx][0] = rgb_input.image[idx][0];
+            rgb_output.image[idx][1] = rgb_input.image[idx][1];
+            rgb_output.image[idx][2] = rgb_input.image[idx][2];
+        }
+    }
+
+    return true;
+}
+
 
 } // namespace libraw_enhanced
