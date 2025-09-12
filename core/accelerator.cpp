@@ -66,7 +66,7 @@ std::string Accelerator::get_device_info() const {
 // Pre interpolate
 //===================================================================
 
-bool Accelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
+bool Accelerator::pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
     if (should_use_gpu()) {
         // GPU accelerator needs to be updated for pre-interpolation
         // For now, fallback to CPU immediately
@@ -74,7 +74,7 @@ bool Accelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, c
     }
     
     std::cout << "🔧 Using CPU pre-interpolation" << std::endl;
-    if (pimpl_->cpu_accelerator->pre_interpolate(image_buffer, filters, xtrans, half_size)) {
+    if (pimpl_->cpu_accelerator->pre_interpolate(rgb_buffer, filters, xtrans, half_size)) {
         std::cout << "✅ Pre-interpolation completed successfully" << std::endl;
         return true;
     }
@@ -279,17 +279,28 @@ bool Accelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
 // Apply white balance
 //===================================================================
 
-bool Accelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
-                                            ImageBufferFloat& rgb_output,
-                                            const float wb_multipliers[4]) {
+bool Accelerator::apply_white_balance(const ImageBuffer& raw_buffer,
+                        ImageBufferFloat& rgb_buffer,
+                        const float wb_multipliers[4],
+                        uint32_t filters,
+                        const char xtrans[6][6]) {
+
     if (should_use_gpu()) {
-        // GPU accelerator needs to be updated to accept ImageBufferFloat
-        // For now, fallback to CPU
-        std::cout << "⚠️  GPU not yet updated for ImageBufferFloat, falling back to CPU" << std::endl;
+        std::cout << "🎯 Trying GPU apply white balance..." << std::endl;
+        if (pimpl_->gpu_accelerator->apply_white_balance(raw_buffer, rgb_buffer, wb_multipliers, filters, xtrans)) {
+            std::cout << "✅ GPU apply white balance completed successfully" << std::endl;
+            return true;
+        }
+        std::cout << "⚠️ GPU apply white balance failed, falling back to CPU" << std::endl;
     }
     
-    std::cout << "🔧 Using CPU white balance on RAW" << std::endl;
-    return pimpl_->cpu_accelerator->apply_white_balance(rgb_input, rgb_output, wb_multipliers);
+    std::cout << "🔧 Using CPU apply white balance" << std::endl;
+    if (pimpl_->cpu_accelerator->apply_white_balance(raw_buffer, rgb_buffer, wb_multipliers, filters, xtrans)) {
+        std::cout << "✅ CPU capply white balance completed successfully" << std::endl;
+        return true;
+    }
+    std::cout << "❌ CPU apply white balance failed" << std::endl;
+    return false;
 }
 
 //===================================================================

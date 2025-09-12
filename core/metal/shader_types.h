@@ -67,6 +67,8 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     float multipliers[4];    // RGBG white balance multipliers
+    uint32_t filters;
+    char xtrans[6][6];
 } WhiteBalanceParams;
 
 typedef struct {

@@ -34,22 +34,115 @@ bool CPUAccelerator::is_available() const { return initialized_; }
 void CPUAccelerator::release_resources() { initialized_ = false; }
 
 //===================================================================
+// ホワイトバランス
+//===================================================================
+
+bool CPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
+                                        ImageBufferFloat& rgb_buffer,
+                                        const float wb_multipliers[4],
+                                        uint32_t filters,
+                                        const char xtrans[6][6]) {
+
+    if (!initialized_) return false;
+
+    // 引数チェック
+    if (!rgb_buffer.is_valid() || !rgb_buffer.is_valid()) {
+        std::cerr << "❌ Invalid or mismatched buffers for white balance" << std::endl;
+        return false;
+    }
+    
+    if (filters == FILTERS_XTRANS) {
+        apply_wb_xtrans(raw_buffer, rgb_buffer, wb_multipliers, xtrans);
+    } else {
+        apply_wb_bayer(raw_buffer, rgb_buffer, wb_multipliers, filters);
+    }
+
+    return true;
+}
+
+// Bayer CFA white balance implementation
+void CPUAccelerator::apply_wb_bayer(
+    const ImageBuffer& raw_buffer,
+    ImageBufferFloat& rgb_buffer,
+    const float wb_multipliers[4],
+    uint32_t filters
+) {
+    const size_t total_pixels = raw_buffer.width * raw_buffer.height;
+    
+    // Process each pixel in the raw buffer
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
+        int row = pixel_idx / raw_buffer.width;
+        int col = pixel_idx % raw_buffer.width;
+        
+        // Get color channel for this pixel position using LibRaw's fcol logic
+        int color_channel = (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
+        
+        // Apply white balance multiplier to the native color channel
+        uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
+        float adjusted_value = original_value * wb_multipliers[color_channel];
+
+        if (color_channel == 3) {
+            rgb_buffer.image[pixel_idx][1] = adjusted_value;
+        } else {
+            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
+        }
+    }
+    
+    std::cout << "✅ Bayer WB process completed" << std::endl;
+}
+
+// X-Trans CFA white balance implementation
+void CPUAccelerator::apply_wb_xtrans(
+    const ImageBuffer& raw_buffer,
+    ImageBufferFloat& rgb_buffer,
+    const float wb_multipliers[4],
+    const char xtrans[6][6]
+) {
+    const size_t total_pixels = raw_buffer.width * raw_buffer.height;
+    
+    // Process each pixel in the raw buffer
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
+        int row = pixel_idx / raw_buffer.width;
+        int col = pixel_idx % raw_buffer.width;
+        
+        // Get color channel using X-Trans pattern
+        int color_channel = xtrans[row % 6][col % 6];
+        
+        // Apply white balance multiplier to the native color channel
+        uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
+        float adjusted_value = original_value * wb_multipliers[color_channel];
+                    
+        rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
+    }
+    
+    std::cout << "✅ X-Trans WB process completed" << std::endl;
+}
+
+//===================================================================
 // Pre-interpolation
 //===================================================================
 
-bool CPUAccelerator::pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
-    if (!image_buffer.is_valid()) return false;
-    uint16_t (*image)[4] = image_buffer.image;
-    size_t width = image_buffer.width, height = image_buffer.height;
+bool CPUAccelerator::pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size) {
+    if (!rgb_buffer.is_valid()) return false;
+    float (*image)[3] = rgb_buffer.image;
+    size_t width = rgb_buffer.width, height = rgb_buffer.height;
     std::cout << "📋 Pre-interpolation: " << width << "x" << height << " (filters=" << filters << ", half_size=" << half_size << ")" << std::endl;
+
     if (half_size && filters == FILTERS_XTRANS) {
         size_t row, col;
-        for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
+//      for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
+        for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (image[row * width + col][0] != 0.f && image[row * width + col][2] != 0.f) goto break_outer;
         break_outer:
         for (; row < height; row += 3)
             for (size_t col_start = (col - 1) % 3 + 1; col_start < width - 1; col_start += 3)
                 for (int c = 0; c < 3; c += 2)
-                    image[row * width + col_start][c] = (image[row * width + col_start - 1][c] + image[row * width + col_start + 1][c]) >> 1;
+                    image[row * width + col_start][c] = (image[row * width + col_start - 1][c] + image[row * width + col_start + 1][c]) * 0.5f;
     }
     return true;
 }
@@ -2659,50 +2752,6 @@ bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageB
     XTrans_Processor processor(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value);
     processor.run_3pass();
     return true;
-}
-
-//===================================================================
-// ホワイトバランス
-//===================================================================
-
-bool CPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input,
-                                        ImageBufferFloat& rgb_output,
-                                        const float wb_multipliers[4]) {
-
-    if (!initialized_) return false;
-
-    // 引数チェック
-    if (!rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
-        std::cerr << "❌ Invalid or mismatched buffers for white balance" << std::endl;
-        return false;
-    }
-
-    const vDSP_Length pixel_count = rgb_input.width * rgb_input.height;
-
-    // バッファが違ったらコピー
-    if (rgb_input.image != rgb_output.image) {
-        std::memcpy(rgb_output.image, rgb_input.image, pixel_count * 3 * sizeof(float));
-    }
-    
-#if defined(__ARM_NEON)
-    std::cout << "🎯 White Balance (Accelerate/vDSP): multipliers [R=" << wb_multipliers[0] 
-              << ", G=" << wb_multipliers[1] << ", B=" << wb_multipliers[2] << "]" << std::endl;
-        
-    // ✨ vDSP を使った超高速ホワイトバランス適用
-    float* data = &rgb_output.image[0][0]; // 連続メモリアクセス用
-    vDSP_vsmul(data + 0, 3, &wb_multipliers[0], data + 0, 3, pixel_count);
-    vDSP_vsmul(data + 1, 3, &wb_multipliers[1], data + 1, 3, pixel_count);
-    vDSP_vsmul(data + 2, 3, &wb_multipliers[2], data + 2, 3, pixel_count);
-
-    // ✨ vDSP を使ったクリッピング（0.0-1.0 範囲に制限）
-    //float zero = 0.0f, one = 1.0f;
-    //vDSP_vclip(data, 1, &zero, &one, data, 1, pixel_count * 3);
-    
-    return true;
-#else
-    // Apple Silicon 以外のためのフォールバック実装
-    return false;
-#endif
 }
 
 //===================================================================

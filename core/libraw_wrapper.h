@@ -73,6 +73,11 @@ struct ImageInfo {
     ImageInfo() = default;
 };
 
+struct MaximumResult {
+    float data_maximum;
+    float maximum;
+};
+
 // LibRawWrapper クラス宣言
 class LibRawWrapper {
 public:

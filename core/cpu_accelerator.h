@@ -25,8 +25,15 @@ public:
     bool is_available() const;
     void release_resources();
 
+    // White balance methods
+    bool apply_white_balance(const ImageBuffer& raw_buffer,
+                            ImageBufferFloat& rgb_buffer,
+                            const float wb_multipliers[4],
+                            uint32_t filters,
+                            const char xtrans[6][6]);
+
     // Pre-processing methods
-    bool pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, 
+    bool pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, 
                         const char (&xtrans)[6][6], bool half_size = false);
                          
     // Bayer specific acceleration methods
@@ -71,11 +78,6 @@ public:
                                    const char (&xtrans)[6][6],
                                    const float (&color_matrix)[3][4],
                                    uint16_t maximum_value);
-                                                              
-    // White balance methods
-    bool apply_white_balance(const ImageBufferFloat& rgb_input,
-                            ImageBufferFloat& rgb_output,
-                            const float wb_multipliers[4]);
                             
     // Camera matrix-based color space conversion
     bool convert_color_space(const ImageBufferFloat& rgb_input,
@@ -101,6 +103,16 @@ private:
     bool initialized_ = false;
     double last_processing_time_ = 0.0;
     std::string device_name_ = "Apple Silicon CPU";
+
+    void apply_wb_bayer(const ImageBuffer& raw_buffer,
+                        ImageBufferFloat& rgb_buffer,
+                        const float wb_multipliers[4],
+                        uint32_t filters);
+
+    void apply_wb_xtrans(const ImageBuffer& raw_buffer,
+                        ImageBufferFloat& rgb_buffer,
+                        const float wb_multipliers[4],
+                        const char xtrans[6][6]);
 
     float apply_srgb_gamma_encode(float linear_value) const;
     float apply_aces_gamma_encode(float linear_value) const;

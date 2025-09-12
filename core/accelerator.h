@@ -196,9 +196,16 @@ public:
     
     // GPU acceleration control
     void set_use_gpu_acceleration(bool enable);
-    
+
+    // White balance methods
+    bool apply_white_balance(const ImageBuffer& raw_buffer,
+                            ImageBufferFloat& rgb_buffer,
+                            const float wb_multipliers[4],
+                            uint32_t filters,
+                            const char xtrans[6][6]);
+
     // Pre-interpolation processing (border handling, hot pixels, etc.)
-    bool pre_interpolate(ImageBuffer& image_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size = false);
+    bool pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size = false);
     
     // Bayer demosaicing methods
     bool demosaic_bayer_linear(const ImageBuffer& raw_buffer,
@@ -246,12 +253,7 @@ public:
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
                                 uint16_t maximum_value);
-                                   
-    // White balance methods
-    bool apply_white_balance(const ImageBufferFloat& rgb_input,
-                            ImageBufferFloat& rgb_output,
-                            const float wb_multipliers[4]);
-
+                                
     // Camera matrix-based color space conversion
     bool convert_color_space(const ImageBufferFloat& rgb_input,
                             ImageBufferFloat& rgb_output,

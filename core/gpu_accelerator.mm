@@ -81,6 +81,78 @@ std::string GPUAccelerator::get_device_info() const {
 }
 
 //===================================================================
+// Apply White Balance
+//===================================================================
+
+bool GPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
+                        ImageBufferFloat& rgb_buffer,
+                        const float wb_multipliers[4],
+                        uint32_t filters,
+                        const char xtrans[6][6]) {
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    
+    // 遅延ローディングでパイプライン取得
+    id<MTLComputePipelineState> apply_white_balance_pipeline = get_pipeline((filters == FILTERS_XTRANS)? "apply_white_balance_xtrans" : "apply_white_balance_bayer");
+    if (!apply_white_balance_pipeline) {
+        std::cerr << "❌ Failed to get apply white balance pipeline" << std::endl;
+        return false;
+    }
+    
+    @autoreleasepool {
+        size_t pixel_count = raw_buffer.width * raw_buffer.height;
+        
+        id<MTLBuffer> input_buffer = [pimpl_->device newBufferWithBytesNoCopy:&raw_buffer.image[0][0]
+                                                                length:pixel_count * 4 * sizeof(uint16_t)
+                                                                options:MTLResourceStorageModeShared
+                                                                deallocator:nil];
+        
+        id<MTLBuffer> output_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0]
+                                                                length:pixel_count * 3 * sizeof(float)
+                                                                options:MTLResourceStorageModeShared
+                                                                deallocator:nil];
+        
+        WhiteBalanceParams params = {
+            static_cast<uint32_t>(rgb_buffer.width),
+            static_cast<uint32_t>(rgb_buffer.height),
+            {wb_multipliers[0], wb_multipliers[1], wb_multipliers[2], wb_multipliers[3]},
+            filters,
+        };
+        memcpy(params.xtrans, xtrans, sizeof(params.xtrans));
+        
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+                                                                length:sizeof(params)
+                                                                options:MTLResourceStorageModeShared
+                                                                deallocator:nil];
+        
+        id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        
+        [encoder setComputePipelineState:apply_white_balance_pipeline];
+        [encoder setBuffer:input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:output_buffer offset:0 atIndex:1];
+        [encoder setBuffer:params_buffer offset:0 atIndex:2];
+        
+        MTLSize grid_size = MTLSizeMake(rgb_buffer.width, rgb_buffer.height, 1);
+        MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
+        
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+        [encoder endEncoding];
+        
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+        
+        //memcpy(&rgb_output.image[0][0], [output_buffer contents], buffer_size);
+        return true;
+    }
+#else
+    return false;
+#endif
+}
+
+//===================================================================
 // Demosaic Bayer Liner
 //===================================================================
 
@@ -601,70 +673,6 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
 }
 
 //===================================================================
-// Apply White Balance
-//===================================================================
-
-// ImageBufferFloat processing methods
-bool GPUAccelerator::apply_white_balance(const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output, const float wb_multipliers[4]) {
-#ifdef __OBJC__
-    if (!pimpl_->initialized) return false;
-    
-    // 遅延ローディングでパイプライン取得
-    id<MTLComputePipelineState> apply_white_balance_pipeline = get_pipeline("apply_white_balance");
-    if (!apply_white_balance_pipeline) {
-        std::cerr << "❌ Failed to get apply white balance pipeline" << std::endl;
-        return false;
-    }
-    
-    @autoreleasepool {
-        size_t pixel_count = rgb_input.width * rgb_input.height;
-        size_t buffer_size = pixel_count * 3 * sizeof(float);
-        
-        id<MTLBuffer> input_buffer = [pimpl_->device newBufferWithBytes:&rgb_input.image[0][0]
-                                                                 length:buffer_size
-                                                                options:MTLResourceStorageModeShared];
-        
-        id<MTLBuffer> output_buffer = [pimpl_->device newBufferWithLength:buffer_size
-                                                                  options:MTLResourceStorageModeShared];
-        
-        WhiteBalanceParams wb_params = {
-            static_cast<uint32_t>(rgb_input.width),
-            static_cast<uint32_t>(rgb_input.height),
-            {wb_multipliers[0], wb_multipliers[1], wb_multipliers[2], wb_multipliers[3]}
-        };
-        
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&wb_params
-                                                                  length:sizeof(wb_params)
-                                                                 options:MTLResourceStorageModeShared];
-        
-        id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        
-        [encoder setComputePipelineState:apply_white_balance_pipeline];
-        [encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder setBuffer:output_buffer offset:0 atIndex:1];
-        [encoder setBuffer:params_buffer offset:0 atIndex:2];
-        
-        MTLSize thread_group_size = MTLSizeMake(32, 32, 1);
-        MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
-        
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
-        [encoder endEncoding];
-        
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
-        
-        memcpy(&rgb_output.image[0][0], [output_buffer contents], buffer_size);
-        return true;
-    }
-#else
-    return false;
-#endif
-}
-
-//===================================================================
 // Convert Color Space
 //===================================================================
 
@@ -716,7 +724,7 @@ bool GPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
         
         MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
-        MTLSize thread_group_size = MTLSizeMake(32, 32, 1);
+        MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
         
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
 
@@ -784,7 +792,7 @@ bool GPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
         
         MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
-        MTLSize thread_group_size = MTLSizeMake(32, 32, 1);
+        MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
         
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
 
@@ -852,7 +860,7 @@ bool GPUAccelerator::tone_mapping(const ImageBufferFloat& rgb_input,
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
         
         MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
-        MTLSize thread_group_size = MTLSizeMake(32, 32, 1);
+        MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
         
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
 
