@@ -12,7 +12,7 @@ using namespace metal;
 kernel void demosaic_xtrans_border(
     device float* rgb_data [[buffer(0)]],
     const device ushort* raw_data [[buffer(1)]],
-    constant XTransParams& params [[buffer(2)]],
+    constant DemosaicXTransParams& params [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint width = params.width;

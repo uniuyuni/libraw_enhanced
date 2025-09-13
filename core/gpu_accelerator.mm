@@ -112,7 +112,7 @@ bool GPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
                                                                 options:MTLResourceStorageModeShared
                                                                 deallocator:nil];
         
-        WhiteBalanceParams params = {
+        ApplyWhiteBalanceParams params = {
             static_cast<uint32_t>(rgb_buffer.width),
             static_cast<uint32_t>(rgb_buffer.height),
             {wb_multipliers[0], wb_multipliers[1], wb_multipliers[2], wb_multipliers[3]},
@@ -192,7 +192,7 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
                                                             options:MTLResourceStorageModeShared 
                                                             deallocator:nil];
         
-        BayerParams params = {
+        DemosaicBayerParams params = {
             (uint32_t)width,
             (uint32_t)height,
             1,
@@ -324,7 +324,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         float clip_pt = 1.0f / initialGain;
         float clip_pt8 = 0.8f / initialGain;
 
-        BayerParams params = { 
+        DemosaicBayerParams params = { 
             (uint32_t)width, 
             (uint32_t)height, 
             4,
@@ -434,7 +434,7 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
                                                             deallocator:nil];
         
         // Prepare XTrans parameters
-        XTransParams params = {
+        DemosaicXTransParams params = {
             (uint32_t)width,
             (uint32_t)height,
             1u,
@@ -611,7 +611,7 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
                                                             deallocator:nil];
         
         // XTransパラメータ準備
-        XTransParams params = {
+        DemosaicXTransParams params = {
             (uint32_t)width,
             (uint32_t)height,
             8u,
@@ -701,7 +701,7 @@ bool GPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
         
-        ColorSpaceParams params = {
+        ConvertColorSpaceParams params = {
             static_cast<uint32_t>(rgb_input.width),
             static_cast<uint32_t>(rgb_input.height),
             {
@@ -771,7 +771,7 @@ bool GPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
         
-        GammaParams params = {
+        GammaCorrectParams params = {
             static_cast<uint32_t>(rgb_input.width),
             static_cast<uint32_t>(rgb_input.height),
             gamma_power,

@@ -8,7 +8,7 @@
 kernel void demosaic_bayer_linear(
     const device uint16_t* raw_data [[buffer(0)]],
     device float* rgb_data [[buffer(1)]],
-    constant BayerParams& params [[buffer(2)]],
+    constant DemosaicBayerParams& params [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint width = params.width;

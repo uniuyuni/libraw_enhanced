@@ -35,7 +35,7 @@ typedef struct {
     UINT2 grid_size;
     float clip_pt;      // Dynamic clipping threshold
     float clip_pt8;     // Dynamic highlight clipping threshold
-} BayerParams;
+} DemosaicBayerParams;
 
 typedef struct {
     uint32_t width;
@@ -44,7 +44,7 @@ typedef struct {
     float maximum_value;
     char xtrans[6][6];
     uint32_t use_cielab;     // 0=YPbPr, 1=CIELab
-} XTransParams;
+} DemosaicXTransParams;
 
 #define XTRANS_3PASS_TS 114
 #define XTRANS_3PASS_PASSES 3
@@ -69,14 +69,14 @@ typedef struct {
     float multipliers[4];    // RGBG white balance multipliers
     uint32_t filters;
     char xtrans[6][6];
-} WhiteBalanceParams;
+} ApplyWhiteBalanceParams;
 
 typedef struct {
     uint32_t width;
     uint32_t height;
     FLOAT4 transform[3];
     //float transform[3][4];   // 3x4 color transformation matrix
-} ColorSpaceParams;
+} ConvertColorSpaceParams;
 
 typedef struct {
     uint32_t width;
@@ -84,7 +84,7 @@ typedef struct {
     float gamma_power;       // Gamma power value
     float gamma_slope;       // Gamma slope value
     uint32_t output_color_space; // Color space identifier
-} GammaParams;
+} GammaCorrectParams;
 
 typedef struct {
     uint32_t width;

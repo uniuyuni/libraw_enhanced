@@ -9,7 +9,7 @@
 kernel void convert_color_space(
     const device float* rgb_input [[buffer(0)]],
     device float* rgb_output [[buffer(1)]],
-    constant ColorSpaceParams& params [[buffer(2)]],
+    constant ConvertColorSpaceParams& params [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= params.width || gid.y >= params.height) return;

@@ -9,7 +9,7 @@
 // Bayer border interpolation
 kernel void demosaic_bayer_border(
     device float* rgb_data [[buffer(0)]],
-    constant BayerParams& params [[buffer(1)]],
+    constant DemosaicBayerParams& params [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint width = params.width;

@@ -59,7 +59,7 @@ inline float3 apply_pure_power_gamma_encode_with_slope(float3 linear_value, floa
 kernel void gamma_correct(
     const device float* rgb_input [[buffer(0)]],
     device float* rgb_output [[buffer(1)]],
-    constant GammaParams& params [[buffer(2)]],
+    constant GammaCorrectParams& params [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 grid_size [[threads_per_grid]]
 ) {

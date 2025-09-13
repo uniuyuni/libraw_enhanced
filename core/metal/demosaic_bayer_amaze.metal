@@ -18,7 +18,7 @@ struct s_hv { float h; float v; };
 void demosaic_bayer_amaze(
     const device ushort4* raw_buffer    [[buffer(0)]],
     device float* rgb_buffer            [[buffer(1)]],
-    constant BayerParams& params        [[buffer(2)]],
+    constant DemosaicBayerParams& params        [[buffer(2)]],
     device float* rgbgreen_             [[buffer(3)]],
     device float* delhvsqsum_           [[buffer(4)]],
     device float* dirwts0_              [[buffer(5)]],

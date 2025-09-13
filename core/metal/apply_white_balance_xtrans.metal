@@ -9,7 +9,7 @@
 kernel void apply_white_balance_xtrans(
     const device ushort* raw_input [[buffer(0)]],
     device float* rgb_output [[buffer(1)]],
-    constant WhiteBalanceParams& params [[buffer(2)]],
+    constant ApplyWhiteBalanceParams& params [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 grid_size [[threads_per_grid]]
 ) {
