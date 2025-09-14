@@ -480,7 +480,7 @@ public:
         apply_black_level_correction(raw_buffer);
 
         // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
-        adjust_maximum0(raw_buffer, params.adjust_maximum_thr);
+        //adjust_maximum0(raw_buffer, params.adjust_maximum_thr);
 
         // set filters and xtrans
         uint32_t filters = processor.imgdata.idata.filters;        
