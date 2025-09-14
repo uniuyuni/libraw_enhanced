@@ -14,7 +14,6 @@
 
 namespace libraw_enhanced {
 
-
 class CPUAccelerator {
 public:
     CPUAccelerator();
@@ -23,14 +22,7 @@ public:
     // 初期化・状態管理
     bool initialize();
     bool is_available() const;
-    void release_resources();
-
-    // White balance methods
-    bool apply_white_balance(const ImageBuffer& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            const float wb_multipliers[4],
-                            uint32_t filters,
-                            const char xtrans[6][6]);
+    std::string get_device_info() const;
 
     // Pre-processing methods
     bool pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, 
@@ -73,6 +65,13 @@ public:
                                 const float (&color_matrix)[3][4],
                                 float maximum_value);
                             
+    // White balance methods
+    bool apply_white_balance(const ImageBuffer& raw_buffer,
+                            ImageBufferFloat& rgb_buffer,
+                            const float wb_multipliers[4],
+                            uint32_t filters,
+                            const char xtrans[6][6]);
+
     // Camera matrix-based color space conversion
     bool convert_color_space(const ImageBufferFloat& rgb_input,
                             ImageBufferFloat& rgb_output,
@@ -96,14 +95,9 @@ public:
                         float threshold,
                         float strength,
                         float target_contrast);
-
-    double get_last_processing_time() const;
-    size_t get_memory_usage() const;
-    std::string get_device_info() const;
         
 private: 
     bool initialized_ = false;
-    double last_processing_time_ = 0.0;
     std::string device_name_ = "Apple Silicon CPU";
 
     void apply_wb_bayer(const ImageBuffer& raw_buffer,
@@ -118,7 +112,7 @@ private:
 
     float apply_srgb_gamma_encode(float linear_value) const;
     float apply_aces_gamma_encode(float linear_value) const;
-    float apply_rec2020_gamma_encode(float linear_value) const;
+    float apply_rec2020_gamma_encode(float v) const;    
     float apply_pure_power_gamma_encode(float linear_value, float power) const;
     float apply_pure_power_gamma_encode_with_slope(float v, float p, float s) const;
     

@@ -24,7 +24,6 @@ def is_apple_platform():
     """Apple プラットフォームの検出"""
     return platform.system() == "Darwin"
 
-
 def is_apple_silicon():
     """Apple Silicon の検出"""
     return platform.system() == "Darwin" and platform.machine() == "arm64"

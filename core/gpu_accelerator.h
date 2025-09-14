@@ -25,12 +25,6 @@ public:
     bool is_available() const;
     std::string get_device_info() const;
 
-    bool apply_white_balance(const ImageBuffer& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            const float wb_multipliers[4],
-                            uint32_t filters,
-                            const char xtrans[6][6]);
-
     // Bayer demosaicing methods
     bool demosaic_bayer_linear(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer, 
@@ -61,7 +55,14 @@ public:
                             const char (&xtrans)[6][6],
                             const float (&color_matrix)[3][4],
                             float maximum_value);
-                            
+
+    // Support Methods
+    bool apply_white_balance(const ImageBuffer& raw_buffer,
+                            ImageBufferFloat& rgb_buffer,
+                            const float wb_multipliers[4],
+                            uint32_t filters,
+                            const char xtrans[6][6]);
+
     bool convert_color_space(const ImageBufferFloat& rgb_input,
                             ImageBufferFloat& rgb_output,
                             const float transform[3][4]);
@@ -86,9 +87,8 @@ private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;
         
-    // 遅延ロード + メモリキャッシュ方式
 #ifdef __OBJC__
-
+    // 遅延ロード + メモリキャッシュ方式
     id<MTLComputePipelineState> get_pipeline(const std::string& shader_name, std::string func_name="");  // 必要時にパイプライン取得
     id<MTLLibrary> compile_and_cache_shader(const std::string& shader_name);   // 個別シェーダーコンパイル（メモリキャッシュのみ）
     std::string load_shader_file(const std::string& filename);

@@ -117,7 +117,6 @@ private:
     
 public:
     BufferManager() = default;
-    
     ~BufferManager() { 
         clear(); 
     }
@@ -187,13 +186,6 @@ public:
     // GPU acceleration control
     void set_use_gpu_acceleration(bool enable);
 
-    // White balance methods
-    bool apply_white_balance(const ImageBuffer& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            const float wb_multipliers[4],
-                            uint32_t filters,
-                            const char xtrans[6][6]);
-
     // Pre-interpolation processing (border handling, hot pixels, etc.)
     bool pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size = false);
     
@@ -204,32 +196,32 @@ public:
                                 float maximum_value);
                                                          
     bool demosaic_bayer_aahd(const ImageBufferFloat& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            uint32_t filters,
-                            float maximum_value);
+                                ImageBufferFloat& rgb_buffer,
+                                uint32_t filters,
+                                float maximum_value);
                                             
     bool demosaic_bayer_dcb(const ImageBufferFloat& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            uint32_t filters,
-                            float maximum_value,
-                            int iterations = 1,   // デフォルト値
-                            bool dcb_enhance = true); // デフォルト値
+                                ImageBufferFloat& rgb_buffer,
+                                uint32_t filters,
+                                float maximum_value,
+                                int iterations = 1,   // デフォルト値
+                                bool dcb_enhance = true); // デフォルト値
                            
     bool demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            uint32_t filters,
-                            const float (&cam_mul)[4],
-                            float maximum_value);
+                                ImageBufferFloat& rgb_buffer,
+                                uint32_t filters,
+                                const float (&cam_mul)[4],
+                                float maximum_value);
     
     // Unified demosaic compute method with CPU/GPU selection
     bool demosaic_compute(const ImageBufferFloat& raw_buffer,
-                            ImageBufferFloat& rgb_buffer,
-                            int algorithm,
-                            uint32_t filters,
-                            const char (&xtrans)[6][6],
-                            const float (&color_matrix)[3][4],
-                            const float (&cam_mul)[4],
-                            float maximum_value);
+                                ImageBufferFloat& rgb_buffer,
+                                int algorithm,
+                                uint32_t filters,
+                                const char (&xtrans)[6][6],
+                                const float (&color_matrix)[3][4],
+                                const float (&cam_mul)[4],
+                                float maximum_value);
     
     // X-Trans demosaicing methods  
     bool demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
@@ -243,30 +235,37 @@ public:
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
                                 float maximum_value);
-                                
+                          
+    // White balance methods
+    bool apply_white_balance(const ImageBuffer& raw_buffer,
+                                ImageBufferFloat& rgb_buffer,
+                                const float wb_multipliers[4],
+                                uint32_t filters,
+                                const char xtrans[6][6]);
+
     // Camera matrix-based color space conversion
     bool convert_color_space(const ImageBufferFloat& rgb_input,
-                            ImageBufferFloat& rgb_output,
-                            const float transform[3][4]);
+                                ImageBufferFloat& rgb_output,
+                                const float transform[3][4]);
 
     // Gamma correction method
     bool gamma_correct(const ImageBufferFloat& rgb_input,
-                        ImageBufferFloat& rgb_output,
-                        float gamma_power = 0.f, //2.2f,
-                        float gamma_slope = 0.f, //4.5f,
-                        int output_color_space = 1); // 1=sRGB, 2=Adobe RGB, etc.
+                                ImageBufferFloat& rgb_output,
+                                float gamma_power = 0.f, //2.2f,
+                                float gamma_slope = 0.f, //4.5f,
+                                int output_color_space = 1); // 1=sRGB, 2=Adobe RGB, etc.
     
     // Tone Mapping method
     bool tone_mapping(const ImageBufferFloat& rgb_input,
-                        ImageBufferFloat& rgb_output,
-                        float after_scale);
+                                ImageBufferFloat& rgb_output,
+                                float after_scale);
 
     // Enhance Micro Contrast
     bool enhance_micro_contrast(const ImageBufferFloat& rgb_input,
-                        ImageBufferFloat& rgb_output,
-                        float threshold,
-                        float strength,
-                        float target_contrast=0.06);
+                                ImageBufferFloat& rgb_output,
+                                float threshold,
+                                float strength,
+                                float target_contrast=0.06);
 
 private:
     class Impl;

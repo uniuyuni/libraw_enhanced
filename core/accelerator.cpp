@@ -122,8 +122,8 @@ bool Accelerator::demosaic_compute(const ImageBufferFloat& raw_buffer,
                 std::cout << "🔧 Calling demosaic_bayer_amaze..." << std::endl;
                 return demosaic_bayer_amaze(raw_buffer, rgb_buffer, filters, cam_mul, maximum_value);
             default:
-                std::cout << "⚠️ Unknown algorithm " << algorithm << ", using Linear" << std::endl;
-                return demosaic_bayer_linear(raw_buffer, rgb_buffer, filters, maximum_value);
+                std::cout << "⚠️ Unknown algorithm " << algorithm << ", using AMaZE" << std::endl;
+                return demosaic_bayer_amaze(raw_buffer, rgb_buffer, filters, cam_mul, maximum_value);
         }
     }
 }
@@ -165,7 +165,7 @@ bool Accelerator::demosaic_bayer_aahd(const ImageBufferFloat& raw_buffer,
     if (should_use_gpu()) {
         // GPU accelerator needs to be updated for demosaic_bayer_aahd
         // For now, fallback to CPU immediately
-        std::cout << "⚠️  GPU not yet updated for demosaic_bayer_aahd, falling back to CPU" << std::endl;
+        std::cout << "⚠️  GPU not yet updated for demosaic bayer aahd, falling back to CPU" << std::endl;
     }
     
     std::cout << "🔧 Using CPU AAHD demosaic" << std::endl;
@@ -187,7 +187,7 @@ bool Accelerator::demosaic_bayer_dcb(const ImageBufferFloat& raw_buffer,
     if (should_use_gpu()) {
         // GPU accelerator needs to be updated for demosaic_bayer_dcb
         // For now, fallback to CPU immediately
-        std::cout << "⚠️  GPU not yet updated for demosaic_bayer_dcb, falling back to CPU" << std::endl;
+        std::cout << "⚠️  GPU not yet updated for demosaic bayer dcb, falling back to CPU" << std::endl;
     }
     
     std::cout << "🔧 Using CPU DCB demosaic" << std::endl;

@@ -25,102 +25,13 @@ CPUAccelerator::CPUAccelerator() {}
 CPUAccelerator::~CPUAccelerator() = default;
 
 bool CPUAccelerator::initialize() {
-    device_name_ = "Apple Silicon CPU";
     initialized_ = true;
     std::cout << "⚡ CPU vectorization initialized on: " << device_name_ << std::endl;
     return true;
 }
 
 bool CPUAccelerator::is_available() const { return initialized_; }
-void CPUAccelerator::release_resources() { initialized_ = false; }
-
-//===================================================================
-// ホワイトバランス
-//===================================================================
-
-bool CPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
-                                        ImageBufferFloat& rgb_buffer,
-                                        const float wb_multipliers[4],
-                                        uint32_t filters,
-                                        const char xtrans[6][6]) {
-
-    if (!initialized_) return false;
-
-    // 引数チェック
-    if (!raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
-        std::cerr << "❌ Invalid or mismatched buffers for white balance" << std::endl;
-        return false;
-    }
-    
-    if (filters == FILTERS_XTRANS) {
-        apply_wb_xtrans(raw_buffer, rgb_buffer, wb_multipliers, xtrans);
-    } else {
-        apply_wb_bayer(raw_buffer, rgb_buffer, wb_multipliers, filters);
-    }
-
-    return true;
-}
-
-// Bayer CFA white balance implementation
-void CPUAccelerator::apply_wb_bayer(
-    const ImageBuffer& raw_buffer,
-    ImageBufferFloat& rgb_buffer,
-    const float wb_multipliers[4],
-    uint32_t filters
-) {
-    std::cout << "raw_buffer" << std::endl;
-   // Process each pixel in the raw buffer
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2)
-#endif
-    for (size_t row = 0; row < raw_buffer.height; row++) {
-        for (size_t col = 0; col < raw_buffer.width; col++) {
-            size_t pixel_idx = row * raw_buffer.width + col;
-        
-            // Get color channel for this pixel position using LibRaw's fcol logic
-            uint32_t color_channel = fcol_bayer_native(row, col, filters);
-            
-            // Apply white balance multiplier to the native color channel
-            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
-            if (original_value <= 0) continue;
-            float adjusted_value = original_value * wb_multipliers[color_channel];
-
-            if (color_channel == 3) color_channel = 1;
-            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
-        }
-    }
-    
-    std::cout << "✅ Bayer WB process completed" << std::endl;
-}
-
-// X-Trans CFA white balance implementation
-void CPUAccelerator::apply_wb_xtrans(
-    const ImageBuffer& raw_buffer,
-    ImageBufferFloat& rgb_buffer,
-    const float wb_multipliers[4],
-    const char xtrans[6][6]
-) {    
-    // Process each pixel in the raw buffer
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2)
-#endif
-    for (size_t row = 0; row < raw_buffer.height; row++) {
-        for (size_t col = 0; col < raw_buffer.width; col++) {
-            size_t pixel_idx = row * raw_buffer.width + col;
-        
-            // Get color channel using X-Trans pattern
-            uint32_t color_channel = fcol_xtrans(row, col, xtrans);
-            
-            // Apply white balance multiplier to the native color channel
-            float original_value = raw_buffer.image[pixel_idx][color_channel];
-            float adjusted_value = original_value * wb_multipliers[color_channel];
-                        
-            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
-        }
-    }
-        
-    std::cout << "✅ X-Trans WB process completed" << std::endl;
-}
+std::string CPUAccelerator::get_device_info() const { return device_name_; }
 
 //===================================================================
 // Pre-interpolation
@@ -134,15 +45,18 @@ bool CPUAccelerator::pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filt
 
     if (half_size && filters == FILTERS_XTRANS) {
         size_t row, col;
-//      for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
         for (row = 0; row < 3; ++row) 
             for (col = 1; col < 4; ++col)
                 if (image[row * width + col][0] != 0.f && image[row * width + col][2] != 0.f) goto break_outer;
         break_outer:
-        for (; row < height; row += 3)
+
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+        for (size_t row_start = row; row_start < height; row_start += 3)
             for (size_t col_start = (col - 1) % 3 + 1; col_start < width - 1; col_start += 3)
                 for (int c = 0; c < 3; c += 2)
-                    image[row * width + col_start][c] = (image[row * width + col_start - 1][c] + image[row * width + col_start + 1][c]) * 0.5f;
+                    image[row_start * width + col_start][c] = (image[row_start * width + col_start - 1][c] + image[row_start * width + col_start + 1][c]) * 0.5f;
     }
     return true;
 }
@@ -290,15 +204,15 @@ private:
         return c1 > c2 ? (float)c1 / c2 : (float)c2 / c1;
     }
     
-    int Y(float3 &rgb) {
+    inline int Y(float3 &rgb) {
         return yuv_cam[0][0] * rgb[0] + yuv_cam[0][1] * rgb[1] + yuv_cam[0][2] * rgb[2];
     }
     
-    int U(float3 &rgb) {
+    inline int U(float3 &rgb) {
         return yuv_cam[1][0] * rgb[0] + yuv_cam[1][1] * rgb[1] + yuv_cam[1][2] * rgb[2];
     }
     
-    int V(float3 &rgb) {
+    inline int V(float3 &rgb) {
         return yuv_cam[2][0] * rgb[0] + yuv_cam[2][1] * rgb[1] + yuv_cam[2][2] * rgb[2];
     }
     
@@ -725,12 +639,11 @@ private:
     float (*image)[4];
     float maximum_val_;
 
-    float CLIP_FLOAT(float val) const {
+    inline float CLIP_FLOAT(float val) const {
         return val > maximum_val_ ? maximum_val_ : (val < 0.0f ? 0.0f : val);
     }
 
 public:
-
     DCB_Processor(float (*img_buffer)[4], int w, int h, uint32_t f, float max_val)
         : width(w), height(h), filters(f), image(img_buffer), maximum_val_(max_val) {}
 
@@ -1720,9 +1633,6 @@ bool CPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, Im
         return false;
     }
 
-    auto start_time = std::chrono::high_resolution_clock::now();
-    // AMaZE demosaic processing
-    
     try {
         AMaZE_Processor_RT amaze_proc(raw_buffer, rgb_buffer, filters, cam_mul, maximum_value);
         amaze_proc.run();
@@ -1730,11 +1640,7 @@ bool CPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, Im
         std::cerr << "❌ An exception occurred during AMaZE processing: " << e.what() << std::endl;
         return false;
     }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();    
-    std::chrono::duration<double> diff = end_time - start_time;
-    last_processing_time_ = diff.count();
-    
+        
     border_interpolate(rgb_buffer, filters, 4);
     
     return true;
@@ -1913,7 +1819,6 @@ private:
 
                 for (uint32_t y = (row > 0) ? row - 1 : 0, v = (row == 0)? 0 : -1; y < row + 2 && y < height_; y++, v++) {
                     for (uint32_t x = (col > 0) ? col - 1 : 0, h = (col == 0)? 0 : -1; x < col + 2 && x < width_; x++, h++) {
-
 //                for (int y = std::max(0, row - 1), v = row == 0 ? 0 : -1; y <= std::min(row + 1, (int)height_ - 1); y++, v++) {
 //                    for (int x = std::max(0, col - 1), h = col == 0 ? 0 : -1; x <= std::min(col + 1, (int)width_ - 1); x++, h++) {
                         int f = fcol_xtrans_(y, x);
@@ -1967,9 +1872,6 @@ public:
         constexpr short dir[4] = { 1, ts, ts + 1, ts - 1 };
         
         float xyz_cam[3][3];
-#ifdef _OPENMP
-        #pragma omp parallel for collapse(2)
-#endif
         for (int i = 0; i < 3; i++) {
             for (int j = 0; j < 3; j++) {
                 xyz_cam[i][j] = color_matrix_[i][j];
@@ -2395,7 +2297,7 @@ public:
                             }
                         }
                     }
-    // end of multipass part
+                    // end of multipass part
 
                     rgb = reinterpret_cast<float(*)[ts][ts][3]>(rgb_buffer_tile.data());
                     mrow -= top;
@@ -2853,6 +2755,93 @@ bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer, I
 }
 
 //===================================================================
+// ホワイトバランス
+//===================================================================
+
+bool CPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
+                                        ImageBufferFloat& rgb_buffer,
+                                        const float wb_multipliers[4],
+                                        uint32_t filters,
+                                        const char xtrans[6][6]) {
+
+    if (!initialized_) return false;
+
+    // 引数チェック
+    if (!raw_buffer.is_valid() || !rgb_buffer.is_valid() || raw_buffer.width != rgb_buffer.width || raw_buffer.height != rgb_buffer.height || raw_buffer.channels != 4 || rgb_buffer.channels != 3) {
+        std::cerr << "❌ Invalid or mismatched buffers for white balance" << std::endl;
+        return false;
+    }
+    
+    if (filters == FILTERS_XTRANS) {
+        apply_wb_xtrans(raw_buffer, rgb_buffer, wb_multipliers, xtrans);
+    } else {
+        apply_wb_bayer(raw_buffer, rgb_buffer, wb_multipliers, filters);
+    }
+
+    return true;
+}
+
+// Bayer CFA white balance implementation
+void CPUAccelerator::apply_wb_bayer(
+    const ImageBuffer& raw_buffer,
+    ImageBufferFloat& rgb_buffer,
+    const float wb_multipliers[4],
+    uint32_t filters
+) {
+   // Process each pixel in the raw buffer
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (size_t row = 0; row < raw_buffer.height; row++) {
+        for (size_t col = 0; col < raw_buffer.width; col++) {
+            size_t pixel_idx = row * raw_buffer.width + col;
+        
+            // Get color channel for this pixel position using LibRaw's fcol logic
+            uint32_t color_channel = fcol_bayer_native(row, col, filters);
+            
+            // Apply white balance multiplier to the native color channel
+            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
+            if (original_value <= 0) continue;
+            float adjusted_value = original_value * wb_multipliers[color_channel];
+
+            if (color_channel == 3) color_channel = 1;
+            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
+        }
+    }
+    
+    std::cout << "✅ Bayer WB process completed" << std::endl;
+}
+
+// X-Trans CFA white balance implementation
+void CPUAccelerator::apply_wb_xtrans(
+    const ImageBuffer& raw_buffer,
+    ImageBufferFloat& rgb_buffer,
+    const float wb_multipliers[4],
+    const char xtrans[6][6]
+) {    
+    // Process each pixel in the raw buffer
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (size_t row = 0; row < raw_buffer.height; row++) {
+        for (size_t col = 0; col < raw_buffer.width; col++) {
+            size_t pixel_idx = row * raw_buffer.width + col;
+        
+            // Get color channel using X-Trans pattern
+            uint32_t color_channel = fcol_xtrans(row, col, xtrans);
+            
+            // Apply white balance multiplier to the native color channel
+            float original_value = raw_buffer.image[pixel_idx][color_channel];
+            float adjusted_value = original_value * wb_multipliers[color_channel];
+                        
+            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
+        }
+    }
+        
+    std::cout << "✅ X-Trans WB process completed" << std::endl;
+}
+
+//===================================================================
 // カラースペース変換
 //===================================================================
 
@@ -2934,14 +2923,6 @@ bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
     }
     return true;
 }
-
-double CPUAccelerator::get_last_processing_time() const { return last_processing_time_; }
-size_t CPUAccelerator::get_memory_usage() const { return 0; }
-std::string CPUAccelerator::get_device_info() const { return device_name_; }
-
-//===================================================================
-// ガンマ補正関数
-//===================================================================
 
 float CPUAccelerator::apply_srgb_gamma_encode(float v) const {
     return (v <= 0.0031308f) ? 12.92f * v : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
@@ -3028,7 +3009,7 @@ bool CPUAccelerator::tone_mapping(const ImageBufferFloat& rgb_input,
     if (!initialized_) return false;
 
     // 引数チェック
-    if (!rgb_input.is_valid() || !rgb_output.is_valid()) {
+    if (!rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
         std::cerr << "❌ Invalid or mismatched buffers for tone mapping" << std::endl;
         return false;
     }
@@ -3130,7 +3111,7 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
     if (!initialized_) return false;
 
     // 引数チェック
-    if (!rgb_input.is_valid() || !rgb_output.is_valid()) {
+    if (!rgb_input.is_valid() || !rgb_output.is_valid() || rgb_input.width != rgb_output.width || rgb_input.height != rgb_output.height || rgb_input.channels != 3 || rgb_output.channels != 3) {
         std::cerr << "❌ Invalid or mismatched buffers for enhance micro contrast" << std::endl;
         return false;
     }
@@ -3254,6 +3235,5 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
 
     return true;
 }
-
 
 } // namespace libraw_enhanced
