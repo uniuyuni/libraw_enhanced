@@ -14,6 +14,7 @@
 #include "accelerator.h"
 #include "camera_matrices.h"
 #endif
+#include "metal/shader_common.h"
 
 namespace libraw_enhanced {
 
@@ -213,94 +214,65 @@ public:
     }
 
     //===============================================================
-    // CFA-aware white balance (experimental pre-demosaic implementation)
-    //===============================================================
-    // Main CFA-aware white balance function
-    void apply_white_balance_to_cfa_data(
-        const ImageBuffer& raw_buffer,
-        ImageBufferFloat& rgb_buffer,
-        const float wb_multipliers[4], 
-        uint32_t filters,
-        const char xtrans[6][6]
-    ) {
-        std::cout << "🧪 EXPERIMENTAL: Applying CFA-aware white balance (pre-demosaic)" << std::endl;
-        std::cout << "   - WB Multipliers: [" << wb_multipliers[0] << ", " << wb_multipliers[1] 
-                  << ", " << wb_multipliers[2] << ", " << wb_multipliers[3] << "]" << std::endl;
-        
-        if (filters == FILTERS_XTRANS) {
-            apply_wb_xtrans(raw_buffer, rgb_buffer, wb_multipliers, xtrans);
-        } else {
-            apply_wb_bayer(raw_buffer, rgb_buffer, wb_multipliers, filters);
-        }        
-    }
-    
-    // Bayer CFA white balance implementation
-    void apply_wb_bayer(
-        const ImageBuffer& raw_buffer,
-        ImageBufferFloat& rgb_buffer,
-        const float wb_multipliers[4],
-        uint32_t filters
-    ) {
-        const size_t total_pixels = raw_buffer.width * raw_buffer.height;
-        
-        // Process each pixel in the raw buffer
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
-            int row = pixel_idx / raw_buffer.width;
-            int col = pixel_idx % raw_buffer.width;
-            
-            // Get color channel for this pixel position using LibRaw's fcol logic
-            int color_channel = (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
-            
-            // Apply white balance multiplier to the native color channel
-            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
-            float adjusted_value = original_value * wb_multipliers[color_channel];
-
-            if (color_channel == 3) {
-                rgb_buffer.image[pixel_idx][1] = adjusted_value;
-            } else {
-                rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
-            }
-        }
-        
-        std::cout << "✅ Bayer WB process completed" << std::endl;
-    }
-    
-    // X-Trans CFA white balance implementation
-    void apply_wb_xtrans(
-        const ImageBuffer& raw_buffer,
-        ImageBufferFloat& rgb_buffer,
-        const float wb_multipliers[4],
-        const char xtrans[6][6]
-    ) {
-        const size_t total_pixels = raw_buffer.width * raw_buffer.height;
-        
-        // Process each pixel in the raw buffer
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
-            int row = pixel_idx / raw_buffer.width;
-            int col = pixel_idx % raw_buffer.width;
-            
-            // Get color channel using X-Trans pattern
-            int color_channel = xtrans[row % 6][col % 6];
-            
-            // Apply white balance multiplier to the native color channel
-            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
-            float adjusted_value = original_value * wb_multipliers[color_channel];
-                        
-            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
-        }
-        
-        std::cout << "✅ X-Trans WB process completed" << std::endl;
-    }
-
-    //===============================================================
     // LibRaw-compatible adjust_maximum implementation
     //===============================================================
+
+    void adjust_maximum0(const ImageBuffer& raw_buffer, float threshold) {
+        std::cout << "📋 Apply adjust_maximum for dynamic maximum value adjustment (threshold: " << threshold << ")" << std::endl;
+        
+        // Early return if threshold is too small (LibRaw compatibility)
+        if (threshold < 0.00001f) {
+            std::cout << "📋 Skipping adjust_maximum: threshold too small (" << threshold << ")" << std::endl;
+            return;
+        }
+        
+        // Use default threshold if too large (LibRaw compatibility)
+        float auto_threshold = threshold;
+        if (threshold > 0.99999f) {
+            auto_threshold = 0.75f; // LIBRAW_DEFAULT_ADJUST_MAXIMUM_THRESHOLD
+            std::cout << "📋 Using default threshold: " << auto_threshold << std::endl;
+        }
+        
+        // Calculate data_maximum if not already set (LibRaw compatibility)
+        uint16_t real_max = processor.imgdata.color.data_maximum;
+        if (real_max == 0 && raw_buffer.image != nullptr) {
+            std::cout << "📋 Calculating data_maximum by scanning image data..." << std::endl;
+            
+            size_t total_pixels = raw_buffer.width * raw_buffer.height;
+            uint16_t max_value = 0;
+            
+            for (size_t i = 0; i < total_pixels; i++) {
+                for (int c = 0; c < 4; c++) {
+                    uint16_t val = raw_buffer.image[i][c];
+                    if (val > max_value) {
+                        max_value = val;
+                    }
+                }
+            }
+            
+            real_max = max_value;
+            processor.imgdata.color.data_maximum = real_max;
+            std::cout << "📋 Calculated data_maximum: " << real_max << std::endl;
+        }
+        
+        uint16_t current_max = processor.imgdata.color.maximum;
+        std::cout << "📋 Current maximum: " << current_max << ", data_maximum: " << real_max << std::endl;
+        
+        // Apply LibRaw's adjust_maximum logic
+        if (real_max > 0 && real_max < current_max && 
+            real_max > current_max * auto_threshold) {
+            
+            processor.imgdata.color.maximum = real_max;
+            std::cout << "✅ Adjusted maximum value: " << current_max << " → " << real_max 
+                      << " (threshold: " << auto_threshold << ")" << std::endl;
+        } else {
+            std::cout << "📋 No adjustment needed - conditions not met" << std::endl;
+            std::cout << "   real_max > 0: " << (real_max > 0) << std::endl;
+            std::cout << "   real_max < current_max: " << (real_max < current_max) << std::endl;
+            std::cout << "   real_max > current_max * threshold: " << (real_max > current_max * auto_threshold) 
+                      << " (" << real_max << " > " << (current_max * auto_threshold) << ")" << std::endl;
+        }
+    }
 
     MaximumResult adjust_maximum(const ImageBufferFloat& rgb_buffer, float threshold) {
         std::cout << "📋 Apply adjust_maximum for dynamic maximum value adjustment (threshold: " << threshold << ")" << std::endl;
@@ -334,9 +306,11 @@ public:
 #ifdef _OPENMP
             #pragma omp parallel for collapse(2)
 #endif
-            for (size_t i = 0; i < total_pixels; i++) {
-                for (int c = 0; c < 4; c++) {
-                    float val = rgb_buffer.image[i][c];
+            for (size_t row = 0; row < rgb_buffer.height; ++row) {
+                for (size_t col = 0; col < rgb_buffer.width; ++col) {
+                    size_t idx = row * rgb_buffer.width + col;
+                    uint32_t c = fcol_bayer(row, col, processor.imgdata.idata.filters);
+                    float val = rgb_buffer.image[idx][c];
                     if (val > max_value) {
                         max_value = val;
                     }
@@ -345,6 +319,7 @@ public:
             
             real_max = max_value;
             result.data_maximum = real_max;
+            processor.imgdata.color.data_maximum = real_max;
             std::cout << "📋 Calculated data_maximum: " << real_max << std::endl;
         }
         
@@ -356,6 +331,7 @@ public:
             real_max > current_max * auto_threshold) {
             
             result.maximum = real_max;
+            processor.imgdata.color.maximum = real_max;
             std::cout << "✅ Adjusted maximum value: " << current_max << " → " << real_max 
                       << " (threshold: " << auto_threshold << ")" << std::endl;
         } else {
@@ -504,12 +480,12 @@ public:
         apply_black_level_correction(raw_buffer);
 
         // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
-        //adjust_maximum(raw_buffer, params.adjust_maximum_thr);
+        adjust_maximum0(raw_buffer, params.adjust_maximum_thr);
 
         // set filters and xtrans
         uint32_t filters = processor.imgdata.idata.filters;        
         char (&xtrans)[6][6] = processor.imgdata.idata.xtrans;        
-        std::cout << "🔍 Filters value: " << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
+        std::cout << "🔍 Filters value: 0x" << std::hex << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
 
         // Apply green matching for Bayer sensors (after black level, before demosaic)
         apply_green_matching(raw_buffer, filters);
@@ -538,29 +514,40 @@ public:
             effective_wb[3] = params.user_wb[3];
             std::cout << "👤 Using user/default WB:" << std::endl;
         }
-        
+
+        // rgb_buffer2 is temporary buffer
+        std::vector<float> raw_buffer2_data(rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels);
+        ImageBufferFloat rgb_buffer2 = {
+            reinterpret_cast<float (*)[3]>(raw_buffer2_data.data()),
+            rgb_buffer.width,
+            rgb_buffer.height,
+            rgb_buffer.channels
+        };
+
         // Determine CFA type and apply appropriate WB processing
-        if (!accelerator->apply_white_balance(raw_buffer, rgb_buffer, effective_wb, filters, xtrans)) {
+        if (!accelerator->apply_white_balance(raw_buffer, rgb_buffer2, effective_wb, filters, xtrans)) {
             return false;
         }
 
         // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
-        MaximumResult maximum_result = adjust_maximum(rgb_buffer, params.adjust_maximum_thr);
+        MaximumResult maximum_result = adjust_maximum(rgb_buffer2, params.adjust_maximum_thr);
 
         // Apply pre-interpolation processing
-        if (!accelerator->pre_interpolate(rgb_buffer, filters, xtrans, params.half_size)) {
+        if (!accelerator->pre_interpolate(rgb_buffer2, filters, xtrans, params.half_size)) {
             return false;
         }
-
+/*
         for (int y = 0; y < rgb_buffer.height; ++y) {
             for( int x = 0; x < rgb_buffer.width; ++x) {
                 int idx = y * rgb_buffer.width + x;
-                raw_buffer.image[idx][0] = (ushort)rgb_buffer.image[idx][0];
-                raw_buffer.image[idx][1] = (ushort)rgb_buffer.image[idx][1];
-                raw_buffer.image[idx][2] = (ushort)rgb_buffer.image[idx][2];
-                raw_buffer.image[idx][3] = (ushort)rgb_buffer.image[idx][1];
+                uint32_t c = fcol_bayer_native(y, x, filters);
+                raw_buffer.image[idx][0] = rgb_buffer2.image[idx][0];
+                raw_buffer.image[idx][1] = rgb_buffer2.image[idx][1];
+                raw_buffer.image[idx][2] = rgb_buffer2.image[idx][2];
+                raw_buffer.image[idx][3] = rgb_buffer2.image[idx][1];
             }
         }
+*/
 
         // Camera matrix-based color space conversion (reuse float_rgb buffer)
         const char* camera_make = processor.imgdata.idata.make;
@@ -576,7 +563,7 @@ public:
 
         // Demosaic processing (unified CPU/GPU selection via accelerator)
         // Pass LibRaw cam_mul for dynamic initialGain calculation and maximum_value for precise normalization
-        bool demosaic_success = accelerator->demosaic_compute(raw_buffer, rgb_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform, processor.imgdata.color.cam_mul, (ushort)maximum_result.maximum);
+        bool demosaic_success = accelerator->demosaic_compute(rgb_buffer2, rgb_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform, processor.imgdata.color.cam_mul, maximum_result.maximum);
         if (!demosaic_success) {
             std::cerr << "❌ Demosaic processing failed" << std::endl;
             return false;
@@ -928,7 +915,7 @@ public:
                 unsigned short val = processor.imgdata.rawdata.raw_image[src_idx];
                 
                 // Determine color channel using filter pattern
-                int color_channel = get_xtrans_color(row, col);
+                int color_channel = fcol_xtrans(row, col, processor.imgdata.idata.xtrans);
                 
                 // Store pixel value in appropriate channel
                 processor.imgdata.image[dst_idx][color_channel] = val;
@@ -947,7 +934,7 @@ public:
                 // Calculate source pixel position
                 int src_row = row + sizes.top_margin;
                 int src_col = col + sizes.left_margin;
-                int src_idx = src_row * (sizes.raw_width) + src_col;
+                int src_idx = src_row * sizes.raw_width + src_col;
                 
                 // Calculate destination pixel position (with potential shrinking)
                 int dst_row = row >> shrink_factor;
@@ -958,35 +945,22 @@ public:
                 if (dst_row >= sizes.iheight || dst_col >= sizes.iwidth) continue;
                 
                 // Get raw pixel value
-                unsigned short val = processor.imgdata.rawdata.raw_image[src_idx];
+                uint16_t val = processor.imgdata.rawdata.raw_image[src_idx];
                 
                 // Determine color channel using filter pattern
-                int color_channel = get_bayer_color(row, col);
+                uint32_t color_channel = fcol_bayer_native(row, col, processor.imgdata.idata.filters);
                 
                 // Store pixel value in appropriate channel
                 processor.imgdata.image[dst_idx][color_channel] = val;
                 if (color_channel == 3) {
                     // If G2 channel, copy to G1 for averaging
-                    processor.imgdata.image[dst_idx][1] = val; // G1
+                    processor.imgdata.image[dst_idx][1] = val;
                 }
             }
         }
         return true;
     }
 
-    // Get color channel for Bayer/X-Trans pattern
-    inline int get_bayer_color(int row, int col) {
-        auto& idata = processor.imgdata.idata;
-        
-        return (idata.filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
-    }
-
-    inline int get_xtrans_color(int row, int col) {
-        auto& idata = processor.imgdata.idata;
-        
-        return idata.xtrans[row % 6][col % 6];
-    }
-    
     // Phase One color channel determination
     int get_phase_one_color(int row, int col) {
         // Phase One specific Bayer pattern variations

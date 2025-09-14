@@ -5,13 +5,11 @@ Real RAW file to JPG output test script
 """
 
 import sys
-import os
 import time
 import numpy as np
 from pathlib import Path
 from PIL import Image
 import pyvips
-import exiftool
 
 # プロジェクトルートをPythonパスに追加
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -54,120 +52,31 @@ def process_raw_file(raw_path, output_dir):
         # 複数の処理パラメータでテスト
         test_configs = [
             {
-                "name": "AMaZE CPU ProPhotoRGB",
+                "name": "Linear GPU AdobeRGB",
                 "params": {
                     "use_camera_wb": True,
                     "half_size": False,
                     "output_bps": 32,
-                    "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,  # AMaZE
+                    "demosaic_algorithm": lre.DemosaicAlgorithm.Linear,
                     "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.ProPhotoRGB,
+                    "output_color": lre.ColorSpace.AdobeRGB,
+                    "highlight_mode": 4,
+                }
+            },
+            {
+                "name": "AMaZE GPU AdobeRGB",
+                "params": {
+                    "use_camera_wb": True,
+                    "half_size": False,
+                    "output_bps": 32,
+                    "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
+                    "use_gpu_acceleration": True,
+                    "output_color": lre.ColorSpace.AdobeRGB,
                     "highlight_mode": 4,
                 }
             },
         ]
-        """
-            {
-                "name": "Linear CPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 0,  # Linear
-                    "use_gpu_acceleration": False
-                }
-            },
-            {
-                "name": "Linear GPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 0,
-                    "use_gpu_acceleration": True
-                }
-            },
-            {
-                "name": "AMaZE CPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 10,  # AMaZE
-                    "use_gpu_acceleration": False
-                }
-            },
-            {
-                "name": "AAHD GPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 12,  # AHD
-                    "use_gpu_acceleration": True
-                }
-            },           
-            {
-                "name": "AHD CPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 3,
-                    "use_gpu_acceleration": False
-                }
-            },
-            {
-                "name": "AHD GPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 3,
-                    "use_gpu_acceleration": True
-                }
-            },
-            {
-                "name": "Linear CPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 0,  # Linear
-                    "use_gpu_acceleration": False
-                }
-            },
-            {
-                "name": "DCB GPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 4,  # DCB
-                    "use_gpu_acceleration": True
-                }
-            },
-            {
-                "name": "DCB CPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 4,  # DCB
-                    "use_gpu_acceleration": False
-                }
-            },
-            {
-                "name": "AAHD CPU",
-                "params": {
-                    "use_camera_wb": True,
-                    "half_size": False,
-                    "output_bps": 16,
-                    "demosaic_algorithm": 12,  # AHD
-                    "use_gpu_acceleration": False
-                }
-            },           
-        """        
+    
         results = []
         
         # 各設定で個別にファイルを読み込み直してテスト

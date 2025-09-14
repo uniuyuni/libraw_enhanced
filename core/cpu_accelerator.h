@@ -37,47 +37,41 @@ public:
                         const char (&xtrans)[6][6], bool half_size = false);
                          
     // Bayer specific acceleration methods
-    bool demosaic_bayer_linear(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_linear(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
-                            uint16_t maximum_value);
+                            float maximum_value);
 
-    bool demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_aahd(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
-                            uint16_t maximum_value);
+                            float maximum_value);
                                        
-    bool demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_dcb(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
-                            uint16_t maximum_value,
+                            float maximum_value,
                             int iterations = 1,
                             bool dcb_enhance = true);
                          
-    bool demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
                             const float (&cam_mul)[4],
-                            uint16_t maximum_value);
+                            float maximum_value);
                            
     // X-Trans specific acceleration methods
-    bool demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
                                 ImageBufferFloat& rgb_buffer,
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
-                                uint16_t maximum_value);
+                                float maximum_value);
                            
-    bool demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer,
                                 ImageBufferFloat& rgb_buffer,
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
-                                uint16_t maximum_value);
-
-    bool demosaic_xtrans_adaptive(const ImageBuffer& raw_buffer,
-                                   ImageBufferFloat& rgb_buffer,
-                                   const char (&xtrans)[6][6],
-                                   const float (&color_matrix)[3][4],
-                                   uint16_t maximum_value);
+                                float maximum_value);
                             
     // Camera matrix-based color space conversion
     bool convert_color_space(const ImageBufferFloat& rgb_input,
@@ -128,7 +122,7 @@ private:
     float apply_pure_power_gamma_encode(float linear_value, float power) const;
     float apply_pure_power_gamma_encode_with_slope(float v, float p, float s) const;
     
-    void border_interpolate(const ImageBufferFloat& raw_buffer, uint32_t filters, int border);
+    void border_interpolate(const ImageBufferFloat& raw_buffer, uint32_t filters, size_t border);
 };
 
 } // namespace libraw_enhanced

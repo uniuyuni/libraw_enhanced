@@ -68,26 +68,24 @@ void CPUAccelerator::apply_wb_bayer(
     const float wb_multipliers[4],
     uint32_t filters
 ) {
-    const size_t total_pixels = raw_buffer.width * raw_buffer.height;
-    
-    // Process each pixel in the raw buffer
+    std::cout << "raw_buffer" << std::endl;
+   // Process each pixel in the raw buffer
 #ifdef _OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for collapse(2)
 #endif
-    for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
-        int row = pixel_idx / raw_buffer.width;
-        int col = pixel_idx % raw_buffer.width;
+    for (size_t row = 0; row < raw_buffer.height; row++) {
+        for (size_t col = 0; col < raw_buffer.width; col++) {
+            size_t pixel_idx = row * raw_buffer.width + col;
         
-        // Get color channel for this pixel position using LibRaw's fcol logic
-        int color_channel = (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
-        
-        // Apply white balance multiplier to the native color channel
-        uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
-        float adjusted_value = original_value * wb_multipliers[color_channel];
+            // Get color channel for this pixel position using LibRaw's fcol logic
+            uint32_t color_channel = fcol_bayer_native(row, col, filters);
+            
+            // Apply white balance multiplier to the native color channel
+            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
+            if (original_value <= 0) continue;
+            float adjusted_value = original_value * wb_multipliers[color_channel];
 
-        if (color_channel == 3) {
-            rgb_buffer.image[pixel_idx][1] = adjusted_value;
-        } else {
+            if (color_channel == 3) color_channel = 1;
             rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
         }
     }
@@ -101,27 +99,26 @@ void CPUAccelerator::apply_wb_xtrans(
     ImageBufferFloat& rgb_buffer,
     const float wb_multipliers[4],
     const char xtrans[6][6]
-) {
-    const size_t total_pixels = raw_buffer.width * raw_buffer.height;
-    
+) {    
     // Process each pixel in the raw buffer
 #ifdef _OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for collapse(2)
 #endif
-    for (size_t pixel_idx = 0; pixel_idx < total_pixels; pixel_idx++) {
-        int row = pixel_idx / raw_buffer.width;
-        int col = pixel_idx % raw_buffer.width;
+    for (size_t row = 0; row < raw_buffer.height; row++) {
+        for (size_t col = 0; col < raw_buffer.width; col++) {
+            size_t pixel_idx = row * raw_buffer.width + col;
         
-        // Get color channel using X-Trans pattern
-        int color_channel = xtrans[row % 6][col % 6];
-        
-        // Apply white balance multiplier to the native color channel
-        uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
-        float adjusted_value = original_value * wb_multipliers[color_channel];
-                    
-        rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
+            // Get color channel using X-Trans pattern
+            uint32_t color_channel = fcol_xtrans(row, col, xtrans);
+            
+            // Apply white balance multiplier to the native color channel
+            float original_value = raw_buffer.image[pixel_idx][color_channel];
+            float adjusted_value = original_value * wb_multipliers[color_channel];
+                        
+            rgb_buffer.image[pixel_idx][color_channel] = adjusted_value;
+        }
     }
-    
+        
     std::cout << "✅ X-Trans WB process completed" << std::endl;
 }
 
@@ -138,7 +135,9 @@ bool CPUAccelerator::pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filt
     if (half_size && filters == FILTERS_XTRANS) {
         size_t row, col;
 //      for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (!(image[row * width + col][0] | image[row * width + col][2])) goto break_outer;
-        for (row = 0; row < 3; ++row) for (col = 1; col < 4; ++col) if (image[row * width + col][0] != 0.f && image[row * width + col][2] != 0.f) goto break_outer;
+        for (row = 0; row < 3; ++row) 
+            for (col = 1; col < 4; ++col)
+                if (image[row * width + col][0] != 0.f && image[row * width + col][2] != 0.f) goto break_outer;
         break_outer:
         for (; row < height; row += 3)
             for (size_t col_start = (col - 1) % 3 + 1; col_start < width - 1; col_start += 3)
@@ -152,31 +151,29 @@ bool CPUAccelerator::pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filt
 // Demosaic function for linear interpolation
 //===================================================================
 
-bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
+bool CPUAccelerator::demosaic_bayer_linear(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, float maximum_value) {
     if (!initialized_) return false;
 
     const size_t width = raw_buffer.width, height = raw_buffer.height;
 
     // まず RAW データをコピー（各ピクセルのネイティブカラーのみ）
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t row = 0; row < height; row++) {
         for (size_t col = 0; col < width; col++) {
             size_t idx = row * width + col;
             int color = fcol_bayer(row, col, filters);
             
             // RAW値を取得して正規化
-            float raw_val = (float)raw_buffer.image[idx][color] / (float)maximum_value;
-            
-            // 初期化：全チャンネルを0にセット
-            rgb_buffer.image[idx][0] = 0.0f;
-            rgb_buffer.image[idx][1] = 0.0f;
-            rgb_buffer.image[idx][2] = 0.0f;
-            
-            // ネイティブカラーをセット
-            rgb_buffer.image[idx][color] = raw_val;
+            rgb_buffer.image[idx][color] = raw_buffer.image[idx][color] / maximum_value;
         }
     }
 
     // シンプルなバイリニア補間
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t row = 1; row < height - 1; row++) {
         for (size_t col = 1; col < width - 1; col++) {
             size_t idx = row * width + col;
@@ -198,7 +195,7 @@ bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
                             int neighbor_color = fcol_bayer(ny, nx, filters);
                             if (neighbor_color == c) {
                                 size_t neighbor_idx = ny * width + nx;
-                                sum += (float)raw_buffer.image[neighbor_idx][c] / (float)maximum_value;
+                                sum += raw_buffer.image[neighbor_idx][c] / maximum_value;
                                 count++;
                             }
                         }
@@ -216,7 +213,7 @@ bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
                                 int neighbor_color = fcol_bayer(ny, nx, filters);
                                 if (neighbor_color == c) {
                                     size_t neighbor_idx = ny * width + nx;
-                                    sum += (float)raw_buffer.image[neighbor_idx][c] / (float)maximum_value;
+                                    sum += raw_buffer.image[neighbor_idx][c] / maximum_value;
                                     count++;
                                 }
                             }
@@ -243,7 +240,7 @@ bool CPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
 // Demosaic function for AAHD (Adaptive AHD) demosaic
 //===================================================================
 
-typedef uint16_t ushort3[3];
+typedef float float3[3];
 typedef int int3[3];
 
 // Direction macros (LibRaw exact)
@@ -264,21 +261,21 @@ private:
     static const int Tdead = 4;
     static const int OverFraction = 8;
     
-    ushort3 *rgb_ahd[2];
+    float3 *rgb_ahd[2];
     int3 *yuv[2];
     char *ndir, *homo[2];
-    uint16_t channel_maximum[3], channels_max;
-    uint16_t channel_minimum[3];
+    float channel_maximum[3], channels_max;
+    float channel_minimum[3];
     
     // YUV coefficients (LibRaw exact - Rec. 2020)
     static const float yuv_coeff[3][3];
     static float gammaLUT[0x10000];
     float yuv_cam[3][3];
     
-    const ImageBuffer& raw_buffer_;
+    const ImageBufferFloat& raw_buffer_;
     ImageBufferFloat& rgb_buffer_;
     uint32_t filters_;
-    const uint16_t maximum_value_;
+    const float maximum_value_;
     
     enum {
         HVSH = 1,
@@ -293,15 +290,15 @@ private:
         return c1 > c2 ? (float)c1 / c2 : (float)c2 / c1;
     }
     
-    int Y(ushort3 &rgb) {
+    int Y(float3 &rgb) {
         return yuv_cam[0][0] * rgb[0] + yuv_cam[0][1] * rgb[1] + yuv_cam[0][2] * rgb[2];
     }
     
-    int U(ushort3 &rgb) {
+    int U(float3 &rgb) {
         return yuv_cam[1][0] * rgb[0] + yuv_cam[1][1] * rgb[1] + yuv_cam[1][2] * rgb[2];
     }
     
-    int V(ushort3 &rgb) {
+    int V(float3 &rgb) {
         return yuv_cam[2][0] * rgb[0] + yuv_cam[2][1] * rgb[1] + yuv_cam[2][2] * rgb[2];
     }
     
@@ -310,15 +307,15 @@ private:
     }
     
 public:
-    AAHD_Processor(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) 
+    AAHD_Processor(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, float maximum_value) 
         : raw_buffer_(raw_buffer), rgb_buffer_(rgb_buffer), filters_(filters), maximum_value_(maximum_value) {
         
         nr_height = raw_buffer.height + nr_margin * 2;
         nr_width = raw_buffer.width + nr_margin * 2;
         
         // Allocate all AAHD buffers in one block (LibRaw exact)
-        rgb_ahd[0] = (ushort3 *)calloc(nr_height * nr_width,
-                                     (sizeof(ushort3) * 2 + sizeof(int3) * 2 + 3));
+        rgb_ahd[0] = (float3 *)calloc(nr_height * nr_width,
+                                     (sizeof(float3) * 2 + sizeof(int3) * 2 + 3));
         if (!rgb_ahd[0]) {
             throw std::bad_alloc();
         }
@@ -344,6 +341,9 @@ public:
             {0.0f, 0.0f, 1.0f, 0.0f}
         };
         
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j) {
                 yuv_cam[i][j] = 0;
@@ -355,6 +355,9 @@ public:
         
         // Initialize gamma LUT (LibRaw exact)
         if (gammaLUT[0] < -0.1f) {
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
             for (int i = 0; i < 0x10000; i++) {
                 float r = (float)i / 0x10000;
                 gammaLUT[i] = 0x10000 * (r < 0.0181 ? 4.5f * r : 1.0993f * pow(r, 0.45f) - 0.0993f);
@@ -365,11 +368,13 @@ public:
         size_t iwidth = raw_buffer.width;
         size_t iheight = raw_buffer.height;
         
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t i = 0; i < iheight; ++i) {
             int col_cache[48];
             for (int j = 0; j < 48; ++j) {
-                int c = fcol_bayer(static_cast<int>(i), j, filters_);
-                if (c == 3) c = 1; // Map G2 to G1
+                int c = fcol_bayer(i, j, filters_);
                 col_cache[j] = c;
             }
             
@@ -377,15 +382,9 @@ public:
             for (size_t j = 0; j < iwidth; ++j, ++moff) {
                 int c = col_cache[j % 48];
                 
-                uint16_t d = 0;
-                uint16_t *pixel = raw_buffer.image[i * iwidth + j];
-                
-                for (int ch = 0; ch < 4; ch++) {
-                    if (pixel[ch] != 0) {
-                        d = pixel[ch];
-                        break;
-                    }
-                }
+                float d = 0;
+                float *pixel = raw_buffer.image[i * iwidth + j];                
+                d = pixel[c];
                 
                 if (i < 3 && j < 3) {
                     std::cout << "Pixel(" << i << "," << j << ") color=" << c << " RAW_value=" << d;
@@ -435,13 +434,16 @@ float AAHD_Processor::gammaLUT[0x10000] = {-1.f};
 void AAHD_Processor::hide_hots() {
     
     int iwidth = raw_buffer_.width;
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
-        int js = fcol_bayer(static_cast<int>(i), 0, filters_) & 1;
-        int kc = fcol_bayer(static_cast<int>(i), js, filters_);
+        int js = fcol_bayer(i, 0, filters_) & 1;
+        int kc = fcol_bayer(i, js, filters_);
         
         int moff = nr_offset(static_cast<int>(i) + nr_margin, nr_margin + js);
         for (int j = js; j < iwidth; j += 2, moff += 2) {
-            ushort3 *rgb = &rgb_ahd[0][moff];
+            float3 *rgb = &rgb_ahd[0][moff];
             int c = rgb[0][kc];
             
             if ((c > rgb[2 * Pe][kc] && c > rgb[2 * Pw][kc] && c > rgb[2 * Pn][kc] &&
@@ -483,6 +485,9 @@ void AAHD_Processor::hide_hots() {
 }
 
 void AAHD_Processor::make_ahd_greens() {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         make_ahd_gline(static_cast<int>(i));
     }
@@ -493,10 +498,13 @@ void AAHD_Processor::make_ahd_gline(int i) {
     int kc = fcol_bayer(i, js, filters_);
     int hvdir[2] = {Pe, Ps};
     
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
     for (int d = 0; d < 2; ++d) {
         int moff = nr_offset(i + nr_margin, nr_margin + js);
         for (size_t j = js; j < raw_buffer_.width; j += 2, moff += 2) {
-            ushort3 *cnr = &rgb_ahd[d][moff];
+            float3 *cnr = &rgb_ahd[d][moff];
             
             int h1 = 2 * cnr[-hvdir[d]][1] - int(cnr[-2 * hvdir[d]][kc] + cnr[0][kc]);
             int h2 = 2 * cnr[+hvdir[d]][1] - int(cnr[+2 * hvdir[d]][kc] + cnr[0][kc]);
@@ -519,9 +527,15 @@ void AAHD_Processor::make_ahd_gline(int i) {
 }
 
 void AAHD_Processor::make_ahd_rb() {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         make_ahd_rb_hv(static_cast<int>(i));
     }
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         make_ahd_rb_last(static_cast<int>(i));
     }
@@ -534,10 +548,13 @@ void AAHD_Processor::make_ahd_rb_hv(int i) {
     js ^= 1;
     int hvdir[2] = {Pe, Ps};
     
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int j = js; j < iwidth; j += 2) {
         int moff = nr_offset(i + nr_margin, j + nr_margin);
         for (int d = 0; d < 2; ++d) {
-            ushort3 *cnr = &rgb_ahd[d][moff];
+            float3 *cnr = &rgb_ahd[d][moff];
             int c = kc ^ (d << 1);
             int eg = cnr[0][1] + (cnr[-hvdir[d]][c] - cnr[-hvdir[d]][1] + cnr[+hvdir[d]][c] - cnr[+hvdir[d]][1]) / 2;
             
@@ -555,9 +572,12 @@ void AAHD_Processor::make_ahd_rb_last(int i) {
     int dirs[2][3] = {{Pnw, Pn, Pne}, {Pnw, Pw, Psw}};
     int moff = nr_offset(i + nr_margin, nr_margin);
     
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (int j = 0; j < iwidth; ++j) {
         for (int d = 0; d < 2; ++d) {
-            ushort3 *cnr = &rgb_ahd[d][moff + j];
+            float3 *cnr = &rgb_ahd[d][moff + j];
             int c = kc ^ 2;
             if ((j & 1) != js) c ^= d << 1;
             
@@ -585,16 +605,22 @@ void AAHD_Processor::make_ahd_rb_last(int i) {
 void AAHD_Processor::evaluate_ahd() {
     int hvdir[4] = {Pw, Pe, Pn, Ps};
     
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int d = 0; d < 2; ++d) {
         for (int i = 0; i < nr_width * nr_height; ++i) {
-            ushort3 rgb;
-            for (int c = 0; c < 3; ++c) rgb[c] = gammaLUT[rgb_ahd[d][i][c]];
+            float3 rgb;
+            for (int c = 0; c < 3; ++c) rgb[c] = gammaLUT[(uint)rgb_ahd[d][i][c]];
             yuv[d][i][0] = Y(rgb);
             yuv[d][i][1] = U(rgb);
             yuv[d][i][2] = V(rgb);
         }
     }
     
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         int moff = nr_offset(static_cast<int>(i) + nr_margin, nr_margin);
         for (size_t j = 0; j < raw_buffer_.width; ++j, ++moff) {
@@ -620,12 +646,18 @@ void AAHD_Processor::evaluate_ahd() {
 }
 
 void AAHD_Processor::refine_hv_dirs() {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         refine_ihv_dirs(static_cast<int>(i));
     }
 }
 
 void AAHD_Processor::refine_ihv_dirs(int i) {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int js = 0; js < 2; ++js) {
         refine_hv_dirs(i, js);
     }
@@ -646,6 +678,9 @@ void AAHD_Processor::refine_hv_dirs(int i, int js) {
 }
 
 void AAHD_Processor::combine_image() {
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t i = 0; i < raw_buffer_.height; ++i) {
         for (size_t j = 0; j < raw_buffer_.width; ++j) {
             int moff = nr_offset(static_cast<int>(i) + nr_margin, static_cast<int>(j) + nr_margin);
@@ -659,7 +694,7 @@ void AAHD_Processor::combine_image() {
     }
 }
 
-bool CPUAccelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
+bool CPUAccelerator::demosaic_bayer_aahd(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, float maximum_value) {
 
     if (!initialized_) return false;
         
@@ -688,20 +723,15 @@ private:
     int width, height;
     uint32_t filters;
     float (*image)[4];
-    uint16_t maximum_val_;
+    float maximum_val_;
 
     float CLIP_FLOAT(float val) const {
-        return val > (float)maximum_val_ ? (float)maximum_val_ : (val < 0.0f ? 0.0f : val);
+        return val > maximum_val_ ? maximum_val_ : (val < 0.0f ? 0.0f : val);
     }
 
 public:
-    uint16_t CLIP_16BIT(float val) const {
-        if (val < 0.0f) return 0;
-        if (val > (float)maximum_val_) return maximum_val_;
-        return static_cast<uint16_t>(val + 0.5f);
-    }
 
-    DCB_Processor(float (*img_buffer)[4], int w, int h, uint32_t f, uint16_t max_val)
+    DCB_Processor(float (*img_buffer)[4], int w, int h, uint32_t f, float max_val)
         : width(w), height(h), filters(f), image(img_buffer), maximum_val_(max_val) {}
 
     // (dcb_* 関連の全関数は、コンパイラの自動ベクトル化を妨げないよう、
@@ -726,6 +756,9 @@ public:
 
 
 void DCB_Processor::dcb_ver(float (*image3)[3]) {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 2; row < height - 2; row++) {
         for (int col = 2 + (fcol_bayer(row, 2, filters) & 1), indx = row * width + col; col < width - 2; col += 2, indx += 2) {
             image3[indx][1] = CLIP_FLOAT((image[indx + width][1] + image[indx - width][1]) / 2.0f);
@@ -734,6 +767,9 @@ void DCB_Processor::dcb_ver(float (*image3)[3]) {
 }
 
 void DCB_Processor::dcb_hor(float (*image2)[3]) {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 2; row < height - 2; row++) {
         for (int col = 2 + (fcol_bayer(row, 2, filters) & 1), indx = row * width + col; col < width - 2; col += 2, indx += 2) {
             image2[indx][1] = CLIP_FLOAT((image[indx + 1][1] + image[indx - 1][1]) / 2.0f);
@@ -743,6 +779,9 @@ void DCB_Processor::dcb_hor(float (*image2)[3]) {
 
 void DCB_Processor::dcb_color() {
     int u = width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 1, filters) & 1), indx = row * u + col; col < u - 1; col += 2, indx += 2) {
             int c = 2 - fcol_bayer(row, col, filters);
@@ -750,6 +789,9 @@ void DCB_Processor::dcb_color() {
                                          image[indx + u + 1][c] + image[indx + u - 1][c] + image[indx - u + 1][c] + image[indx - u - 1][c]) / 4.0f);
         }
     }
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 2, filters) & 1), indx = row * u + col; col < width - 1; col += 2, indx += 2) {
             int c = fcol_bayer(row, col + 1, filters);
@@ -762,6 +804,9 @@ void DCB_Processor::dcb_color() {
 
 void DCB_Processor::dcb_color2(float (*image2)[3]) {
     int u = width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 1, filters) & 1), indx = row * u + col; col < u - 1; col += 2, indx += 2) {
             int c = 2 - fcol_bayer(row, col, filters);
@@ -769,6 +814,9 @@ void DCB_Processor::dcb_color2(float (*image2)[3]) {
                                           image[indx + u + 1][c] + image[indx + u - 1][c] + image[indx - u + 1][c] + image[indx - u - 1][c]) / 4.0f);
         }
     }
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 2, filters) & 1), indx = row * u + col; col < width - 1; col += 2, indx += 2) {
             int c = fcol_bayer(row, col + 1, filters);
@@ -781,6 +829,9 @@ void DCB_Processor::dcb_color2(float (*image2)[3]) {
 
 void DCB_Processor::dcb_color3(float (*image3)[3]) {
     int u = width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 1, filters) & 1), indx = row * u + col; col < u - 1; col += 2, indx += 2) {
             int c = 2 - fcol_bayer(row, col, filters);
@@ -788,6 +839,9 @@ void DCB_Processor::dcb_color3(float (*image3)[3]) {
                                           image[indx + u + 1][c] + image[indx + u - 1][c] + image[indx - u + 1][c] + image[indx - u - 1][c]) / 4.0f);
         }
     }
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 2, filters) & 1), indx = row * u + col; col < width - 1; col += 2, indx += 2) {
             int c = fcol_bayer(row, col + 1, filters);
@@ -800,6 +854,9 @@ void DCB_Processor::dcb_color3(float (*image3)[3]) {
 
 void DCB_Processor::dcb_decide(float (*image2)[3], float (*image3)[3]) {
     int v = 2 * width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 2; row < height - 2; row++) {
         for (int col = 2 + (fcol_bayer(row, 2, filters) & 1), indx = row * width + col; col < width - 2; col += 2, indx += 2) {
             int c = fcol_bayer(row, col, filters);
@@ -822,6 +879,9 @@ void DCB_Processor::dcb_decide(float (*image2)[3], float (*image3)[3]) {
 }
 
 void DCB_Processor::dcb_copy_to_buffer(float (*image2)[3]) {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int i = 0; i < height * width; i++) {
         image2[i][0] = image[i][0];
         image2[i][2] = image[i][2];
@@ -829,6 +889,9 @@ void DCB_Processor::dcb_copy_to_buffer(float (*image2)[3]) {
 }
 
 void DCB_Processor::dcb_restore_from_buffer(float (*image2)[3]) {
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int i = 0; i < height * width; i++) {
         image[i][0] = image2[i][0];
         image[i][2] = image2[i][2];
@@ -837,6 +900,9 @@ void DCB_Processor::dcb_restore_from_buffer(float (*image2)[3]) {
 
 void DCB_Processor::dcb_pp() {
     int u = width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 2; row < height - 2; row++) {
         for (int col = 2, indx = row * u + col; col < width - 2; col++, indx++) {
             float r1 = (image[indx - 1][0] + image[indx + 1][0] + image[indx - u][0] + image[indx + u][0] + image[indx - u - 1][0] + image[indx + u + 1][0] + image[indx - u + 1][0] + image[indx + u - 1][0]) / 8.0f;
@@ -850,6 +916,9 @@ void DCB_Processor::dcb_pp() {
 
 void DCB_Processor::dcb_nyquist() {
     int v = 2 * width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 2; row < height - 2; row++) {
         for (int col = 2 + (fcol_bayer(row, 2, filters) & 1), indx = row * width + col; col < width - 2; col += 2, indx += 2) {
             int c = fcol_bayer(row, col, filters);
@@ -864,12 +933,18 @@ void DCB_Processor::dcb_color_full() {
     std::vector<float> chroma_vec(static_cast<size_t>(u) * height * 2);
     float (*chroma)[2] = reinterpret_cast<float(*)[2]>(chroma_vec.data());
 
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1 + (fcol_bayer(row, 1, filters) & 1), indx = row * u + col; col < u - 1; col += 2, indx += 2) {
             int c = fcol_bayer(row, col, filters);
             chroma[indx][c / 2] = image[indx][c] - image[indx][1];
         }
     }
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 3; row < height - 3; row++) {
         for (int col = 3 + (fcol_bayer(row, 1, filters) & 1), indx = row * u + col; col < u - 3; col += 2, indx += 2) {
             int c = 1 - fcol_bayer(row, col, filters) / 2;
@@ -885,6 +960,7 @@ void DCB_Processor::dcb_color_full() {
             chroma[indx][c] = (f[0] * g[0] + f[1] * g[1] + f[2] * g[2] + f[3] * g[3]) / (f[0] + f[1] + f[2] + f[3]);
         }
     }
+
     for (int row = 3; row < height - 3; row++) {
         for (int col = 3 + (fcol_bayer(row, 2, filters) & 1), indx = row * u + col; col < u - 3; col += 2, indx += 2) {
             int c = fcol_bayer(row, col + 1, filters) / 2;
@@ -902,6 +978,9 @@ void DCB_Processor::dcb_color_full() {
             }
         }
     }
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 6; row < height - 6; row++) {
         for (int col = 6, indx = row * u + col; col < width - 6; col++, indx++) {
             image[indx][0] = CLIP_FLOAT(chroma[indx][0] + image[indx][1]);
@@ -918,6 +997,9 @@ void DCB_Processor::dcb_color_full() {
 
 void DCB_Processor::dcb_map() {
     int u = width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 1; row < height - 1; row++) {
         for (int col = 1, indx = row * u + col; col < width - 1; col++, indx++) {
             if (image[indx][1] > (image[indx - 1][1] + image[indx + 1][1] + image[indx - u][1] + image[indx + u][1]) / 4.0f)
@@ -941,6 +1023,9 @@ void DCB_Processor::dcb_correction() {
 
 void DCB_Processor::dcb_correction2() {
     int v = 2 * width;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (int row = 4; row < height - 4; row++) {
         for (int col = 4 + (fcol_bayer(row, 2, filters) & 1), indx = row * width + col; col < width - 4; col += 2, indx += 2) {
             int c = fcol_bayer(row, col, filters);
@@ -954,6 +1039,7 @@ void DCB_Processor::dcb_correction2() {
 
 void DCB_Processor::dcb_refinement() {
     int u = width, v = 2 * u, w = 3 * u;
+
     for (int row = 4; row < height - 4; row++) {
         for (int col = 4 + (fcol_bayer(row, 2, filters) & 1), indx = row * u + col; col < u - 4; col += 2, indx += 2) {
             int c = fcol_bayer(row, col, filters);
@@ -1035,7 +1121,7 @@ void DCB_Processor::run_dcb(int iterations, bool dcb_enhance) {
 
 } // anonymous namespace (DCB)
 
-bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value, int iterations, bool dcb_enhance) {
+bool CPUAccelerator::demosaic_bayer_dcb(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, float maximum_value, int iterations, bool dcb_enhance) {
 
     if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid() || raw_buffer.width != rgb_buffer.width || raw_buffer.height != rgb_buffer.height) {
         std::cerr << "❌ DCB Demosaic: Invalid buffers or initialization state." << std::endl;
@@ -1052,22 +1138,28 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
     float (*work_image)[4] = work_image_ptr.get();
     
     // 手順1: 正しいRAWデータの読み出し
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < num_pixels; ++i) {
         size_t row = i / width;
         size_t col = i % width;
         int color_idx = fcol_bayer(row, col, filters);
 
-        uint16_t raw_value = raw_buffer.image[i][color_idx];
+        float raw_value = raw_buffer.image[i][color_idx];
 
         // 全チャンネルを0で初期化
         for(int c=0; c<4; ++c) sparse_image[i][c] = 0.0f;
         
         // ネイティブカラーのみをセット
-        sparse_image[i][color_idx] = static_cast<float>(raw_value);
+        sparse_image[i][color_idx] = raw_value;
     }
     
     // 手順2: バイリニア補間 - 隣接ピクセルのネイティブ値から補間
     std::memcpy(work_image, sparse_image, num_pixels * sizeof(float[4]));
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t r = 1; r < height - 1; ++r) {
         for (size_t c = 1; c < width - 1; ++c) {
             size_t i = r * width + c;
@@ -1110,10 +1202,13 @@ bool CPUAccelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer, ImageBuff
     
     // ✨✨✨ 手順5: float正規化書き込み ✨✨✨
     // work_image (4チャンネル) から rgb_buffer (3チャンネル) への変換
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < num_pixels; ++i) {
-        rgb_buffer.image[i][0] = work_image[i][0] / (float)maximum_value;
-        rgb_buffer.image[i][1] = work_image[i][1] / (float)maximum_value;
-        rgb_buffer.image[i][2] = work_image[i][2] / (float)maximum_value;
+        rgb_buffer.image[i][0] = work_image[i][0] / maximum_value;
+        rgb_buffer.image[i][1] = work_image[i][1] / maximum_value;
+        rgb_buffer.image[i][2] = work_image[i][2] / maximum_value;
     }
     
     // ✨デモザイク後境界補間✨: 最終処理で境界を修正
@@ -1153,19 +1248,19 @@ private:
     float clip_pt;
     float clip_pt8;
 
-    const ImageBuffer& raw_buffer_;
+    const ImageBufferFloat& raw_buffer_;
     ImageBufferFloat& rgb_buffer_;
     const uint32_t filters_;
     const float (&cam_mul_)[4];
     const size_t width_, height_;
-    const uint16_t maximum_value_;
+    const float maximum_value_;
     int ex = 0, ey = 0;
     unsigned int cfarray[2][2]; // Bayer pattern cache
 
     struct s_hv { float h; float v; };
 
 public:
-    AMaZE_Processor_RT(const ImageBuffer& raw, ImageBufferFloat& rgb, uint32_t f, const float (&cam_mul)[4], uint16_t max_val)
+    AMaZE_Processor_RT(const ImageBufferFloat& raw, ImageBufferFloat& rgb, uint32_t f, const float (&cam_mul)[4], float max_val)
         : raw_buffer_(raw), rgb_buffer_(rgb), filters_(f), cam_mul_(cam_mul), width_(raw.width), height_(raw.height), maximum_value_(max_val)
     {
         // Assuming G1==G2 and are not white-balanced (pre-demosaic)
@@ -1193,7 +1288,7 @@ public:
     }
 
     // A robust Bayer pattern lookup function, like in RawTherapee
-    unsigned int fc_rt(int r, int c) const {
+    inline unsigned int fc_rt(int r, int c) const {
         return cfarray[r & 1][c & 1];
     }
 
@@ -1226,7 +1321,7 @@ public:
             float* nyqutest     = reinterpret_cast<float*>(reinterpret_cast<char*>(nyquist) + sizeof(unsigned char) * TS * TSH);
 
 #ifdef _OPENMP
-            #pragma omp for collapse(2) schedule(dynamic, 8) nowait
+            #pragma omp for collapse(2)
 #endif
             for (int top = -16; top < (int)height_; top += TS - 32) {
                 for (int left = -16; left < (int)width_; left += TS - 32) {
@@ -1618,7 +1713,7 @@ public:
 } // anonymous namespace
 
 
-bool CPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, const float (&cam_mul)[4], uint16_t maximum_value) {
+bool CPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, const float (&cam_mul)[4], float maximum_value) {
     if (!initialized_ || !raw_buffer.is_valid() || !rgb_buffer.is_valid() ||
         raw_buffer.width != rgb_buffer.width || raw_buffer.height != rgb_buffer.height) {
         std::cerr << "❌ AMaZE Demosaic (RT Port): Invalid buffers or initialization state." << std::endl;
@@ -1657,8 +1752,8 @@ namespace {
 
 class XTrans_Processor {
 private:
-    const libraw_enhanced::ImageBuffer& raw_buffer_;
-    libraw_enhanced::ImageBufferFloat& rgb_buffer_;
+    const ImageBufferFloat& raw_buffer_;
+    ImageBufferFloat& rgb_buffer_;
     const char (&xtrans_)[6][6];
     const float (&color_matrix_)[3][4];
     uint32_t width_, height_;
@@ -1708,6 +1803,9 @@ private:
 
         if (!rgb) return; // テーブル初期化のみ実行
 
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int i = 0; i < height; ++i) {
             for (int j = 0; j < labWidth; ++j) {
                 // RGBからXYZへの変換
@@ -1769,6 +1867,9 @@ private:
 
         if (!rgb) return; // テーブルがないので何もしない
 
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int i = 0; i < height; ++i) {
             for (int j = 0; j < labWidth; ++j) {
                 // RGBからXYZへの変換
@@ -1790,7 +1891,7 @@ private:
             }
         }
     }
-    void xtrans_border_interpolate(int border)
+    void xtrans_border_interpolate(uint32_t border)
     {
         const float weight[3][3] = {
             {0.25f, 0.5f, 0.25f},
@@ -1798,16 +1899,23 @@ private:
             {0.25f, 0.5f, 0.25f}
         };
 
-        for (int row = 0; row < (int)height_; row++) {
-            for (int col = 0; col < (int)width_; col++) {
-                if (col == border && row >= border && row < (int)height_ - border) {
-                    col = width_ - border;
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
+        for (uint32_t row = 0; row < height_; row++) {
+            for (uint32_t col = 0; col < width_; col++) {
+                if (col >= border && col < width_ - border &&
+                    row >= border && row < height_ - border) {
+                    continue;
                 }
 
                 float sum[6] = {0.f};
 
-                for (int y = std::max(0, row - 1), v = row == 0 ? 0 : -1; y <= std::min(row + 1, (int)height_ - 1); y++, v++) {
-                    for (int x = std::max(0, col - 1), h = col == 0 ? 0 : -1; x <= std::min(col + 1, (int)width_ - 1); x++, h++) {
+                for (uint32_t y = (row > 0) ? row - 1 : 0, v = (row == 0)? 0 : -1; y < row + 2 && y < height_; y++, v++) {
+                    for (uint32_t x = (col > 0) ? col - 1 : 0, h = (col == 0)? 0 : -1; x < col + 2 && x < width_; x++, h++) {
+
+//                for (int y = std::max(0, row - 1), v = row == 0 ? 0 : -1; y <= std::min(row + 1, (int)height_ - 1); y++, v++) {
+//                    for (int x = std::max(0, col - 1), h = col == 0 ? 0 : -1; x <= std::min(col + 1, (int)width_ - 1); x++, h++) {
                         int f = fcol_xtrans_(y, x);
                         sum[f] += raw_buffer(y, x) * weight[v + 1][h + 1];
                         sum[f + 3] += weight[v + 1][h + 1];
@@ -1842,10 +1950,10 @@ private:
     }
 
 public:
-    XTrans_Processor(const libraw_enhanced::ImageBuffer& raw, libraw_enhanced::ImageBufferFloat& rgb, 
-                    const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t max_val)
+    XTrans_Processor(const ImageBufferFloat& raw, ImageBufferFloat& rgb, 
+                    const char (&xtrans)[6][6], const float (&color_matrix)[3][4], float max_val)
         : raw_buffer_(raw), rgb_buffer_(rgb), xtrans_(xtrans), color_matrix_(color_matrix),
-            width_(raw.width), height_(raw.height), maximum_value_((float)max_val){
+            width_(raw.width), height_(raw.height), maximum_value_(max_val){
     }
 
     void run_3pass() {
@@ -1859,26 +1967,9 @@ public:
         constexpr short dir[4] = { 1, ts, ts + 1, ts - 1 };
         
         float xyz_cam[3][3];
-
-/*
-        constexpr float xyz_rgb[3][3] = {
-            { 0.412453f, 0.357580f, 0.180423f },
-            { 0.212671f, 0.715160f, 0.072169f },
-            { 0.019334f, 0.119193f, 0.950227f }
-        };
-
-        constexpr float d65_white[3] = { 0.950456f, 1.0f, 1.088754f };
-
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                xyz_cam[i][j] = 0.0f;
-                for (int k = 0; k < 3; k++) {
-                    xyz_cam[i][j] += xyz_rgb[i][k] * color_matrix_[k][j] / d65_white[i];
-                }
-            }
-        }
-*/
-
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int i = 0; i < 3; i++) {
             for (int j = 0; j < 3; j++) {
                 xyz_cam[i][j] = color_matrix_[i][j];
@@ -1891,6 +1982,9 @@ public:
         {
             int gint, d, h, v, ng, row, col;
 
+#ifdef _OPENMP
+            #pragma omp parallel for collapse(2)
+#endif
             for (row = 0; row < 3; row++) {
                 for (col = 0; col < 3; col++) {
                     gint = isgreen_(row, col);
@@ -1960,7 +2054,7 @@ public:
             auto greenminmaxtile = reinterpret_cast<s_minmaxgreen(*)[ts / 2]>(greenminmax_buffer_tile.data());
 
 #ifdef _OPENMP
-            #pragma omp for collapse(2) schedule(dynamic, 4) nowait
+            #pragma omp for collapse(2)
 #endif
             //std::cout << "[DEBUG] X-Trans tile loop begin" << std::endl;
             for (int top = 3; top < (int)height_ - 19; top += ts - 16) {
@@ -2338,17 +2432,17 @@ public:
                         //std::cout << "[DEBUG] For 1-pass demosaic we use YPbPr which requires much" << std::endl;
                         for (int d = 0; d < ndir; d++) {
                             float (*yuv)[ts - 8][ts - 8] = lab; // we use the lab buffer, which has the same dimensions
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                             float32x4_t zd2627v = vdupq_n_f32(0.2627f);
                             float32x4_t zd6780v = vdupq_n_f32(0.6780f);
                             float32x4_t zd0593v = vdupq_n_f32(0.0593f);
                             float32x4_t zd56433v = vdupq_n_f32(0.56433f);
                             float32x4_t zd67815v = vdupq_n_f32(0.67815f);
-    #endif
+#endif
 
                             for (int row = 4; row < mrow - 4; row++) {
                                 int col = 4;
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                                 for (; col < mcol - 7; col += 4) {
                                     // use ITU-R BT.2020 YPbPr, which is great, but could use
                                     // a better/simpler choice? note that imageop.h provides
@@ -2377,7 +2471,7 @@ public:
                                     vst1q_f32(&yuv[1][row - 4][col - 4], uv);
                                     vst1q_f32(&yuv[2][row - 4][col - 4], vv);
                                 }
-    #endif
+#endif
                                 for (; col < mcol - 4; col++) {
                                     // use ITU-R BT.2020 YPbPr, which is great, but could use
                                     // a better/simpler choice? note that imageop.h provides
@@ -2408,15 +2502,15 @@ public:
 
                     /* Build homogeneity maps from the derivatives:         */
                     //std::cout << "[DEBUG] Build homogeneity maps from the derivatives:" << std::endl;
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                     float32x4_t eightv = vdupq_n_f32(8.f);
                     float32x4_t zerov = vdupq_n_f32(0.f);
                     float32x4_t onev = vdupq_n_f32(1.f);
-    #endif
+#endif
 
                     for (int row = 6; row < mrow - 6; row++) {
                         int col = 6;
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                         for (; col < mcol - 9; col += 4) {
                             float32x4_t tr1v = vminq_f32(vld1q_f32(&drv[0][row - 5][col - 5]), vld1q_f32(&drv[1][row - 5][col - 5]));
                             float32x4_t tr2v = vminq_f32(vld1q_f32(&drv[2][row - 5][col - 5]), vld1q_f32(&drv[3][row - 5][col - 5]));
@@ -2454,7 +2548,7 @@ public:
                                 homo[d][row][col + 3] = (uint8_t)temp_arr[3];
                             }
                         }
-    #endif
+#endif
 
                         for (; col < mcol - 6; col++) {
                             float tr = drv[0][row - 5][col - 5] < drv[1][row - 5][col - 5] ? drv[0][row - 5][col - 5] : drv[1][row - 5][col - 5];
@@ -2494,7 +2588,7 @@ public:
                     for(int d = 0; d < ndir; d++) {
                         for (int row = std::min(top, 8); row < mrow - 8; row++) {
                             int col = startcol;
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                             int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
 
                             // crunching 16 values at once is faster than summing up column sums
@@ -2510,7 +2604,7 @@ public:
 
                                 vst1q_u8(&homosum[d][row][col], v5sumv);
                             }
-    #endif
+#endif
 
                             if(col < mcol - 8) {
                                 int v5sum[5] = {0};
@@ -2540,13 +2634,13 @@ public:
 
                     // calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step
                     //std::cout << "[DEBUG] calculate maximum of homogeneity maps per pixel. Vectorized calculation is a tiny bit faster than on the fly calculation in next step" << std::endl;
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                     uint8x16_t maskv = vdupq_n_u8(31);
-    #endif
+#endif
 
                     for (int row = std::min(top, 8); row < mrow - 8; row++) {
                         int col = startcol;
-    #ifdef __ARM_NEON
+#ifdef __ARM_NEON
                         int endcol = row < mrow - 9 ? mcol - 8 : mcol - 23;
 
                         for (; col < endcol; col += 16) {
@@ -2592,7 +2686,7 @@ public:
                             
                             vst1q_u8(&homosummax[row][col], maxval1);
                         }
-    #endif
+#endif
 
                         for (; col < mcol - 8; col ++) {
                             uint8_t maxval = homosum[0][row][col];
@@ -2636,7 +2730,7 @@ public:
                                     for (int c = 0; c < 3; c++) {
                                         avg[c] += rgb[d][row][col][c];
                                     }
-                                    avg[3]++;
+                                    avg[3] += 1.f;
                                 }
 
                             RGB_BUFFER(row + top, col + left, 0) = std::max(0.f, avg[0] / avg[3]);
@@ -2663,6 +2757,9 @@ public:
             {0.25f, 0.5f, 0.25f}
         };
         
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int row = 1; row < (int)height_ - 1; ++row) {
             for (int col = 1; col < (int)width_ - 1; ++col) {
                 float sum[3] = {0.0f, 0.0f, 0.0f};
@@ -2737,7 +2834,7 @@ public:
 
 } // namespace
 
-bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], float maximum_value) {
     if (!raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         return false;
     }
@@ -2746,7 +2843,7 @@ bool CPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
     return true;
 }
 
-bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+bool CPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], float maximum_value) {
     if (!raw_buffer.is_valid() || !rgb_buffer.is_valid()) {
         return false;
     }
@@ -2770,6 +2867,9 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
     }
 
     const size_t pixel_count = rgb_input.width * rgb_input.height;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
     for (size_t i = 0; i < pixel_count; i++) {
         const float* in = rgb_input.image[i];
         float* out = rgb_output.image[i];
@@ -2800,6 +2900,9 @@ bool CPUAccelerator::gamma_correct(const ImageBufferFloat& rgb_input, ImageBuffe
     }
 
     std::cout << "🎯 Gamma Correction: color_space=" << output_color_space << ", γ=" << gamma_power << ", slope=" << gamma_slope << std::endl;
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t i = 0; i < rgb_input.width * rgb_input.height; i++) {
         float* pixel = rgb_output.image[i];
         for (int c = 0; c < 3; c++) {
@@ -2868,19 +2971,21 @@ float CPUAccelerator::apply_pure_power_gamma_encode_with_slope(float v, float p,
 // 境界補間
 //===================================================================
 
-void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint32_t filters, int border_int) {
+void CPUAccelerator::border_interpolate(const ImageBufferFloat& rgb_buffer, uint32_t filters, size_t border) {
     const size_t width = rgb_buffer.width, height = rgb_buffer.height;
-    const int border = border_int;
     float (*image)[3] = rgb_buffer.image;
     std::cout << "🔧 LibRaw-exact border interpolation: border=" << border << " pixels" << std::endl;
-    
+
     // ✨LibRaw完全移植✨: 元のLibRaw border_interpolate を正確に再現
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t row = 0; row < height; row++) {
         for (size_t col = 0; col < width; col++) {
             // LibRawの最適化: 境界領域のみ処理、内部は早期スキップ
-            if (col == static_cast<size_t>(border) && row >= static_cast<size_t>(border) && 
-                row < (height - static_cast<size_t>(border))) {
-                col = width - static_cast<size_t>(border);
+            if (col >= border && col < (width - border) &&
+                row >= border && row < (height - border)) {
+                continue;
             }
             
             // sum配列: [R, G, B, G2, R_count, G_count, B_count, G2_count]

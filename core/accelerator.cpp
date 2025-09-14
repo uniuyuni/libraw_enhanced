@@ -87,14 +87,14 @@ bool Accelerator::pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters
 //===================================================================
 
 // Unified demosaic computation with CPU/GPU selection
-bool Accelerator::demosaic_compute(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_compute(const ImageBufferFloat& raw_buffer,
                                     ImageBufferFloat& rgb_buffer,
                                     int algorithm,
                                     uint32_t filters,
                                     const char (&xtrans)[6][6],
                                     const float (&color_matrix)[3][4],
                                     const float (&cam_mul)[4],
-                                    uint16_t maximum_value) {
+                                    float maximum_value) {
 
     if (filters == FILTERS_XTRANS) {
         // xtrans data
@@ -133,10 +133,10 @@ bool Accelerator::demosaic_compute(const ImageBuffer& raw_buffer,
 //===================================================================
 
 // Processing methods with GPU/CPU selection
-bool Accelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_bayer_linear(const ImageBufferFloat& raw_buffer,
                                            ImageBufferFloat& rgb_buffer,
                                            uint32_t filters,
-                                           uint16_t maximum_value) {
+                                           float maximum_value) {
     // GPU acceleration check
     if (should_use_gpu()) {
         std::cout << "🎯 Trying GPU Bayer Linear demosaic..." << std::endl;
@@ -157,10 +157,10 @@ bool Accelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer,
     return false;
 }
 
-bool Accelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_bayer_aahd(const ImageBufferFloat& raw_buffer,
                                         ImageBufferFloat& rgb_buffer,
                                         uint32_t filters,
-                                        uint16_t maximum_value) {
+                                        float maximum_value) {
 
     if (should_use_gpu()) {
         // GPU accelerator needs to be updated for demosaic_bayer_aahd
@@ -177,10 +177,10 @@ bool Accelerator::demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
     return false;
 }
 
-bool Accelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_bayer_dcb(const ImageBufferFloat& raw_buffer,
                                         ImageBufferFloat& rgb_buffer,
                                         uint32_t filters,
-                                        uint16_t maximum_value,
+                                        float maximum_value,
                                         int iterations,
                                         bool dcb_enhance) {
 
@@ -199,11 +199,11 @@ bool Accelerator::demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
     return false;
 }
 
-bool Accelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer,
                                           ImageBufferFloat& rgb_buffer,
                                           uint32_t filters,
                                           const float (&cam_mul)[4],
-                                          uint16_t maximum_value) {
+                                          float maximum_value) {
     //if (should_use_gpu()) {
     if (false) {
         std::cout << "🎯 Trying GPU AMaZE demosaic..." << std::endl;
@@ -227,11 +227,11 @@ bool Accelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
 // Demosaic Xtrans
 //===================================================================
 
-bool Accelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer,
                                         ImageBufferFloat& rgb_buffer,
                                         const char (&xtrans)[6][6],
                                         const float (&color_matrix)[3][4],
-                                        uint16_t maximum_value) {
+                                        float maximum_value) {
     //if (should_use_gpu()) {
     if (false) { // Temporarily disable GPU for testing
         std::cout << "🎯 Trying GPU X-Trans 1-pass demosaic..." << std::endl;
@@ -251,11 +251,11 @@ bool Accelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
     return false;
 }
 
-bool Accelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
+bool Accelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
                                         ImageBufferFloat& rgb_buffer,
                                         const char (&xtrans)[6][6],
                                         const float (&color_matrix)[3][4],
-                                        uint16_t maximum_value) {
+                                        float maximum_value) {
     //if (should_use_gpu()) {
     if (false) {
         std::cout << "🎯 Trying GPU X-Trans 3-pass demosaic..." << std::endl;
@@ -347,7 +347,7 @@ bool Accelerator::gamma_correct(const ImageBufferFloat& rgb_input,
         std::cout << "✅ Color space Raw or XYZ or ACEScg, skipping gamma correction" << std::endl;
         return true;
     } else
-    if (gamma_power > 0.f && gamma_slope > 0.f) {
+    if (gamma_power > 0.f) {
         std::cout << "ℹ️ Both gamma power and slope are set, custom gamma corrention" << std::endl;
         std::cout << "　 Gamma power: " << gamma_power << " slope: " << gamma_slope << std::endl;
         output_color_space = -1;

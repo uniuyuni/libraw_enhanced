@@ -194,9 +194,9 @@ private:
         for (i = 0; i < 4; i++) {
             for (j = 0; j < 3; j++) {
                 temp[i][j] = 0.0;
-                for (k = 0; k < 3; k++)
+                for (k = 0; k < 3; k++) {
                     temp[i][j] += cam_xyz[i][k] * xyz_rgb[k][j];
-//                    temp[i][j] += xyz_rgb[i][k] * cam_xyz[k][j];
+                }
             }
         }
 

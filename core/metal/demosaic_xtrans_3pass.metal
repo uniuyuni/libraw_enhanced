@@ -17,16 +17,16 @@ inline int isgreen(int row, int col, thread char (&xtrans)[6][6]) {
     return (xtrans[(row) % 3][(col) % 3] & 1);
 }
 
-inline float raw_buffer(int row, int col, const device uint16_t* raw_data, constant DemosaicXTransParams& params) {
+inline float raw_buffer(int row, int col, const device float* raw_data, constant DemosaicXTransParams& params) {
     int pos = row * params.width + col;
     //if (pos < 0 || pos >= (int)(params.width * params.height)) return 0.0f;
-    return (float)raw_data[pos] / params.maximum_value;
+    return raw_data[pos] / params.maximum_value;
 }
 
-inline float raw_buffer_hex(int row, int col, short hex, const device uint16_t* raw_data, constant DemosaicXTransParams& params) {
+inline float raw_buffer_hex(int row, int col, short hex, const device float* raw_data, constant DemosaicXTransParams& params) {
     int pos = row * params.width + col + hex;
     //if (pos < 0 || pos >= (int)(params.width * params.height)) return 0.0f;
-    return (float)raw_data[pos] / params.maximum_value;
+    return raw_data[pos] / params.maximum_value;
 }
 
 inline void vconvertrgbrgbrgbrgb2rrrrggggbbbb(const device float *src,
@@ -43,7 +43,7 @@ inline void vconvertrgbrgbrgbrgb2rrrrggggbbbb(const device float *src,
 
 // X-Trans 3-pass demosaic kernel
 kernel void demosaic_xtrans_3pass(
-    const device uint16_t* raw_data [[buffer(0)]],
+    const device float* raw_data [[buffer(0)]],
     device float* rgb_data [[buffer(1)]],
     const device float* cbrt_lut [[buffer(2)]],
     const device short* allhex_data [[buffer(3)]],

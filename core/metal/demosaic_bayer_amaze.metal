@@ -16,9 +16,9 @@ struct s_hv { float h; float v; };
 
 [[kernel, max_total_threads_per_threadgroup(16)]]
 void demosaic_bayer_amaze(
-    const device ushort4* raw_buffer    [[buffer(0)]],
+    const device float4* raw_buffer    [[buffer(0)]],
     device float* rgb_buffer            [[buffer(1)]],
-    constant DemosaicBayerParams& params        [[buffer(2)]],
+    constant DemosaicBayerParams& params [[buffer(2)]],
     device float* rgbgreen_             [[buffer(3)]],
     device float* delhvsqsum_           [[buffer(4)]],
     device float* dirwts0_              [[buffer(5)]],
@@ -132,7 +132,7 @@ void demosaic_bayer_amaze(
                 int safe_row = max(0, min((int)height_ - 1, row));
                 int safe_col = max(0, min((int)width_ - 1, cc + left));
                 int c = fc_rt(safe_row, safe_col);
-                float val = (float)raw_buffer[safe_row * width_ + safe_col][c] * scale;
+                float val = raw_buffer[safe_row * width_ + safe_col][c] * scale;
                 cfa[rr * TS + cc] = val;
                 rgbgreen[rr * TS + cc] = val;
             }
@@ -146,7 +146,7 @@ void demosaic_bayer_amaze(
         for (; cc < ccmax; cc++) {
             int indx1 = rr * TS + cc;
             int c = fc_rt(row, cc + left);
-            float val = (float)raw_buffer[row * width_ + (cc + left)][c] * scale;
+            float val = raw_buffer[row * width_ + (cc + left)][c] * scale;
             cfa[indx1] = val;
             rgbgreen[indx1] = val;
         }
@@ -159,7 +159,7 @@ void demosaic_bayer_amaze(
                 int safe_row = max(0, min((int)height_ - 1, (int)height_ - rr - 2));
                 int safe_col = max(0, min((int)width_ - 1, left + cc));
                 int c = fc_rt(safe_row, safe_col);
-                float val = (float)raw_buffer[safe_row * width_ + safe_col][c] * scale;
+                float val = raw_buffer[safe_row * width_ + safe_col][c] * scale;
                 cfa[(rrmax + rr) * TS + cc] = val;
                 rgbgreen[(rrmax + rr) * TS + cc] = val;
             }
@@ -173,7 +173,7 @@ void demosaic_bayer_amaze(
                 int safe_row = max(0, min((int)height_ - 1, row));
                 int safe_col = max(0, min((int)width_ - 1, 32 - cc + left));
                 int c = fc_rt(safe_row, safe_col);
-                float val = (float)raw_buffer[safe_row * width_ + safe_col][c] * scale;
+                float val = raw_buffer[safe_row * width_ + safe_col][c] * scale;
                 cfa[rr * TS + cc] = val;
                 rgbgreen[rr * TS + cc] = val;
             }
@@ -185,7 +185,7 @@ void demosaic_bayer_amaze(
                 int safe_row = max(0, min((int)height_ - 1, top + rr));
                 int safe_col = max(0, min((int)width_ - 1, (int)width_ - cc - 2));
                 int c = fc_rt(safe_row, safe_col);
-                float val = (float)raw_buffer[safe_row * width_ + safe_col][c] * scale;
+                float val = raw_buffer[safe_row * width_ + safe_col][c] * scale;
                 cfa[rr * TS + ccmax + cc] = val;
                 rgbgreen[rr * TS + ccmax + cc] = val;
             }

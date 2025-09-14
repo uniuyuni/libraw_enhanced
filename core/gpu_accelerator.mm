@@ -156,7 +156,7 @@ bool GPUAccelerator::apply_white_balance(const ImageBuffer& raw_buffer,
 // Demosaic Bayer Liner
 //===================================================================
 
-bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, uint16_t maximum_value) {
+bool GPUAccelerator::demosaic_bayer_linear(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, float maximum_value) {
 #ifdef __OBJC__
     if (!pimpl_->initialized) return false;
     
@@ -172,7 +172,10 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
         
         // Prepare raw data
-        std::vector<uint16_t> raw_gpu_data(pixel_count);
+        std::vector<float> raw_gpu_data(pixel_count);
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t i = 0; i < pixel_count; i++) {
             size_t r = i / width, c = i % width;
             uint32_t color_idx = fcol_bayer(r, c, filters);
@@ -181,7 +184,7 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
 
         // Create Metal buffers
         id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
-                                                            length:pixel_count * sizeof(uint16_t) 
+                                                            length:pixel_count * sizeof(float) 
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
         
@@ -240,7 +243,7 @@ bool GPUAccelerator::demosaic_bayer_linear(const ImageBuffer& raw_buffer, ImageB
 // Demosaic Bayer AMaZE
 //===================================================================
 
-bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, const float (&cam_mul)[4], uint16_t maximum_value) {
+bool GPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, uint32_t filters, const float (&cam_mul)[4], float maximum_value) {
 #ifdef __OBJC__
     if (!pimpl_->initialized) return false;
     
@@ -255,9 +258,12 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
         
-        std::vector<ushort4> raw_rgbg_data(pixel_count);
+        std::vector<float4> raw_rgbg_data(pixel_count);
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t i = 0; i < pixel_count; i++) {
-            raw_rgbg_data[i] = { raw_buffer.image[i][0], raw_buffer.image[i][1], raw_buffer.image[i][2], raw_buffer.image[i][3] };
+            raw_rgbg_data[i] = { raw_buffer.image[i][0], raw_buffer.image[i][1], raw_buffer.image[i][2], raw_buffer.image[i][1] };
         }
 
         const size_t AMAZE_TS_CONST = 160;
@@ -274,7 +280,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
         size_t total_tile_pixels_half = total_tiles * TILE_PIXELS_HALF;
 
         id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_rgbg_data.data()
-                                                            length:pixel_count * sizeof(ushort4)
+                                                            length:pixel_count * sizeof(float4)
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
         
@@ -398,7 +404,7 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBuffer& raw_buffer, ImageBu
 // Demosaic X-Trans 1pass
 //===================================================================
 
-bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], uint16_t maximum_value) {
+bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer, ImageBufferFloat& rgb_buffer, const char (&xtrans)[6][6], const float (&color_matrix)[3][4], float maximum_value) {
 #ifdef __OBJC__
     if (!pimpl_->initialized) return false;
     
@@ -414,7 +420,10 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
         
         // Prepare raw data
-        std::vector<uint16_t> raw_gpu_data(pixel_count);
+        std::vector<float> raw_gpu_data(pixel_count);
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t i = 0; i < pixel_count; ++i) {
             size_t r = i / width, c = i % width;
             raw_gpu_data[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
@@ -422,7 +431,7 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
         
         // Create Metal buffers
         id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
-                                                            length:pixel_count * sizeof(uint16_t) 
+                                                            length:pixel_count * sizeof(float) 
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
         
@@ -455,8 +464,8 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
         // First do border interpolation
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         [encoder setComputePipelineState:xtrans_border_pipeline];
-        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
-        [encoder setBuffer:raw_metal_buffer offset:0 atIndex:1];
+        [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
+        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -489,11 +498,11 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBuffer& raw_buffer, ImageB
 // Demosaic X-Trans 3pass
 //===================================================================
 
-bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
+bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
                                           ImageBufferFloat& rgb_buffer,
                                           const char (&xtrans)[6][6],
                                           const float (&color_matrix)[3][4],
-                                          uint16_t maximum_value) {
+                                          float maximum_value) {
 #ifdef __OBJC__
     if (!pimpl_->initialized) return false;
     
@@ -511,7 +520,10 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         constexpr int ts = XTRANS_3PASS_TS;
         
         // 生データ準備
-        std::vector<uint16_t> raw_gpu_data(pixel_count);
+        std::vector<float> raw_gpu_data(pixel_count);
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
         for (size_t i = 0; i < pixel_count; ++i) {
             size_t r = i / width, c = i % width;
             raw_gpu_data[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
@@ -519,7 +531,7 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         
         // Metalバッファ作成
         id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
-                                                            length:pixel_count * sizeof(uint16_t) 
+                                                            length:pixel_count * sizeof(float) 
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
         
@@ -547,6 +559,9 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
             { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 }
         };
         
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2)
+#endif
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
                 int gint = isgreen(row, col) ? 1 : 0;
@@ -630,7 +645,7 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
 
         // スレッドグループサイズ計算
         MTLSize grid_size = MTLSizeMake(tile_count_x, tile_count_y, 1);
-        MTLSize threadgroup_size = MTLSizeMake(4, 2, 1);
+        MTLSize threadgroup_size = MTLSizeMake(4, 4, 1);
         
         // パイプライン実行 - 新しい遅延ロード方式使用
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
@@ -656,10 +671,10 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
         
         // ボーダー補間
         [encoder setComputePipelineState:xtrans_border_pipeline];
-        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:0];
-        [encoder setBuffer:raw_metal_buffer offset:0 atIndex:1];
+        [encoder setBuffer:raw_metal_buffer offset:0 atIndex:0];
+        [encoder setBuffer:rgb_metal_buffer offset:0 atIndex:1];
         [encoder setBuffer:params_buffer offset:0 atIndex:2];
-        [encoder dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:threadgroup_size];
+        [encoder dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
       
         [encoder endEncoding];
         [command_buffer commit];

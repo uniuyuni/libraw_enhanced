@@ -32,35 +32,35 @@ public:
                             const char xtrans[6][6]);
 
     // Bayer demosaicing methods
-    bool demosaic_bayer_linear(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_linear(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer, 
                             uint32_t filters,
-                            uint16_t maximum_value);
+                            float maximum_value);
                            
-    bool demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
                             const float (&cam_mul)[4],
-                            uint16_t maximum_value);
+                            float maximum_value);
     
     // X-Trans demosaicing methods
-    bool demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             const char (&xtrans)[6][6],
                             const float (&color_matrix)[3][4],
-                            uint16_t maximum_value);
+                            float maximum_value);
                               
-    bool demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             const char (&xtrans)[6][6],
                             const float (&color_matrix)[3][4],
-                            uint16_t maximum_value);
+                            float maximum_value);
 
-    bool demosaic_xtrans_adaptive(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_adaptive(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             const char (&xtrans)[6][6],
                             const float (&color_matrix)[3][4],
-                            uint16_t maximum_value);
+                            float maximum_value);
                             
     bool convert_color_space(const ImageBufferFloat& rgb_input,
                             ImageBufferFloat& rgb_output,

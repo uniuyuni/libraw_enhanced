@@ -15,16 +15,6 @@
 
 namespace libraw_enhanced {
 
-// ✨ D50白色点 (ProPhotoRGBに準拠)
-static constexpr float d50_white[3] = {0.9642f, 1.0f, 0.8249f};
-
-// ✨ XYZから線形ProPhotoRGBへの変換マトリクス
-static constexpr float xyz_rgb[3][3] = {
-    {1.34578f, -0.04008f, -0.04033f},
-    {-0.25556f, 1.15949f, 0.09109f},
-    {0.00912f, -0.00994f, 1.00693f}
-};
-
 // ===== COMMON DEFINITIONS =====
 // These definitions are shared across CPU, GPU, and wrapper components
 
@@ -45,7 +35,7 @@ struct ImageBufferFloat {
     size_t height = 0;
     size_t channels = 3;  // Always 3 (RGB)
     
-    bool is_valid() const { return image != nullptr && width > 0 && height > 0; }
+    bool is_valid() const { return image != nullptr && width > 0 && height > 0 && channels > 0; }
 };
 
 // Processing parameters for all components
@@ -208,51 +198,51 @@ public:
     bool pre_interpolate(ImageBufferFloat& rgb_buffer, uint32_t filters, const char (&xtrans)[6][6], bool half_size = false);
     
     // Bayer demosaicing methods
-    bool demosaic_bayer_linear(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_linear(const ImageBufferFloat& raw_buffer,
                                 ImageBufferFloat& rgb_buffer, 
                                 uint32_t filters,
-                                uint16_t maximum_value);
+                                float maximum_value);
                                                          
-    bool demosaic_bayer_aahd(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_aahd(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
-                            uint16_t maximum_value);
+                            float maximum_value);
                                             
-    bool demosaic_bayer_dcb(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_dcb(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
-                            uint16_t maximum_value,
+                            float maximum_value,
                             int iterations = 1,   // デフォルト値
                             bool dcb_enhance = true); // デフォルト値
                            
-    bool demosaic_bayer_amaze(const ImageBuffer& raw_buffer,
+    bool demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             uint32_t filters,
                             const float (&cam_mul)[4],
-                            uint16_t maximum_value);
+                            float maximum_value);
     
     // Unified demosaic compute method with CPU/GPU selection
-    bool demosaic_compute(const ImageBuffer& raw_buffer,
+    bool demosaic_compute(const ImageBufferFloat& raw_buffer,
                             ImageBufferFloat& rgb_buffer,
                             int algorithm,
                             uint32_t filters,
                             const char (&xtrans)[6][6],
                             const float (&color_matrix)[3][4],
                             const float (&cam_mul)[4],
-                            uint16_t maximum_value);
+                            float maximum_value);
     
     // X-Trans demosaicing methods  
-    bool demosaic_xtrans_3pass(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
                                 ImageBufferFloat& rgb_buffer,
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
-                                uint16_t maximum_value);
+                                float maximum_value);
                               
-    bool demosaic_xtrans_1pass(const ImageBuffer& raw_buffer,
+    bool demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer,
                                 ImageBufferFloat& rgb_buffer,
                                 const char (&xtrans)[6][6],
                                 const float (&color_matrix)[3][4],
-                                uint16_t maximum_value);
+                                float maximum_value);
                                 
     // Camera matrix-based color space conversion
     bool convert_color_space(const ImageBufferFloat& rgb_input,

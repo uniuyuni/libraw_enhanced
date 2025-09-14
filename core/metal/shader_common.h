@@ -22,11 +22,15 @@ using namespace std;
 
 STATIC_CONSTANT uint32_t bayer_to3[4] = {0, 1, 2, 1}; // Maps Bayer filter to RGBG
 
-inline uint32_t fcol_bayer(uint32_t row, uint32_t col, uint32_t filters) {
-    return bayer_to3[(filters >> ((((row) << 1) & 14) + ((col) & 1)) * 2) & 3];
+inline uint32_t fcol_bayer_native(uint32_t row, uint32_t col, uint32_t filters) {
+    return (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
 }
 
-inline uint32_t fcol_xtrans(uint32_t row, uint32_t col, CONSTANT char (&xtrans)[6][6]) {
+inline uint32_t fcol_bayer(uint32_t row, uint32_t col, uint32_t filters) {
+    return bayer_to3[fcol_bayer_native(row, col, filters)];
+}
+
+inline uint32_t fcol_xtrans(uint32_t row, uint32_t col, CONSTANT char xtrans[6][6]) {
     return xtrans[(row + 6) % 6][(col + 6) % 6];
 }
 

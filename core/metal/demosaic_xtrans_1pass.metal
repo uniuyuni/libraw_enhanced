@@ -7,7 +7,7 @@
 #include "shader_common.h"
 
 kernel void demosaic_xtrans_1pass(
-    const device ushort* raw_data [[buffer(0)]],
+    const device float* raw_data [[buffer(0)]],
     device float* rgb_data [[buffer(1)]],
     constant DemosaicXTransParams& params [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
@@ -40,7 +40,7 @@ kernel void demosaic_xtrans_1pass(
             int src_idx = y * width + x;
             int src_color = fcol_xtrans(y, x, params.xtrans);
             
-            float raw_val = float(raw_data[src_idx]) / params.maximum_value;
+            float raw_val = raw_data[src_idx] / params.maximum_value;
             sum[src_color] += raw_val * weight[v + 1][h + 1];
         }
     }
@@ -48,14 +48,14 @@ kernel void demosaic_xtrans_1pass(
     // RawTherapee's exact color interpolation logic
     switch(pixel_color) {
         case 0: // Red pixel
-            rgb_data[out_idx + 0] = float(raw_data[idx]) / params.maximum_value;
+            rgb_data[out_idx + 0] = raw_data[idx] / params.maximum_value;
             rgb_data[out_idx + 1] = sum[1] * 0.5f;
             rgb_data[out_idx + 2] = sum[2];
             break;
             
         case 1: // Green pixel
             {
-                rgb_data[out_idx + 1] = float(raw_data[idx]) / params.maximum_value;
+                rgb_data[out_idx + 1] = raw_data[idx] / params.maximum_value;
                 
                 // Check if this is a solitary green pixel
                 int left_color = fcol_xtrans(row, col - 1, params.xtrans);
@@ -76,7 +76,7 @@ kernel void demosaic_xtrans_1pass(
         case 2: // Blue pixel
             rgb_data[out_idx + 0] = sum[0];
             rgb_data[out_idx + 1] = sum[1] * 0.5f;
-            rgb_data[out_idx + 2] = float(raw_data[idx]) / params.maximum_value;
+            rgb_data[out_idx + 2] = raw_data[idx] / params.maximum_value;
             break;
     }
     
