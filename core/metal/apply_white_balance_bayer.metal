@@ -20,10 +20,11 @@ kernel void apply_white_balance_bayer(
     
     // Get color channel for this pixel position using LibRaw's fcol logic
     //int color_channel = (params.filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
-    const int color_channel = fcol_bayer(row, col, params.filters);
+    int color_channel = fcol_bayer_native(row, col, params.filters);
     
     // Apply white balance multiplier to the native color channel
     float adjusted_value = raw_input[input_idx + color_channel] * params.multipliers[color_channel];
 
+    if (color_channel == 3) color_channel = 1;
     rgb_output[output_idx + color_channel] = adjusted_value;
 }

@@ -2800,8 +2800,7 @@ void CPUAccelerator::apply_wb_bayer(
             uint32_t color_channel = fcol_bayer_native(row, col, filters);
             
             // Apply white balance multiplier to the native color channel
-            uint16_t original_value = raw_buffer.image[pixel_idx][color_channel];
-            if (original_value <= 0) continue;
+            float original_value = raw_buffer.image[pixel_idx][color_channel];
             float adjusted_value = original_value * wb_multipliers[color_channel];
 
             if (color_channel == 3) color_channel = 1;

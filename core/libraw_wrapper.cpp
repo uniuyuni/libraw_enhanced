@@ -43,7 +43,251 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - timer_start);
         return duration.count() / 1000000.0;  // 秒単位で返す
     }
-    
+
+    //===============================================================
+    // ゼロを無くす
+    //===============================================================
+
+    void remove_zeroes()
+    {
+        auto& imgdata = processor.imgdata;
+
+        // === メイン処理: 全ピクセルをスキャンしてゼロ値を補間 ===
+        
+        for (unsigned row = 0; row < imgdata.sizes.height; row++) {
+            for (unsigned col = 0; col < imgdata.sizes.width; col++) {
+                
+                // 現在のピクセル値を取得
+                unsigned short& current_pixel = imgdata.image[((row) >> imgdata.rawdata.ioparams.shrink) * imgdata.sizes.iwidth + ((col) >> imgdata.rawdata.ioparams.shrink)][fcol_bayer_native(row, col, imgdata.idata.filters)];
+                
+                // ゼロピクセルが見つかった場合のみ処理
+                if (current_pixel == 0) {
+                    
+                    // --- 周辺5x5領域から同色ピクセルを探して平均値を計算 ---
+                    
+                    unsigned int pixel_sum = 0;      // 有効ピクセル値の合計
+                    unsigned int valid_count = 0;    // 有効ピクセルの個数
+                    
+                    // 中心から半径2ピクセルの5x5領域をスキャン
+                    for (int search_row = (int)row - 2; search_row <= (int)row + 2; search_row++) {
+                        for (int search_col = (int)col - 2; search_col <= (int)col + 2; search_col++) {
+                            
+                            // --- 境界チェック ---
+                            if (search_row < 0 || search_row >= (int)imgdata.sizes.height || 
+                                search_col < 0 || search_col >= (int)imgdata.sizes.width) {
+                                continue;  // 画像範囲外はスキップ
+                            }
+                            
+                            // --- 同色ピクセルかつ非ゼロの場合のみ使用 ---
+                            unsigned short neighbor_pixel = imgdata.image[((search_row) >> imgdata.rawdata.ioparams.shrink) * imgdata.sizes.iwidth + ((search_col) >> imgdata.rawdata.ioparams.shrink)][fcol_bayer_native(search_row, search_col, imgdata.idata.filters)];
+                            
+                            // 条件チェック:
+                            // 1. 同じ色チャンネル (R,G,B,G2)
+                            // 2. ゼロでない値
+                            if (fcol_bayer_native(search_row, search_col, imgdata.idata.filters) == fcol_bayer_native(row, col, imgdata.idata.filters) && neighbor_pixel != 0) {
+                                pixel_sum += neighbor_pixel;
+                                valid_count++;
+                            }
+                        }
+                    }
+                    
+                    // --- 補間値の計算と適用 ---
+                    if (valid_count > 0) {
+                        // 平均値を計算してゼロピクセルを置き換え
+                        current_pixel = pixel_sum / valid_count;
+                    }
+                    // 注意: 周辺にも同色の有効ピクセルがない場合は0のまま残る
+                }
+            }
+        }
+    }
+
+    //===============================================================
+    // ブラックレベル調整
+    //===============================================================
+
+    void adjust_bl()
+    {
+        // === ステップ1: ユーザー指定のブラックレベルを適用 ===
+        bool user_values_applied = apply_user_black_levels();
+        
+        // === ステップ2: 2D配列形式のブラックレベルを処理 ===
+        if (has_2d_black_level_pattern()) {
+            process_2d_black_level_pattern();
+        }
+        
+        // === ステップ3: 基本ブラックレベル配列から共通部分を抽出 ===
+        extract_common_black_level_from_basic_array();
+        
+        // === ステップ4: 2D配列部分から共通部分を抽出 ===
+        extract_common_black_level_from_2d_array();
+        
+        // === ステップ5: 最終的な調整 ===
+        finalize_black_levels();
+    }
+
+    // ユーザー指定のブラックレベル値を適用
+    bool apply_user_black_levels()
+    {
+        auto& imgdata = processor.imgdata;
+        bool applied = false;
+        
+        // 全体のブラックレベルがユーザー指定されている場合
+        if (imgdata.params.user_black >= 0) {
+            imgdata.color.black = imgdata.params.user_black;
+            applied = true;
+        }
+        
+        // 色別のブラックレベルがユーザー指定されている場合
+        for (int i = 0; i < 4; i++) {
+            if (imgdata.params.user_cblack[i] > -1000000) {
+                imgdata.color.cblack[i] = imgdata.params.user_cblack[i];
+                applied = true;
+            }
+        }
+        
+        // ユーザー指定値が適用された場合、2D配列パターンをリセット
+        if (applied) {
+            imgdata.color.cblack[4] = 0;  // 2D配列の幅
+            imgdata.color.cblack[5] = 0;  // 2D配列の高さ
+        }
+        
+        return applied;
+    }
+
+    // 2D配列形式のブラックレベルパターンがあるかチェック
+    bool has_2d_black_level_pattern()
+    {
+        auto& imgdata = processor.imgdata;
+        return (imgdata.idata.filters > 1000 && 
+                (imgdata.color.cblack[4] + 1) / 2 == 1 &&
+                (imgdata.color.cblack[5] + 1) / 2 == 1);
+    }
+
+    // Bayerパターン用の2D配列処理
+    void process_2d_black_level_pattern()
+    {
+        auto& imgdata = processor.imgdata;
+        // 各位置の色を特定
+        int color_at_position[4];
+        int green_count = 0;
+        int last_green_pos = -1;
+        
+        for (int pos = 0; pos < 4; pos++) {
+            color_at_position[pos] = fcol_bayer_native(pos / 2, pos % 2, imgdata.idata.filters);  // FC: Filter Color関数
+            
+            if (color_at_position[pos] == 1) {  // Green
+                green_count++;
+                last_green_pos = pos;
+            }
+        }
+        
+        // 複数のGreenがある場合、最後のものを別色として扱う
+        if (green_count > 1 && last_green_pos >= 0) {
+            color_at_position[last_green_pos] = 3;  // 第2のGreen
+        }
+        
+        // 2D配列の値を対応する色のブラックレベルに加算
+        for (int pos = 0; pos < 4; pos++) {
+            int row = pos / 2;
+            int col = pos % 2;
+            int array_index = 6 + (row % imgdata.color.cblack[4]) * imgdata.color.cblack[5] + 
+                            (col % imgdata.color.cblack[5]);
+            
+            imgdata.color.cblack[color_at_position[pos]] += imgdata.color.cblack[array_index];
+        }
+        
+        // 2D配列パターンを無効化
+        imgdata.color.cblack[4] = 0;
+        imgdata.color.cblack[5] = 0;
+    }
+
+    // Fuji RAF DNG形式の特別処理
+    void process_fuji_raf_format()
+    {
+        auto& imgdata = processor.imgdata;
+        // 単純に全色に同じ値を加算
+        for (int c = 0; c < 4; c++) {
+            imgdata.color.cblack[c] += imgdata.color.cblack[6];
+        }
+        
+        imgdata.color.cblack[4] = 0;
+        imgdata.color.cblack[5] = 0;
+    }
+
+    // 基本ブラックレベル配列（cblack[0-3]）から共通部分を抽出
+    void extract_common_black_level_from_basic_array()
+    {
+        auto& imgdata = processor.imgdata;
+        // Fuji RAF DNG形式の特別処理
+        if (imgdata.idata.filters <= 1000 && 
+            imgdata.color.cblack[4] == 1 && 
+            imgdata.color.cblack[5] == 1) {
+            process_fuji_raf_format();
+        }
+        
+        // 4色の最小値を見つける
+        int min_black = imgdata.color.cblack[3];
+        for (int c = 0; c < 3; c++) {
+            if (min_black > imgdata.color.cblack[c]) {
+                min_black = imgdata.color.cblack[c];
+            }
+        }
+        
+        // 各色から最小値を引いて、共通部分をblackに移す
+        for (int c = 0; c < 4; c++) {
+            imgdata.color.cblack[c] -= min_black;
+        }
+        imgdata.color.black += min_black;
+    }
+
+    // 2D配列部分（cblack[6+]）から共通部分を抽出
+    void extract_common_black_level_from_2d_array()
+    {
+        auto& imgdata = processor.imgdata;
+        if (!imgdata.color.cblack[4] || !imgdata.color.cblack[5]) {
+            return;  // 2D配列がない場合は何もしない
+        }
+        
+        int array_size = imgdata.color.cblack[4] * imgdata.color.cblack[5];
+        
+        // 2D配列の最小値を見つける
+        int min_value = imgdata.color.cblack[6];
+        for (int i = 1; i < array_size; i++) {
+            if (min_value > imgdata.color.cblack[6 + i]) {
+                min_value = imgdata.color.cblack[6 + i];
+            }
+        }
+        
+        // 各要素から最小値を引く
+        int non_zero_count = 0;
+        for (int i = 0; i < array_size; i++) {
+            imgdata.color.cblack[6 + i] -= min_value;
+            if (imgdata.color.cblack[6 + i] != 0) {
+                non_zero_count++;
+            }
+        }
+        
+        // 共通部分をblackに移す
+        imgdata.color.black += min_value;
+        
+        // すべてが0になった場合、2D配列を無効化
+        if (non_zero_count == 0) {
+            imgdata.color.cblack[4] = 0;
+            imgdata.color.cblack[5] = 0;
+        }
+    }
+
+    // 最終的なブラックレベルの調整
+    void finalize_black_levels()
+    {
+        auto& imgdata = processor.imgdata;
+        // 各色のブラックレベルに共通ブラックレベルを加算
+        for (int c = 0; c < 4; c++) {
+            imgdata.color.cblack[c] += imgdata.color.black;
+        }
+    }
+
     //===============================================================
     // LibRaw-compatible black level correction (internal function)
     //===============================================================
@@ -211,6 +455,264 @@ public:
         
         free(img);
         std::cout << "✅ Green matching completed: processed " << processed_pixels << " G2 pixels" << std::endl;
+    }
+
+    //===============================================================
+    // カラースケール処理
+    //===============================================================
+  
+    void scale_colors(float scale_mul[4])
+    {
+        auto& imgdata = processor.imgdata;
+
+        // 変数宣言
+        unsigned bottom, right, size, row, col, ur, uc, i, x, y, c, sum[8];
+        int val;
+        double dsum[8], dmin, dmax;
+        float fr, fc;
+        ushort *img = 0, *pix;
+
+        // ========================================
+        // 1. ユーザー指定の乗数設定
+        // ========================================
+        if (imgdata.params.user_mul[0]) {
+            memcpy(imgdata.color.pre_mul, imgdata.params.user_mul, sizeof(imgdata.color.pre_mul));
+        }
+
+        // ========================================
+        // 2. 自動ホワイトバランス計算
+        // ========================================
+        bool should_use_auto_wb = imgdata.params.use_auto_wb || 
+            (imgdata.params.use_camera_wb && 
+            (imgdata.color.cam_mul[0] < -0.5  // LibRaw 0.19以前: cam_mul[0]が-1の時のみ自動に戻る
+            || (imgdata.color.cam_mul[0] <= 0.00001f  // 新しいデフォルト: cam_mulがメタデータから解析されない場合
+                && !(imgdata.rawparams.options & LIBRAW_RAWOPTIONS_CAMERAWB_FALLBACK_TO_DAYLIGHT))
+            ));
+
+        if (should_use_auto_wb) {
+
+            // RGBチャンネルを表すenum
+            enum ColorChannel {
+                RED = 0,
+                GREEN = 1,
+                BLUE = 2
+            };
+
+            // 画像統計情報を保持する構造体
+            struct ImageStats {
+                double min[3] = {0.0, 0.0, 0.0};
+                double max[3] = {0.0, 0.0, 0.0};
+                double mean[3] = {0.0, 0.0, 0.0};
+                int count[3] = {0, 0, 0};
+            };
+            
+            // 画像統計を計算
+            ImageStats stats;
+            double sum[3] = {0.0, 0.0, 0.0};
+            
+            // 各ピクセルを処理
+#ifdef _OPENMP
+//            #pragma omp parallel for collapse(2)
+#endif
+            for (size_t row = 0; row < imgdata.sizes.height; ++row) {
+                for (size_t col = 0; col < imgdata.sizes.width; ++col) {
+                    int pixelIndex = row * imgdata.sizes.width + col;
+
+                    // カラーフィルタ配列からカラーチャンネルを取得
+                    int colorIndex;
+                    if (imgdata.idata.filters == FILTERS_XTRANS) {
+                        colorIndex = fcol_xtrans(row, col, imgdata.idata.xtrans);
+                    } else {
+                        colorIndex = fcol_bayer(row, col, imgdata.idata.filters);
+                    }
+
+                    unsigned short pixelValue = imgdata.image[pixelIndex][colorIndex];                    
+                    
+                    // カラーチャンネルに応じて統計情報を更新
+                    if (colorIndex >= 0 && colorIndex < 3) {
+                        double value = static_cast<double>(pixelValue);
+                        
+                        // 最小値更新
+                        if (stats.count[colorIndex] == 0 || value < stats.min[colorIndex]) {
+                            stats.min[colorIndex] = value;
+                        }
+                        
+                        // 最大値更新
+                        if (stats.count[colorIndex] == 0 || value > stats.max[colorIndex]) {
+                            stats.max[colorIndex] = value;
+                        }
+                        
+                        // 合計値更新
+                        sum[colorIndex] += value;
+                        stats.count[colorIndex]++;
+                    }
+                }
+            }
+            
+            // 平均値計算
+            for (int i = 0; i < 3; ++i) {
+                if (stats.count[i] > 0) {
+                    stats.mean[i] = sum[i] / stats.count[i];
+                }
+            }
+            
+            // グリーンチャンネルを基準としてホワイトバランス係数を計算
+            imgdata.color.pre_mul[RED] = static_cast<float>(stats.mean[GREEN] / stats.mean[RED]);
+            imgdata.color.pre_mul[GREEN] = 1.0f; // グリーンは基準なので1.0
+            imgdata.color.pre_mul[BLUE] = static_cast<float>(stats.mean[GREEN] / stats.mean[BLUE]);
+            imgdata.color.pre_mul[GREEN+2] = 1.0f;
+        }
+
+        // ========================================
+        // 3. カメラホワイトバランス処理
+        // ========================================
+        if (imgdata.params.use_camera_wb && imgdata.color.cam_mul[0] > 0.00001f) {
+            memset(sum, 0, sizeof(sum));
+            
+            // ホワイトポイントサンプル処理
+            for (row = 0; row < 8; row++) {
+                for (col = 0; col < 8; col++) {
+                    c = fcol_bayer_native(row, col, imgdata.idata.filters);
+                    if ((val = imgdata.color.white[row][col] - imgdata.color.cblack[c]) > 0) {
+                        sum[c] += val;
+                    }
+                    sum[c + 4]++;
+                }
+            }
+            
+            if (imgdata.color.as_shot_wb_applied) {
+                // Nikon sRAW: カメラWBが既に適用済み
+                imgdata.color.pre_mul[0] = imgdata.color.pre_mul[1] = imgdata.color.pre_mul[2] = imgdata.color.pre_mul[3] = 1.0;
+            } else if (sum[0] && sum[1] && sum[2] && sum[3]) {
+                // 全色のデータがある場合
+                for (c = 0; c < 4; c++) {
+                    imgdata.color.pre_mul[c] = (float)sum[c + 4] / sum[c];
+                }
+            } else if (imgdata.color.cam_mul[0] > 0.00001f && imgdata.color.cam_mul[2] > 0.00001f) {
+                // カメラ乗数を直接使用
+                memcpy(imgdata.color.pre_mul, imgdata.color.cam_mul, sizeof(imgdata.color.pre_mul));
+            } else {
+                // 警告: カメラWBが不正
+                imgdata.process_warnings |= LIBRAW_WARN_BAD_CAMERA_WB;
+            }
+        }
+
+        // ========================================
+        // 4. Nikon sRAW特別処理（昼光設定）
+        // ========================================
+        bool is_nikon_sraw_daylight = imgdata.color.as_shot_wb_applied && 
+                                    !imgdata.params.use_camera_wb && !imgdata.params.use_auto_wb &&
+                                    imgdata.color.cam_mul[0] > 0.00001f && 
+                                    imgdata.color.cam_mul[1] > 0.00001f && 
+                                    imgdata.color.cam_mul[2] > 0.00001f;
+                                    
+        if (is_nikon_sraw_daylight) {
+            for (c = 0; c < 3; c++) {
+                imgdata.color.pre_mul[c] /= imgdata.color.cam_mul[c];
+            }
+        }
+
+        // ========================================
+        // 5. pre_mul値の正規化
+        // ========================================
+        if (imgdata.color.pre_mul[1] == 0) {
+            imgdata.color.pre_mul[1] = 1;
+        }
+        if (imgdata.color.pre_mul[3] == 0) {
+            imgdata.color.pre_mul[3] = imgdata.idata.colors < 4 ? imgdata.color.pre_mul[1] : 1;
+        }
+
+        // ========================================
+        // 6. ウェーブレットノイズ除去（オプション）
+        // ========================================
+/*
+        if (threshold) {
+            wavelet_denoise();
+        }
+*/
+        // ========================================
+        // 7. スケーリング係数計算
+        // ========================================
+        imgdata.color.maximum -= imgdata.color.black;
+
+        if (!should_use_auto_wb) {
+            
+            // 最小・最大乗数値を検索
+            for (dmin = std::numeric_limits<double>::max(), c = 0; c < 4; c++) {
+                if (dmin > imgdata.color.pre_mul[c]) {
+                    dmin = imgdata.color.pre_mul[c];
+                }
+            }
+            
+            // スケーリング乗数計算
+            if (dmin > 0.00001 && imgdata.color.maximum > 0) {
+                for (c = 0; c < 4; c++) {
+                    //scale_mul[c] = (imgdata.color.pre_mul[c] /= dmax) * 65535.0 / imgdata.color.maximum;
+                    scale_mul[c] = imgdata.color.pre_mul[c] / dmin;
+                }
+            } else {
+                for (c = 0; c < 4; c++) {
+                    scale_mul[c] = 1.0;
+                }
+            }
+        } else {
+            for (c = 0; c < 4; c++) {
+                scale_mul[c] = imgdata.color.pre_mul[c];
+            }
+        }
+
+        // ========================================
+        // 8. ブラックレベル調整
+        // ========================================
+        if (imgdata.idata.filters > 1000 && (imgdata.color.cblack[4] + 1) / 2 == 1 && (imgdata.color.cblack[5] + 1) / 2 == 1) {
+            for (c = 0; c < 4; c++) {
+                imgdata.color.cblack[fcol_bayer_native(c / 2, c % 2, imgdata.idata.filters)] += 
+                    imgdata.color.cblack[6 + c / 2 % imgdata.color.cblack[4] * imgdata.color.cblack[5] + c % 2 % imgdata.color.cblack[5]];
+            }
+            imgdata.color.cblack[4] = imgdata.color.cblack[5] = 0;
+        }
+
+        // ========================================
+        // 9. 色スケーリングの実行
+        // ========================================
+        size = imgdata.sizes.iheight * imgdata.sizes.iwidth;
+//        scale_colors_loop(scale_mul);
+/*
+        // ========================================
+        // 10. 収差補正（RGB画像のみ）
+        // ========================================
+        if ((imgdata.params.aber[0] != 1 || imgdata.params.aber[2] != 1) && imgdata.idata.colors == 3) {
+            for (c = 0; c < 4; c += 2) {
+                if (imgdata.params.aber[c] == 1) continue;
+                
+                // 一時画像バッファ確保
+                img = (ushort *)malloc(size * sizeof(*img));
+                for (i = 0; i < size; i++) {
+                    img[i] = image[i][c];
+                }
+                
+                // バイリニア補間による収差補正
+                for (row = 0; row < imgdata.sizes.iheight; row++) {
+                    ur = fr = (row - imgdata.sizes.iheight * 0.5) * imgdata.params.aber[c] + iheight * 0.5;
+                    if (ur > (unsigned)imgdata.sizes.iheight - 2) continue;
+                    fr -= ur;
+                    
+                    for (col = 0; col < imgdata.sizes.iwidth; col++) {
+                        uc = fc = (col - imgdata.sizes.iwidth * 0.5) * imgdata.params.aber[c] + imgdata.sizes.iwidth * 0.5;
+                        if (uc > (unsigned)imgdata.sizes.iwidth - 2) continue;
+                        fc -= uc;
+                        
+                        pix = img + ur * imgdata.sizes.iwidth + uc;
+                        image[row * imgdata.sizes.iwidth + col][c] =
+                            (pix[0] * (1 - fc) + pix[1] * fc) * (1 - fr) +
+                            (pix[imgdata.sizes.iwidth] * (1 - fc) + pix[imgdata.sizes.iwidth + 1] * fc) * fr;
+                    }
+                }
+                
+                free(img);
+            }
+        }
+*/
     }
 
     //===============================================================
@@ -467,6 +969,8 @@ public:
         std::cout << "🎯 Starting unified RAW→RGB processing pipeline" << std::endl;
         std::cout << "📋 Parameters: demosaic=" << params.demosaic_algorithm << std::endl;
 
+        auto& imgdata = processor.imgdata;
+
         // Initialize LibRaw and check for raw data
         if (!accelerator) {
             std::cerr << "❌ Accelerator not initialized" << std::endl;
@@ -476,15 +980,38 @@ public:
         // Set GPU acceleration flag from processing parameters
         accelerator->set_use_gpu_acceleration(params.use_gpu_acceleration);
 
+        std::cout << "　 data_maximum: " << imgdata.color.data_maximum << ", maximum: " << imgdata.color.maximum << std::endl;
+
+        if (imgdata.rawdata.ioparams.zero_is_bad) {
+            remove_zeroes();
+        }
+
+        bool is_bayer = (imgdata.idata.filters || imgdata.idata.colors == 1);
+        int subtract_inline =
+            !imgdata.params.bad_pixels && !imgdata.params.dark_frame && is_bayer && !imgdata.rawdata.ioparams.zero_is_bad;
+
+/*        
+        if (subtract_inline) {
+            adjust_bl();
+
+            imgdata.color.data_maximum = 0;
+            imgdata.color.maximum -= imgdata.color.black;
+            imgdata.color.cblack[0] = imgdata.color.cblack[1] = imgdata.color.cblack[2] = imgdata.color.cblack[3] = 0;
+            imgdata.color.black = 0;
+        }
+*/
         // Apply LibRaw-compatible black level subtraction
-        apply_black_level_correction(raw_buffer);
+        if (!subtract_inline || !imgdata.color.data_maximum) {
+            adjust_bl();
+            apply_black_level_correction(raw_buffer);
+        }
 
         // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
         //adjust_maximum0(raw_buffer, params.adjust_maximum_thr);
 
         // set filters and xtrans
-        uint32_t filters = processor.imgdata.idata.filters;        
-        char (&xtrans)[6][6] = processor.imgdata.idata.xtrans;        
+        uint32_t filters = imgdata.idata.filters;        
+        char (&xtrans)[6][6] = imgdata.idata.xtrans;        
         std::cout << "🔍 Filters value: 0x" << std::hex << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
 
         // Apply green matching for Bayer sensors (after black level, before demosaic)
@@ -492,19 +1019,20 @@ public:
         
         // Calculate white balance multipliers (same logic as original)
         float effective_wb[4];
-        if (params.use_camera_wb && processor.imgdata.color.cam_mul[1] > 0) {
-            float dmin = *std::min_element(std::begin(processor.imgdata.color.cam_mul), std::end(processor.imgdata.color.cam_mul) - 1);
-            effective_wb[0] = processor.imgdata.color.cam_mul[0] / dmin;
-            effective_wb[1] = processor.imgdata.color.cam_mul[1] / dmin;
-            effective_wb[2] = processor.imgdata.color.cam_mul[2] / dmin;
-            effective_wb[3] = processor.imgdata.color.cam_mul[3] / dmin;
+/*
+        if (params.use_camera_wb && imgdata.color.cam_mul[1] > 0) {
+            float dmin = *std::min_element(std::begin(imgdata.color.cam_mul), std::end(imgdata.color.cam_mul) - 2);
+            effective_wb[0] = imgdata.color.cam_mul[0] / dmin;
+            effective_wb[1] = imgdata.color.cam_mul[1] / dmin;
+            effective_wb[2] = imgdata.color.cam_mul[2] / dmin;
+            effective_wb[3] = imgdata.color.cam_mul[1] / dmin;
             std::cout << "📷 Using camera WB from EXIF (min-normalized cam_mul):" << std::endl;
-        } else if (params.use_auto_wb && processor.imgdata.color.pre_mul[1] > 0) {
-            float dmin = *std::min_element(std::begin(processor.imgdata.color.pre_mul), std::end(processor.imgdata.color.pre_mul) - 1);
-            effective_wb[0] = processor.imgdata.color.pre_mul[0] / dmin;
-            effective_wb[1] = processor.imgdata.color.pre_mul[1] / dmin;
-            effective_wb[2] = processor.imgdata.color.pre_mul[2] / dmin;
-            effective_wb[3] = processor.imgdata.color.pre_mul[3] / dmin;
+        } else if (params.use_auto_wb && imgdata.color.pre_mul[1] > 0) {
+            float dmin = *std::min_element(std::begin(imgdata.color.pre_mul), std::end(imgdata.color.pre_mul) - 2);
+            effective_wb[0] = imgdata.color.pre_mul[0] / dmin;
+            effective_wb[1] = imgdata.color.pre_mul[1] / dmin;
+            effective_wb[2] = imgdata.color.pre_mul[2] / dmin;
+            effective_wb[3] = imgdata.color.pre_mul[3] / dmin;
             std::cout << "📷 Using computed WB from LibRaw (min-normalized pre_mul):" << std::endl;
         } else {
             // Use user-specified white balance or default
@@ -514,7 +1042,7 @@ public:
             effective_wb[3] = params.user_wb[3];
             std::cout << "👤 Using user/default WB:" << std::endl;
         }
-
+*/
         // rgb_buffer2 is temporary buffer
         std::vector<float> raw_buffer2_data(rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels);
         ImageBufferFloat rgb_buffer2 = {
@@ -524,34 +1052,44 @@ public:
             rgb_buffer.channels
         };
 
+        if (!imgdata.params.no_auto_scale) {
+            scale_colors(effective_wb);
+        } else {
+            effective_wb[0] = 1.0;
+            effective_wb[1] = 1.0;
+            effective_wb[2] = 1.0;
+            effective_wb[3] = 1.0;
+        }
+        std::cout << "📷 WB: " << effective_wb[0] << ", " << effective_wb[1] << ", " << effective_wb[2] << ", " << effective_wb[3] << std::endl;
+
         // Determine CFA type and apply appropriate WB processing
         if (!accelerator->apply_white_balance(raw_buffer, rgb_buffer2, effective_wb, filters, xtrans)) {
             return false;
         }
 
+        libraw_decoder_info_t di;
+        processor.get_decoder_info(&di);
+
         // Apply adjust_maximum for dynamic maximum value adjustment (must be after black level correction)
-        MaximumResult maximum_result = adjust_maximum(rgb_buffer2, params.adjust_maximum_thr);
+        MaximumResult maximum_result;
+        if (!(di.decoder_flags & LIBRAW_DECODER_FIXEDMAXC)) {
+            maximum_result = adjust_maximum(rgb_buffer2, params.adjust_maximum_thr);
+        } else {
+            maximum_result.data_maximum = imgdata.color.data_maximum;
+            maximum_result.maximum = imgdata.color.maximum;
+        }
+        if (imgdata.params.user_sat > 0) {
+            maximum_result.maximum = imgdata.params.user_sat;
+        }
 
         // Apply pre-interpolation processing
         if (!accelerator->pre_interpolate(rgb_buffer2, filters, xtrans, params.half_size)) {
             return false;
         }
-/*
-        for (int y = 0; y < rgb_buffer.height; ++y) {
-            for( int x = 0; x < rgb_buffer.width; ++x) {
-                int idx = y * rgb_buffer.width + x;
-                uint32_t c = fcol_bayer_native(y, x, filters);
-                raw_buffer.image[idx][0] = rgb_buffer2.image[idx][0];
-                raw_buffer.image[idx][1] = rgb_buffer2.image[idx][1];
-                raw_buffer.image[idx][2] = rgb_buffer2.image[idx][2];
-                raw_buffer.image[idx][3] = rgb_buffer2.image[idx][1];
-            }
-        }
-*/
 
         // Camera matrix-based color space conversion (reuse float_rgb buffer)
-        const char* camera_make = processor.imgdata.idata.make;
-        const char* camera_model = processor.imgdata.idata.model;        
+        const char* camera_make = imgdata.idata.make;
+        const char* camera_model = imgdata.idata.model;        
         
         // Get camera-specific color transformation matrix
         ColorTransformMatrix camera_matrix = compute_camera_transform(camera_make, camera_model, ColorSpace::XYZ);
@@ -563,7 +1101,7 @@ public:
 
         // Demosaic processing (unified CPU/GPU selection via accelerator)
         // Pass LibRaw cam_mul for dynamic initialGain calculation and maximum_value for precise normalization
-        bool demosaic_success = accelerator->demosaic_compute(rgb_buffer2, rgb_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform, processor.imgdata.color.cam_mul, maximum_result.maximum);
+        bool demosaic_success = accelerator->demosaic_compute(rgb_buffer2, rgb_buffer, params.demosaic_algorithm, filters, xtrans, camera_matrix.transform, imgdata.color.cam_mul, maximum_result.maximum);
         if (!demosaic_success) {
             std::cerr << "❌ Demosaic processing failed" << std::endl;
             return false;
@@ -573,7 +1111,7 @@ public:
 
         // Highlight recovery
         if (params.highlight_mode > 2) {
-            recover_highlights(rgb_buffer, threshold * 0.75);
+            recover_highlights(rgb_buffer, threshold); // * 0.75f);
         }
 
         // Tone mapping
@@ -610,34 +1148,162 @@ public:
     //===============================================================
     int convert_raw_to_image() {
         std::cout << "🔧 Converting raw data to image..." << std::endl;
-        
+
+        auto& imgdata = processor.imgdata;
+
         // Step 1: raw2image_start equivalent - initialization
         raw2image_start();
         
         // Step 2: Handle existing processed image
-        if (processor.imgdata.image) {
+        if (imgdata.image) {
             std::cout << "ℹ️ Image data already exists, skipping conversion" << std::endl;
             return 0;
         }
         
         // Step 3: Check for raw data availability
-        if (!processor.imgdata.rawdata.raw_image && 
-            !processor.imgdata.rawdata.color4_image && 
-            !processor.imgdata.rawdata.color3_image) {
+        if (!imgdata.rawdata.raw_image && 
+            !imgdata.rawdata.color4_image && 
+            !imgdata.rawdata.color3_image) {
             std::cerr << "❌ No raw data available for conversion" << std::endl;
             return LIBRAW_REQUEST_FOR_NONEXISTENT_IMAGE;
         }
         
         // Step 4: Calculate allocation dimensions
-        int alloc_width = processor.imgdata.sizes.iwidth;
-        int alloc_height = processor.imgdata.sizes.iheight;
-        
+        int do_crop = 0;
+
+        // === ステップ1: クロップ処理が必要かチェック ===
+        // cropbox[2]とcropbox[3]が設定されている場合（~演算子でビット反転チェック）
+        if (~imgdata.params.cropbox[2] && ~imgdata.params.cropbox[3]) {
+            
+            // --- クロップ座標の初期化と検証 ---
+            int crop[4];  // [left, top, width, height]
+            for (int q = 0; q < 4; q++) {
+                crop[q] = imgdata.params.cropbox[q];
+                if (crop[q] < 0) {
+                    crop[q] = 0;  // 負の値は0にクランプ
+                }
+            }
+            
+            // --- センサータイプ別のアライメント調整 ---
+            
+            if (imgdata.rawdata.ioparams.fuji_width && imgdata.idata.filters >= 1000) {
+                // === Fujiセンサー（X-Trans以外のBayer）の処理 ===
+                
+                // 開始位置を4ピクセル境界に合わせる
+                crop[0] = (crop[0] / 4) * 4;  // left
+                crop[1] = (crop[1] / 4) * 4;  // top
+                
+                // Fujiの特殊レイアウト処理
+                if (!processor.get_internal_data_pointer()->unpacker_data.fuji_layout) {
+                    // 45度回転レイアウトの場合の幅・高さ補正
+                    crop[2] *= sqrt(2.0);  // width を√2倍
+                    crop[3] /= sqrt(2.0);  // height を√2で割る
+                }
+                
+                // サイズを4ピクセル境界に合わせる（切り上げ）
+                crop[2] = (crop[2] / 4 + 1) * 4;  // width
+                crop[3] = (crop[3] / 4 + 1) * 4;  // height
+            }
+            else if (imgdata.idata.filters == 1) {
+                // === モノクローム/特殊センサーの処理 ===
+                // 16ピクセル境界にアライメント
+                crop[0] = (crop[0] / 16) * 16;  // left
+                crop[1] = (crop[1] / 16) * 16;  // top
+            }
+            else if (imgdata.idata.filters == FILTERS_XTRANS) {
+                // === Fuji X-Transセンサーの処理 ===
+                // 6x6パターンの境界に合わせる
+                crop[0] = (crop[0] / 6) * 6;   // left
+                crop[1] = (crop[1] / 6) * 6;   // top
+            }
+            // 通常のBayerセンサー（filters >= 1000）の場合は特別な調整なし
+            
+            do_crop = 1;  // クロップ実行フラグをセット
+            
+            // --- クロップサイズの最終検証と調整 ---
+            
+            // 画像境界内に収める
+            crop[2] = std::min(crop[2], (signed)imgdata.sizes.width - crop[0]);   // width制限
+            crop[3] = std::min(crop[3], (signed)imgdata.sizes.height - crop[1]);  // height制限
+            
+            // 無効なクロップサイズの検出
+            if (crop[2] <= 0 || crop[3] <= 0) {
+                throw LIBRAW_EXCEPTION_BAD_CROP;
+            }
+            
+            // --- 画像サイズ情報の更新 ---
+            
+            // マージン調整（クロップ開始位置分だけマージンを増加）
+            imgdata.sizes.left_margin += crop[0];
+            imgdata.sizes.top_margin += crop[1];
+            
+            // 新しい画像サイズを設定
+            imgdata.sizes.width = crop[2];
+            imgdata.sizes.height = crop[3];
+            
+            // 縮小処理を考慮した最終画像サイズ
+            imgdata.sizes.iheight = (imgdata.sizes.height + imgdata.rawdata.ioparams.shrink) >> imgdata.rawdata.ioparams.shrink;  // >> IO.shrink は /2^shrink と同じ
+            imgdata.sizes.iwidth = (imgdata.sizes.width + imgdata.rawdata.ioparams.shrink) >> imgdata.rawdata.ioparams.shrink;
+            
+            // --- Bayerフィルターパターンの再計算 ---
+            // 通常のBayerセンサー（Fuji以外）でクロップした場合
+            if (!imgdata.rawdata.ioparams.fuji_width && imgdata.idata.filters && imgdata.idata.filters >= 1000) {
+                
+                int filt, c;
+                
+                // 新しいクロップ位置での4x4 Bayerパターンを再計算
+                for (filt = c = 0; c < 16; c++) {
+                    // 4x4グリッドの各位置での色を計算
+                    int row = (c >> 1) + crop[1];  // 行位置 = (c/2) + top_offset
+                    int col = (c & 1) + crop[0];   // 列位置 = (c%2) + left_offset
+                    
+                    // FC関数で該当位置の色を取得し、2ビットずつ格納
+                    filt |= fcol_bayer_native(row, col, imgdata.idata.filters) << (c * 2);
+                }
+                
+                // 新しいフィルターパターンを設定
+                imgdata.idata.filters = filt;
+            }
+        }
+
+        // === ステップ2: メモリ割り当てサイズの計算 ===
+
+        // デフォルトの割り当てサイズ
+        int alloc_width = imgdata.sizes.iwidth;
+        int alloc_height = imgdata.sizes.iheight;
+
+        // Fujiセンサーでクロップが実行された場合の特殊計算
+        if (imgdata.rawdata.ioparams.fuji_width && do_crop) {
+            
+            // --- Fuji特殊レイアウト用のメモリサイズ計算 ---
+            
+            // レイアウトタイプに基づく幅の調整
+            int IO_fw = imgdata.sizes.width >> int(!processor.get_internal_data_pointer()->unpacker_data.fuji_layout);
+            // fuji_layout == 1 の場合: imgdata.sizes.width >> 0 = imgdata.sizes.width (シフトなし)
+            // fuji_layout == 0 の場合: imgdata.sizes.width >> 1 = imgdata.sizes.width / 2
+            
+            // Fuji特殊フォーマットでの必要メモリサイズ計算
+            int t_alloc_width = (imgdata.sizes.height >> processor.get_internal_data_pointer()->unpacker_data.fuji_layout) + IO_fw;
+            // fuji_layout == 1 の場合: imgdata.sizes.height >> 1 + IO_fw
+            // fuji_layout == 0 の場合: imgdata.sizes.height >> 0 + IO_fw = imgdata.sizes.height + IO_fw
+            
+            int t_alloc_height = t_alloc_width - 1;
+            
+            // 縮小処理を考慮した最終的な割り当てサイズ
+            alloc_height = (t_alloc_height + imgdata.rawdata.ioparams.shrink) >> imgdata.rawdata.ioparams.shrink;
+            alloc_width = (t_alloc_width + imgdata.rawdata.ioparams.shrink) >>imgdata.rawdata.ioparams.shrink;
+        }
+
+/*        
+        int alloc_width = imgdata.sizes.iwidth;
+        int alloc_height = imgdata.sizes.iheight;
+*/
         
         // Step 5: Allocate image buffer
         size_t alloc_sz = alloc_width * alloc_height;
-        processor.imgdata.image = (unsigned short (*)[4])calloc(alloc_sz, sizeof(*processor.imgdata.image));
+        imgdata.image = (unsigned short (*)[4])calloc(alloc_sz, sizeof(*imgdata.image));
         
-        if (!processor.imgdata.image) {
+        if (!imgdata.image) {
             std::cerr << "❌ Failed to allocate image buffer" << std::endl;
             return LIBRAW_UNSUFFICIENT_MEMORY;
         }
@@ -645,13 +1311,13 @@ public:
         std::cout << "✅ Allocated image buffer (" << alloc_sz << " pixels)" << std::endl;
         
         // Step 6: Copy data based on source type
-        if (processor.imgdata.rawdata.color4_image) {
+        if (imgdata.rawdata.color4_image) {
             std::cout << "🔧 Copying from color4_image..." << std::endl;
             copy_color4_image();
-        } else if (processor.imgdata.rawdata.color3_image) {
+        } else if (imgdata.rawdata.color3_image) {
             std::cout << "🔧 Copying from color3_image..." << std::endl;
             copy_color3_image();
-        } else if (processor.imgdata.rawdata.raw_image) {
+        } else if (imgdata.rawdata.raw_image) {
             std::cout << "🔧 Copying from raw_image (Bayer/X-Trans)..." << std::endl;
             copy_bayer_image();
         } else {
@@ -666,20 +1332,22 @@ public:
     // raw2image_start equivalent - setup and initialization
     void raw2image_start() {
         std::cout << "🔧 raw2image_start: Initializing conversion parameters..." << std::endl;
+
+        auto& imgdata = processor.imgdata;
         
         // Restore metadata from raw data structures
-        if (processor.imgdata.rawdata.color.maximum > 0) {
-            memcpy(&processor.imgdata.color, &processor.imgdata.rawdata.color, sizeof(processor.imgdata.color));
+        if (imgdata.rawdata.color.maximum > 0) {
+            memcpy(&imgdata.color, &imgdata.rawdata.color, sizeof(imgdata.color));
         }
         
         // Calculate image dimensions
-        auto& S = processor.imgdata.sizes;
-        auto& O = processor.imgdata.params;
+        auto& S = imgdata.sizes;
+        auto& O = imgdata.params;
         
         // Handle half-size processing
-        bool shrink = !processor.imgdata.rawdata.color4_image && 
-                     !processor.imgdata.rawdata.color3_image && 
-                     processor.imgdata.idata.filters && O.half_size;
+        bool shrink = !imgdata.rawdata.color4_image && 
+                     !imgdata.rawdata.color3_image && 
+                     imgdata.idata.filters && O.half_size;
         
         // Calculate final image dimensions
         if (shrink) {
@@ -805,11 +1473,12 @@ public:
         }
         
         // Hasselblad cameras
+/*
         if (strstr(idata.make, "Hasselblad") || strstr(idata.model, "Hasselblad")) {
             std::cout << "🔧 Processing Hasselblad format..." << std::endl;
             return copy_hasselblad_image();
         }
-        
+*/        
         return false; // No special format detected
     }
     
@@ -934,7 +1603,7 @@ public:
                 // Calculate source pixel position
                 int src_row = row + sizes.top_margin;
                 int src_col = col + sizes.left_margin;
-                int src_idx = src_row * sizes.raw_width + src_col;
+                int src_idx = src_row * sizes.raw_pitch / 2 + src_col;
                 
                 // Calculate destination pixel position (with potential shrinking)
                 int dst_row = row >> shrink_factor;
@@ -949,7 +1618,13 @@ public:
                 
                 // Determine color channel using filter pattern
                 uint32_t color_channel = fcol_bayer_native(row, col, processor.imgdata.idata.filters);
-                
+/*
+                if (val > processor.imgdata.color.cblack[color_channel]) {
+                    val -= processor.imgdata.color.cblack[color_channel];
+                } else {
+                    val = 0;
+                }
+*/
                 // Store pixel value in appropriate channel
                 processor.imgdata.image[dst_idx][color_channel] = val;
                 if (color_channel == 3) {
