@@ -461,7 +461,7 @@ public:
     // カラースケール処理
     //===============================================================
   
-    void scale_colors(float scale_mul[4])
+    void scale_colors(const ImageBuffer& raw_buffer, float scale_mul[4])
     {
         auto& imgdata = processor.imgdata;
 
@@ -490,7 +490,38 @@ public:
             ));
 
         if (should_use_auto_wb) {
+            // 各チャンネルのpノルムを計算
+            double p = 1.0; // 6.0
+            double norm[4] = {0.0, 0.0, 0.0, 0.0};
+            double count[4] = {0.0, 0.0, 0.0, 0.0};
+            uint32_t cc;
 
+            for (int row = 0; row < raw_buffer.height; ++row) {
+                for (int col = 0; col < raw_buffer.width; ++col) {
+                    if (imgdata.idata.filters == FILTERS_XTRANS) {
+                        cc = fcol_xtrans(row, col, imgdata.idata.xtrans);
+                    } else {
+                        cc = fcol_bayer_native(row, col, imgdata.idata.filters);
+                    }
+                    size_t idx = row * imgdata.sizes.iwidth + col;
+                    norm[cc] += std::pow(raw_buffer.image[idx][cc], p);
+                    count[cc] += 1;
+                }
+            }
+            norm[1] += norm[3];
+            count[1] += count[3];
+
+            // p乗平均を計算
+            for (cc = 0; cc < 3; ++cc) {
+                norm[cc] = std::pow(norm[cc] / count[cc], 1.0/p);
+            }
+
+            // ゲインを計算 (Gチャンネルを基準とする場合)
+            imgdata.color.pre_mul[0] = norm[1] / norm[0];
+            imgdata.color.pre_mul[1] = 1.0;
+            imgdata.color.pre_mul[2] = norm[1] / norm[2];
+            imgdata.color.pre_mul[3] = 1.0;
+/*
             // RGBチャンネルを表すenum
             enum ColorChannel {
                 RED = 0,
@@ -561,6 +592,7 @@ public:
             imgdata.color.pre_mul[GREEN] = 1.0f; // グリーンは基準なので1.0
             imgdata.color.pre_mul[BLUE] = static_cast<float>(stats.mean[GREEN] / stats.mean[BLUE]);
             imgdata.color.pre_mul[GREEN+2] = 1.0f;
+*/
         }
 
         // ========================================
@@ -853,14 +885,14 @@ public:
 
     bool recover_highlights(ImageBufferFloat& rgb_buffer, float saturation_threshold) {
         std::cout << "🔧 Starting highlight recovery... sat: " << saturation_threshold << std::endl;
-        
+
         const size_t width = rgb_buffer.width;
         const size_t height = rgb_buffer.height;
         const size_t channels = rgb_buffer.channels;
 
         // ハイライト部のR/G, B/G比を求める
         float grf = 0.f, gbf = 0.f, count = 0.f;
-        std::deque<int> highlight;  // ついでに処理ハイライト処理するピクセルインデクスを保持
+        std::deque<size_t> highlight;  // ついでにハイライト処理するピクセルインデクスを保持
         for (size_t idx = 0; idx < width * height; ++idx) {
             float* pixel = rgb_buffer.image[idx];
 
@@ -890,10 +922,10 @@ public:
         }
 
         // highlight処理
-        std::deque<int> white;  // ついでに完全白飛び部分処理するピクセルインデクスを保持
+        std::deque<size_t> white;  // ついでに完全白飛び処理するピクセルインデクスを保持
         float max_val = 0.f;
-        for (std::deque<int>::iterator it = highlight.begin(); it != highlight.end(); ++it) {
-            const int idx = *it;
+        for (std::deque<size_t>::iterator it = highlight.begin(); it != highlight.end(); ++it) {
+            const size_t idx = *it;
             float* pixel = rgb_buffer.image[idx];
 
             for (size_t i = 0; i < channels; ++i) {
@@ -936,15 +968,15 @@ public:
         std::random_device rd;
         std::mt19937 g(rd());
         std::shuffle(white.begin(), white.end(), g);
-        for (std::deque<int>::iterator it = white.begin(); it != white.end(); ++it) {
-            const int idx = *it;
-            size_t x = idx / width;
-            size_t y = idx % width;
-            if (x <= 0 || x >= width -2 || y <= 0 || y >= height -2) {
+        for (std::deque<size_t>::iterator it = white.begin(); it != white.end(); ++it) {
+            const size_t idx = *it;
+            const size_t y = idx / width;
+            const size_t x = idx % width;
+            if (x <= 0 || x >= width -1 || y <= 0 || y >= height -1) {
                 continue;
             }
 
-            for (size_t c = 0; c < channels; ++c) {
+            for (uint32_t c = 0; c < channels; ++c) {
                 float avg = image[idx - width - 1][c]
                           + image[idx - width + 0][c]
                           + image[idx - width + 1][c]
@@ -1044,16 +1076,16 @@ public:
         }
 */
         // rgb_buffer2 is temporary buffer
-        std::vector<float> raw_buffer2_data(rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels);
+        std::vector<float> rgb_buffer2_data(rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels);
         ImageBufferFloat rgb_buffer2 = {
-            reinterpret_cast<float (*)[3]>(raw_buffer2_data.data()),
+            reinterpret_cast<float (*)[3]>(rgb_buffer2_data.data()),
             rgb_buffer.width,
             rgb_buffer.height,
             rgb_buffer.channels
         };
 
         if (!imgdata.params.no_auto_scale) {
-            scale_colors(effective_wb);
+            scale_colors(raw_buffer, effective_wb);
         } else {
             effective_wb[0] = 1.0;
             effective_wb[1] = 1.0;
