@@ -287,7 +287,7 @@ def create_extension():
         'core/python_bindings.cpp',
         'core/libraw_wrapper.cpp',
         'core/camera_matrices.cpp',
-        'external/LibRaw-0.21.4/src/metadata/identify.cpp',
+        'external/LibRaw-master/src/metadata/identify.cpp',
     ]
     
     # Apple プラットフォームでのみMetal統合ファイルを追加
@@ -302,8 +302,8 @@ def create_extension():
     # インクルードディレクトリ
     include_dirs = [
         'core',
-        'external/LibRaw-0.21.4',        # LibRaw internal headers
-        'external/LibRaw-0.21.4/internal', # LibRaw internal defs
+        'external/LibRaw-master',        # LibRaw internal headers
+        'external/LibRaw-master/internal', # LibRaw internal defs
         *libraw_includes,
     ]
     

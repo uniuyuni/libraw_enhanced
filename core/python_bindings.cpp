@@ -178,14 +178,6 @@ PYBIND11_MODULE(_core, m) {
             return py::array_t<float>({3, 4}, {4*sizeof(float), sizeof(float)}, &self.transform[0][0]);
         });
         
-    m.def("compute_camera_transform", &compute_camera_transform,
-          py::arg("make"), py::arg("model"), py::arg("color_space") = 1,
-          "Compute camera transformation matrix for given camera and color space");
-#else
-    // Stub implementation for non-Metal platforms
-    m.def("compute_camera_transform", [](const char* make, const char* model, int color_space) -> py::object {
-        return py::none();
-    }, py::arg("make"), py::arg("model"), py::arg("color_space") = 1);
 #endif
 
     // ProcessedImageData構造体のバインディング

@@ -77,7 +77,7 @@ public:
             
             // Call LibRaw's adobe_coeff to get cam_xyz matrix
             // adobe_coeff populates imgdata.color.cam_xyz from internal database
-            int matrix_found = libraw_instance.adobe_coeff(make_idx, model, 0);
+            int matrix_found = libraw_instance.adobe_coeff(make_idx, model, 1);
             
             if (matrix_found > 0) {
 
@@ -227,7 +227,7 @@ private:
 
     void convert_white_point(double cam_xyz_xwp[3][4], double cam_xyz[3][4], int output_color_space) {
         // transform white point
-        static constexpr double transform_wp_from_d65[][3][3] = {
+        static constexpr double transform_wp[][3][3] = {
             {
                 {1.0, 0.0, 0.0},
                 {0.0, 1.0, 0.0},
@@ -259,8 +259,10 @@ private:
             },
         };
         static constexpr int color_space_wp[] = {
+//            0, 0, 3, 0, 0, 0, 0, 0, 0,  // ICC Profile
             0, 3, 3, 0, 0, 3, 4, 3, 3,  // from D50
 //            0, 0, 0, 1, 1, 0, 2, 0, 0,  // from D65
+//            0, 0, 0, 0, 0, 0, 0, 0, 0,
         };
 
         if (output_color_space < 8) {
@@ -270,7 +272,7 @@ private:
                 for (int j = 0; j < 4; j++) {
                     cam_xyz_xwp[i][j] = 0;
                     for (int k = 0; k < 3; k++) {
-                        cam_xyz_xwp[i][j] += transform_wp_from_d65[tn][i][k] * cam_xyz[k][j];
+                        cam_xyz_xwp[i][j] += transform_wp[tn][i][k] * cam_xyz[k][j];
                     }
                 }
             }

@@ -29,7 +29,8 @@ def find_raw_files():
     
     raw_extensions = ['.CR2', '.RAF', '.ARW', 
                       '.DNG', '.ORF', '.NEF',
-                      '.PEF', '.3FR', '.IIQ']
+                      '.PEF', '.3FR', '.IIQ',
+                      '.X3F']
     
     raw_files = []
     
@@ -52,26 +53,28 @@ def process_raw_file(raw_path, output_dir):
         # 複数の処理パラメータでテスト
         test_configs = [
             {
-                "name": "Linear GPU AdobeRGB",
+                "name": "Linear CPU sRGB",
                 "params": {
                     "use_camera_wb": True,
+                    "use_auto_wb": False,
                     "half_size": False,
                     "output_bps": 32,
                     "demosaic_algorithm": lre.DemosaicAlgorithm.Linear,
                     "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.AdobeRGB,
+                    "output_color": lre.ColorSpace.sRGB,
                     "highlight_mode": 4,
                 }
             },
             {
-                "name": "AMaZE GPU AdobeRGB",
+                "name": "AMaZE CPU WideGamutRGB",
                 "params": {
                     "use_camera_wb": True,
+                    "use_auto_wb": False,
                     "half_size": False,
                     "output_bps": 32,
                     "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
                     "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.AdobeRGB,
+                    "output_color": lre.ColorSpace.WideGamutRGB,
                     "highlight_mode": 4,
                 }
             },
@@ -205,7 +208,7 @@ def main():
     # 各RAWファイルを処理
     results_by_file = {}
     
-    for raw_file in raw_files[:3]:  # 最初の3ファイルのみテスト
+    for raw_file in raw_files:  # 最初の3ファイルのみテスト
         results = process_raw_file(raw_file, output_dir)
         if results:
             results_by_file[raw_file.name] = results

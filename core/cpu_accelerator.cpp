@@ -1885,7 +1885,7 @@ public:
             int gint, d, h, v, ng, row, col;
 
 #ifdef _OPENMP
-            #pragma omp parallel for collapse(2)
+//            #pragma omp parallel for collapse(2)
 #endif
             for (row = 0; row < 3; row++) {
                 for (col = 0; col < 3; col++) {
@@ -2054,15 +2054,18 @@ public:
 
                     memset(rgb, 0, ts * ts * 3 * sizeof(float));
 
-                    for (int row = top; row < mrow; row++)
+                    for (int row = top; row < mrow; row++) {
                         for (int col = left; col < mcol; col++) {
                             rgb[0][row - top][col - left][fcol_xtrans_(row, col)] = raw_buffer(row, col);
                         }
-
-                    for(int c = 0; c < 3; c++) {
-                        memcpy (rgb[c + 1], rgb[0], sizeof * rgb);
                     }
 
+#ifdef _OPENMP
+//                    #pragma omp critical
+#endif
+                    for(int c = 0; c < 3; c++) {
+                        memcpy (rgb[c + 1], rgb[0], sizeof(*rgb) - sizeof(float));
+                    }
                     /* Interpolate green horizontally, vertically, and along both diagonals: */
                     // std::cout << "[DEBUG] Interpolate green horizontally, vertically, and along both diagonals:" << std::endl;
                     for (int row = top; row < mrow; row++) {
@@ -2120,7 +2123,11 @@ public:
 
                     for (int pass = 0; pass < passes; pass++) {
                         if (pass == 1) {
-                            memcpy (rgb += 4, rgb_buffer_tile.data(), 4 * sizeof * rgb);
+#ifdef _OPENMP
+//                        #pragma omp critical
+#endif
+                            memcpy (rgb += 4, rgb_buffer_tile.data(), 4 * sizeof(*rgb) - sizeof(float));
+//                            memcpy (rgb += 4, rgb_buffer_tile.data(), sizeof(*rgb) - sizeof(float));
                         }
 
                         /* Recalculate green from interpolated values of closer pixels: */
@@ -2184,6 +2191,9 @@ public:
                                         color[h][d] = g + rix[i << c][h] + rix[-i << c][h];
 
                                         if (d > 1)
+#ifdef _OPENMP
+//                                            #pragma omp critical
+#endif
                                             diff[d] += SQR (rix[i << c][1] - rix[-i << c][1]
                                                             - rix[i << c][h] + rix[-i << c][h]) + SQR(g);
                                     }
@@ -2466,6 +2476,9 @@ public:
 
                                 for (int v = -1; v <= 1; v++) {
                                     for (int h = -1; h <= 1; h++) {
+#ifdef _OPENMP
+//                                    #pragma omp critical
+#endif
                                         temp += (drv[d][row + v - 5][col + h - 5] <= tr ? 1 : 0);
                                     }
                                 }
@@ -2513,6 +2526,9 @@ public:
 
                                 for(int v = -2; v <= 2; v++)
                                     for(int h = -2; h <= 2; h++) {
+#ifdef _OPENMP
+//                                        #pragma omp critical
+#endif
                                         v5sum[2 + h] += homo[d][row + v][col + h];
                                     }
 
@@ -2521,6 +2537,9 @@ public:
                                 col++;
 
                                 // now we can subtract a column of five from blocksum and get new colsum of 5
+#ifdef _OPENMP
+//                                #pragma omp critical
+#endif
                                 for (int voffset = 0; col < mcol - 8; col++, voffset++) {
                                     int colsum = homo[d][row - 2][col + 2] + homo[d][row - 1][col + 2] + homo[d][row][col + 2] + homo[d][row + 1][col + 2] + homo[d][row + 2][col + 2];
                                     voffset = voffset == 5 ? 0 : voffset;  // faster than voffset %= 5;
@@ -2628,6 +2647,9 @@ public:
                             uint8_t maxval = homosummax[row][col];
 
                             for (int d = 0; d < ndir; d++)
+#ifdef _OPENMP
+//                                #pragma omp critical
+#endif
                                 if (hm[d] >= maxval) {
                                     for (int c = 0; c < 3; c++) {
                                         avg[c] += rgb[d][row][col][c];
