@@ -1,5 +1,5 @@
 #include "libraw_wrapper.h"
-#include "constants.h"
+#include "metal/constants.h"
 #include <iostream>
 #include <memory>
 #include <chrono>
@@ -1042,39 +1042,13 @@ public:
         //adjust_maximum0(raw_buffer, params.adjust_maximum_thr);
 
         // set filters and xtrans
-        uint32_t filters = imgdata.idata.filters;        
-        char (&xtrans)[6][6] = imgdata.idata.xtrans;        
+        const uint32_t filters = imgdata.idata.filters;        
+        const char (&xtrans)[6][6] = imgdata.idata.xtrans;        
         std::cout << "🔍 Filters value: 0x" << std::hex << filters << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
 
         // Apply green matching for Bayer sensors (after black level, before demosaic)
         apply_green_matching(raw_buffer, filters);
         
-        // Calculate white balance multipliers (same logic as original)
-        float effective_wb[4];
-/*
-        if (params.use_camera_wb && imgdata.color.cam_mul[1] > 0) {
-            float dmin = *std::min_element(std::begin(imgdata.color.cam_mul), std::end(imgdata.color.cam_mul) - 2);
-            effective_wb[0] = imgdata.color.cam_mul[0] / dmin;
-            effective_wb[1] = imgdata.color.cam_mul[1] / dmin;
-            effective_wb[2] = imgdata.color.cam_mul[2] / dmin;
-            effective_wb[3] = imgdata.color.cam_mul[1] / dmin;
-            std::cout << "📷 Using camera WB from EXIF (min-normalized cam_mul):" << std::endl;
-        } else if (params.use_auto_wb && imgdata.color.pre_mul[1] > 0) {
-            float dmin = *std::min_element(std::begin(imgdata.color.pre_mul), std::end(imgdata.color.pre_mul) - 2);
-            effective_wb[0] = imgdata.color.pre_mul[0] / dmin;
-            effective_wb[1] = imgdata.color.pre_mul[1] / dmin;
-            effective_wb[2] = imgdata.color.pre_mul[2] / dmin;
-            effective_wb[3] = imgdata.color.pre_mul[3] / dmin;
-            std::cout << "📷 Using computed WB from LibRaw (min-normalized pre_mul):" << std::endl;
-        } else {
-            // Use user-specified white balance or default
-            effective_wb[0] = params.user_wb[0];
-            effective_wb[1] = params.user_wb[1];
-            effective_wb[2] = params.user_wb[2];
-            effective_wb[3] = params.user_wb[3];
-            std::cout << "👤 Using user/default WB:" << std::endl;
-        }
-*/
         // rgb_buffer2 is temporary buffer
         std::vector<float> rgb_buffer2_data(rgb_buffer.width * rgb_buffer.height * rgb_buffer.channels);
         ImageBufferFloat rgb_buffer2 = {
@@ -1084,6 +1058,8 @@ public:
             rgb_buffer.channels
         };
 
+        // Calculate white balance multipliers (same logic as original)
+        float effective_wb[4];
         if (!imgdata.params.no_auto_scale) {
             scale_colors(raw_buffer, effective_wb);
         } else {
@@ -1119,12 +1095,8 @@ public:
             return false;
         }
 
-        // Camera matrix-based color space conversion (reuse float_rgb buffer)
-        const char* camera_make = imgdata.idata.make;
-        const char* camera_model = imgdata.idata.model;        
-        
         // Get camera-specific color transformation matrix
-        ColorTransformMatrix camera_matrix = compute_camera_transform(camera_make, camera_model, ColorSpace::XYZ);
+        ColorTransformMatrix camera_matrix = compute_camera_transform(imgdata.idata.make, imgdata.idata.model, ColorSpace::XYZ);
         if(!camera_matrix.valid) {
             std::cout << "⚠️ Camera not in database, using fallback matrix" << std::endl;
             // Use fallback identity-like matrix for unknown cameras
@@ -1155,7 +1127,7 @@ public:
         }
 
         // Get camera-specific color transformation matrix
-        camera_matrix = compute_camera_transform(camera_make, camera_model, params.output_color_space);
+        camera_matrix = compute_camera_transform(imgdata.idata.make, imgdata.idata.model, params.output_color_space);
         if (!camera_matrix.valid) {
             std::cout << "⚠️ Camera not in database, using fallback matrix" << std::endl;
             camera_matrix.set_default();
@@ -1323,14 +1295,9 @@ public:
             
             // 縮小処理を考慮した最終的な割り当てサイズ
             alloc_height = (t_alloc_height + imgdata.rawdata.ioparams.shrink) >> imgdata.rawdata.ioparams.shrink;
-            alloc_width = (t_alloc_width + imgdata.rawdata.ioparams.shrink) >>imgdata.rawdata.ioparams.shrink;
+            alloc_width = (t_alloc_width + imgdata.rawdata.ioparams.shrink) >> imgdata.rawdata.ioparams.shrink;
         }
 
-/*        
-        int alloc_width = imgdata.sizes.iwidth;
-        int alloc_height = imgdata.sizes.iheight;
-*/
-        
         // Step 5: Allocate image buffer
         size_t alloc_sz = alloc_width * alloc_height;
         imgdata.image = (unsigned short (*)[4])calloc(alloc_sz, sizeof(*imgdata.image));

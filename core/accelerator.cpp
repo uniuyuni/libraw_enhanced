@@ -6,7 +6,7 @@
 #include "accelerator.h"
 #include "cpu_accelerator.h"
 #include "gpu_accelerator.h"
-#include "constants.h"
+#include "metal/constants.h"
 #include <iostream>
 #include <memory>
 

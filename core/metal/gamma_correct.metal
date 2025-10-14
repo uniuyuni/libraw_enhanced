@@ -6,7 +6,7 @@
 
 #include "shader_types.h"
 #include "shader_common.h"
-#include "../constants.h"
+#include "constants.h"
 
 // sRGB gamma encode
 inline float3 apply_srgb_gamma_encode(float3 linear_value) {

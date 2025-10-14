@@ -1062,7 +1062,7 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
         // 2. ヘッダーファイルを結合
         std::string types_header = load_shader_file("shader_types.h");
         std::string common_header = load_shader_file("shader_common.h");
-        std::string constants_header = load_shader_file("../constants.h");
+        std::string constants_header = load_shader_file("constants.h");
         
         if (types_header.empty() || common_header.empty() || constants_header.empty()) {
             std::cerr << "[ERROR] Failed to load shader headers for: " << shader_name << std::endl;
@@ -1125,6 +1125,7 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
 
 std::string GPUAccelerator::load_shader_file(const std::string& filename) {
     std::vector<std::string> possible_paths = {
+        std::string("metal/") + filename,
         std::string("core/metal/") + filename,
         std::string("../core/metal/") + filename,
         std::string("../../core/metal/") + filename,

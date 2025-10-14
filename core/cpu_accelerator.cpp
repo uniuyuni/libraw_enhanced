@@ -1,6 +1,6 @@
 #include "cpu_accelerator.h"
 #include "accelerator.h"
-#include "constants.h"
+#include "metal/constants.h"
 #include "metal/shader_common.h"
 #include <iostream>
 #include <chrono>
