@@ -1077,8 +1077,8 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
         while ((pos = shader_source.find("#include \"shader_common.h\"")) != std::string::npos) {
             shader_source.erase(pos, strlen("#include \"shader_common.h\""));
         }
-        while ((pos = shader_source.find("#include \"../constants.h\"")) != std::string::npos) {
-            shader_source.erase(pos, strlen("#include \"../constants.h\""));
+        while ((pos = shader_source.find("#include \"constants.h\"")) != std::string::npos) {
+            shader_source.erase(pos, strlen("#include \"constants.h\""));
         }
         
         std::string combined_source = types_header + "\n" + common_header + "\n" + constants_header + "/n" + shader_source;

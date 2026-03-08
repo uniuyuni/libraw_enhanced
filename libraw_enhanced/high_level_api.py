@@ -59,8 +59,10 @@ class RawImage:
         self._is_loaded = False
         self._image_info = None
         self._raw_data = None
+        self._color_matrix: Optional[np.ndarray] = None
         
         if filepath is not None:
+
             self.load_file(filepath)
     
     def load_file(self, filepath: str):
@@ -165,9 +167,11 @@ class RawImage:
                    bad_pixels_path: Optional[str] = None,
                    
                    # LibRaw Enhanced extensions
-                   use_gpu_acceleration: Optional[bool] = False) -> np.ndarray:
+                   use_gpu_acceleration: Optional[bool] = False,
+                   preprocess: bool = False) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
+
         
         This method provides full rawpy.postprocess() compatibility with all
         parameters, plus LibRaw Enhanced extensions.
@@ -227,8 +231,10 @@ class RawImage:
             # LibRaw Enhanced extensions
             metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
             use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
+            preprocess: If true, stops processing before demosaicing and returns the raw/modified bayer data.
             
         Returns:
+
             numpy.ndarray: Processed RGB image array (height, width, channels)
             
         Raises:
@@ -300,9 +306,11 @@ class RawImage:
             
             # LibRaw Enhanced extensions
             'use_gpu_acceleration': gpu_acceleration,
+            'preprocess': preprocess,
         }
                 
         # Convert parameter dict to the format expected by C++
+
         float_params = {}
         int_params = {}
         bool_params = {}
@@ -323,6 +331,7 @@ class RawImage:
                 if key == 'user_wb':
                     for i, val in enumerate(value):
                         float_params[f'user_wb_{i}'] = float(val)
+        int_params['preprocess'] = preprocess
         
         # Execute processing with categorized parameters
         result_image = self._wrapper.process_with_dict(
@@ -330,13 +339,19 @@ class RawImage:
         )
         
         # Save timing information for profiling
+
         if hasattr(result_image, 'timing_info'):
             self._last_timing_info = result_image.timing_info
+            
+        # Save camera color transformation matrix if available
+        if hasattr(result_image, 'color_matrix'):
+            self._color_matrix = np.array(result_image.color_matrix, dtype=np.float32)
         
         # Convert to NumPy array and return
         return result_image.to_numpy()
     
     def unpack(self):
+
         """
         RAWデータの展開処理
         
@@ -416,6 +431,91 @@ class RawImage:
         return self._image_info
     
     @property
+    def is_xtrans(self) -> bool:
+        """
+        画像がX-Transセンサーか判定
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded")
+        return self.sizes.is_xtrans
+        
+    @property
+    def is_bayer(self) -> bool:
+        """
+        画像がBayer配列か判定 (X-Transでない場合はBayerとみなす)
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded")
+        return not self.sizes.is_xtrans
+    
+    @property
+    def color_desc(self) -> bytes:
+        """
+        RAW画像のBayer配列の色配置パターン記述子を取得します。
+        例: b'RGBG'
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded")
+        # pybind11経由で抽出された文字列(str)を利用してbytesに変換（上位互換のため）
+        return self.sizes.color_desc.encode('ascii')
+        
+    def get_bayer_pattern_offset(self, img_pre: Optional[np.ndarray] = None) -> Tuple[int, int]:
+        """
+        DemosaicNet等で必要となる固定レイアウト(GRBG)にアラインメントするための
+        (offset_y, offset_x) を計算して返します。
+        
+        Bayer配列画像に対して機能します。X-Trans画像の場合は (0, 0) を返します。
+        内部で前処理画像(preprocess=True)の赤チャンネルの位相を判定します。
+        
+        Args:
+            img_pre (numpy.ndarray, optional): 既に `postprocess(preprocess=True)` で
+                取得済みの画像があれば渡すことで再計算を防げます。
+                
+        Returns:
+            Tuple[int, int]: numpy.roll(img, shift=(offset_y, offset_x), axis=(0, 1)) に使用するシフト量
+        """
+        if self.is_xtrans:
+            return (0, 0)
+            
+        try:
+            # 前処理画像が渡されていなければ取得する
+            if img_pre is None:
+                img_pre = self.postprocess(preprocess=True, no_auto_scale=True, use_camera_wb=False)
+            
+            # preprocess=True出力は (H, W, 3) のスパースBayerデータ
+            # 各位置はRGBいずれか1チャンネルのみ非ゼロ
+            # Rチャンネルの2x2グリッド上での非ゼロ位置を特定する
+            r_ch = img_pre[..., 0].astype(np.float64)
+            
+            # 2x2位相ごとのR値の合計を計算する
+            # (0,0): 偶数行・偶数列, (0,1): 偶数行・奇数列
+            # (1,0): 奇数行・偶数列, (1,1): 奇数行・奇数列
+            sums = {
+                (0, 0): r_ch[0::2, 0::2].sum(),  # RGGB layout
+                (0, 1): r_ch[0::2, 1::2].sum(),  # GRBG layout
+                (1, 0): r_ch[1::2, 0::2].sum(),  # GBRG layout
+                (1, 1): r_ch[1::2, 1::2].sum(),  # BGGR layout
+            }
+            
+            # 最も赤チャンネルの値の合計が大きい位相をRの2D空間位置とみなす
+            # NOTE: color_desc文字列はLibRaw内部の順序であり、2D空間レイアウトと一致しない場合がある
+            # このため実際のピクセルデータから位相を検出する
+            ry, rx = max(sums, key=sums.get)
+            
+            # アラインメント要件: DemosaicNetは R が (0, 1) の位置にあることを期待 (GRBG)
+            # DemosaicNet bayer_mosaic: mask[0, 0::2, 1::2] = 1  # Red at (even row, odd col)
+            # 必要なシフト量 = DemosaicNet期待位置 - 現在位置 (mod 2)
+            dy = (0 - ry) % 2
+            dx = (1 - rx) % 2
+            
+            return (dy, dx)
+            
+        except Exception as e:
+            # Fallback for unexpected errors
+            import warnings
+            warnings.warn(f"Failed to calculate bayer offset: {e}")
+            return (0, 0)
+
     def color(self) -> Dict[str, Any]:
         """
         色情報を取得（rawpy互換性のため）
@@ -434,8 +534,20 @@ class RawImage:
         }
     
     @property
+    def color_matrix(self) -> Optional[np.ndarray]:
+        """
+        Color transformation matrix (3x4) used to convert camera color space to output color space.
+        Available only after `postprocess()` is called.
+        
+        Returns:
+            numpy.ndarray: 3x4 layout matrix, or None if `postprocess()` has not been called.
+        """
+        return self._color_matrix
+        
+    @property
     def params(self) -> Dict[str, Any]:
         """
+
         現在の処理パラメータを取得（rawpy互換性のため）
         
         Returns:

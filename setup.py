@@ -299,12 +299,12 @@ def create_extension():
     else:
         print("Skipping Metal accelerator on non-Apple platform")
     
-    # インクルードディレクトリ
+    # インクルードディレクトリ (libraw_includes MUST be before bundled external/LibRaw-master to avoid ABI memory corruption!)
     include_dirs = [
         'core',
-        'external/LibRaw-master',        # LibRaw internal headers
-        'external/LibRaw-master/internal', # LibRaw internal defs
         *libraw_includes,
+        'external/LibRaw-master',        # LibRaw internal headers (fallback)
+        'external/LibRaw-master/internal', # LibRaw internal defs (fallback)
     ]
     
     # libompのインクルードパスを追加
