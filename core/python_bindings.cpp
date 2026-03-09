@@ -310,6 +310,26 @@ PYBIND11_MODULE(_core, m) {
            })
       .def("set_gpu_acceleration", &LibRawWrapper::set_gpu_acceleration)
       .def("get_device_info", &LibRawWrapper::get_device_info)
+      // Standalone numpy image processing
+      .def("get_threshold", &LibRawWrapper::get_threshold,
+           "Get threshold value = maximum / data_maximum (computed from "
+           "current RAW metadata)")
+      .def("recover_highlights", &LibRawWrapper::recover_highlights_numpy,
+           py::arg("image"), py::arg("threshold") = -1.f,
+           "Recover highlights on a (H,W,3) float32 numpy array. "
+           "threshold<0 uses maximum/data_maximum automatically. "
+           "Returns a new array.")
+      .def("tone_mapping", &LibRawWrapper::tone_mapping_numpy, py::arg("image"),
+           py::arg("after_scale") = 1.f,
+           "Apply tone mapping on a (H,W,3) float32 numpy array. "
+           "Returns a new array.")
+      .def("enhance_micro_contrast",
+           &LibRawWrapper::enhance_micro_contrast_numpy, py::arg("image"),
+           py::arg("threshold") = -1.f, py::arg("strength") = 8.f,
+           py::arg("target_contrast") = 0.06f,
+           "Enhance micro contrast on a (H,W,3) float32 numpy array. "
+           "threshold<0 uses maximum/data_maximum automatically. "
+           "Returns a new array.")
 #endif
       ;
 

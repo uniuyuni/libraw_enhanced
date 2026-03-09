@@ -117,6 +117,18 @@ public:
   void set_processing_params(const ProcessingParams &params);
   void set_gpu_acceleration(bool enable);
   std::string get_device_info() const;
+
+  // Standalone image processing methods (accept numpy float32 array, return new
+  // array)
+  float get_threshold() const;
+  py::array_t<float> recover_highlights_numpy(py::array_t<float> image,
+                                              float threshold = -1.f);
+  py::array_t<float> tone_mapping_numpy(py::array_t<float> image,
+                                        float after_scale = 1.f);
+  py::array_t<float>
+  enhance_micro_contrast_numpy(py::array_t<float> image, float threshold = -1.f,
+                               float strength = 8.f,
+                               float target_contrast = 0.06f);
 #endif
 
 private:

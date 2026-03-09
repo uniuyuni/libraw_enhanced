@@ -372,6 +372,91 @@ class RawImage:
         """
         return self._last_timing_info
     
+    def get_threshold(self) -> float:
+        """
+        threshold = maximum / data_maximum の値を返す。
+
+        RAWファイルの処理後にハイライトリカバリやマイクロコントラスト強調に
+        使うデフォルトの閾値として利用できる。
+
+        Returns:
+            float: threshold 値（data_maximum が 0 の場合は 1.0）
+
+        Raises:
+            RuntimeError: RAW ファイルが読み込まれていない場合
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded. Call load_file() first.")
+        return self._wrapper.get_threshold()
+
+    def recover_highlights(self,
+                           image: np.ndarray,
+                           threshold: float = -1.0) -> np.ndarray:
+        """
+        ハイライトリカバリを実行し、新しい numpy 配列を返す。
+
+        Args:
+            image: 入力画像 (H, W, 3) float32 numpy 配列, 値域 0.0-1.0
+            threshold: 飽和閾値。-1 のとき maximum/data_maximum を自動使用。
+
+        Returns:
+            numpy.ndarray: 処理後の新しい (H, W, 3) float32 配列
+
+        Raises:
+            RuntimeError: RAW ファイルが読み込まれていない場合
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded. Call load_file() first.")
+        arr = np.ascontiguousarray(image, dtype=np.float32)
+        return self._wrapper.recover_highlights(arr, threshold)
+
+    def tone_mapping(self,
+                     image: np.ndarray,
+                     after_scale: float = 1.0) -> np.ndarray:
+        """
+        トーンマッピングを実行し、新しい numpy 配列を返す。
+
+        Args:
+            image: 入力画像 (H, W, 3) float32 numpy 配列, 値域 0.0-1.0
+            after_scale: 処理後のスケール係数（デフォルト 1.0）
+
+        Returns:
+            numpy.ndarray: 処理後の新しい (H, W, 3) float32 配列
+
+        Raises:
+            RuntimeError: RAW ファイルが読み込まれていない場合
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded. Call load_file() first.")
+        arr = np.ascontiguousarray(image, dtype=np.float32)
+        return self._wrapper.tone_mapping(arr, after_scale)
+
+    def enhance_micro_contrast(self,
+                               image: np.ndarray,
+                               threshold: float = -1.0,
+                               strength: float = 8.0,
+                               target_contrast: float = 0.06) -> np.ndarray:
+        """
+        マイクロコントラスト強調を実行し、新しい numpy 配列を返す。
+
+        Args:
+            image: 入力画像 (H, W, 3) float32 numpy 配列, 値域 0.0-1.0
+            threshold: 処理対象の閾値。-1 のとき maximum/data_maximum を自動使用。
+            strength: 強調の強さ（デフォルト 8.0）
+            target_contrast: 目標コントラスト値（デフォルト 0.06）
+
+        Returns:
+            numpy.ndarray: 処理後の新しい (H, W, 3) float32 配列
+
+        Raises:
+            RuntimeError: RAW ファイルが読み込まれていない場合
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded. Call load_file() first.")
+        arr = np.ascontiguousarray(image, dtype=np.float32)
+        return self._wrapper.enhance_micro_contrast(arr, threshold, strength,
+                                                   target_contrast)
+
     def close(self):
         """リソースの解放"""
         if self._wrapper:

@@ -2333,6 +2333,141 @@ void LibRawWrapper::close() {
   pimpl->processor.recycle();
 }
 
+#ifdef __arm64__
+
+// ---------------------------------------------------------------
+// Standalone numpy-based image processing methods
+// ---------------------------------------------------------------
+
+// Helper: compute default threshold = maximum / data_maximum
+static float compute_default_threshold(LibRaw &processor) {
+  float maximum = (float)processor.imgdata.color.maximum;
+  float data_maximum = (float)processor.imgdata.color.data_maximum;
+  if (data_maximum > 0.f && maximum > 0.f) {
+    return maximum / data_maximum;
+  }
+  return 1.f; // fallback: no adjustment
+}
+
+float LibRawWrapper::get_threshold() const {
+  return compute_default_threshold(pimpl->processor);
+}
+
+py::array_t<float>
+LibRawWrapper::recover_highlights_numpy(py::array_t<float> image,
+                                        float threshold) {
+  py::buffer_info buf = image.request();
+  if (buf.ndim != 3 || buf.shape[2] != 3) {
+    throw std::invalid_argument(
+        "recover_highlights_numpy: image must be shape (H, W, 3) float32");
+  }
+  if (threshold < 0.f) {
+    threshold = compute_default_threshold(pimpl->processor);
+  }
+
+  const size_t height = buf.shape[0];
+  const size_t width = buf.shape[1];
+  const size_t channels = 3;
+  const size_t num_pixels = height * width;
+
+  // Allocate output array
+  py::array_t<float> output({height, width, channels});
+  py::buffer_info out_buf = output.request();
+
+  // Copy input to output
+  std::memcpy(out_buf.ptr, buf.ptr, num_pixels * channels * sizeof(float));
+
+  // Wrap output buffer as ImageBufferFloat (in-place on the copy)
+  ImageBufferFloat rgb_buffer;
+  rgb_buffer.image = reinterpret_cast<float(*)[3]>(out_buf.ptr);
+  rgb_buffer.width = width;
+  rgb_buffer.height = height;
+  rgb_buffer.channels = channels;
+
+  pimpl->recover_highlights(rgb_buffer, threshold);
+
+  return output;
+}
+
+py::array_t<float> LibRawWrapper::tone_mapping_numpy(py::array_t<float> image,
+                                                     float after_scale) {
+  py::buffer_info buf = image.request();
+  if (buf.ndim != 3 || buf.shape[2] != 3) {
+    throw std::invalid_argument(
+        "tone_mapping_numpy: image must be shape (H, W, 3) float32");
+  }
+
+  const size_t height = buf.shape[0];
+  const size_t width = buf.shape[1];
+  const size_t channels = 3;
+  const size_t num_pixels = height * width;
+
+  // Allocate output array
+  py::array_t<float> output({height, width, channels});
+  py::buffer_info out_buf = output.request();
+
+  // Copy input to output
+  std::memcpy(out_buf.ptr, buf.ptr, num_pixels * channels * sizeof(float));
+
+  // Wrap as ImageBufferFloat
+  ImageBufferFloat rgb_buffer;
+  rgb_buffer.image = reinterpret_cast<float(*)[3]>(out_buf.ptr);
+  rgb_buffer.width = width;
+  rgb_buffer.height = height;
+  rgb_buffer.channels = channels;
+
+  if (!pimpl->accelerator) {
+    throw std::runtime_error("tone_mapping_numpy: accelerator not initialized");
+  }
+  pimpl->accelerator->tone_mapping(rgb_buffer, rgb_buffer, after_scale);
+
+  return output;
+}
+
+py::array_t<float>
+LibRawWrapper::enhance_micro_contrast_numpy(py::array_t<float> image,
+                                            float threshold, float strength,
+                                            float target_contrast) {
+  py::buffer_info buf = image.request();
+  if (buf.ndim != 3 || buf.shape[2] != 3) {
+    throw std::invalid_argument(
+        "enhance_micro_contrast_numpy: image must be shape (H, W, 3) float32");
+  }
+  if (threshold < 0.f) {
+    threshold = compute_default_threshold(pimpl->processor);
+  }
+
+  const size_t height = buf.shape[0];
+  const size_t width = buf.shape[1];
+  const size_t channels = 3;
+  const size_t num_pixels = height * width;
+
+  // Allocate output array
+  py::array_t<float> output({height, width, channels});
+  py::buffer_info out_buf = output.request();
+
+  // Copy input to output
+  std::memcpy(out_buf.ptr, buf.ptr, num_pixels * channels * sizeof(float));
+
+  // Wrap as ImageBufferFloat
+  ImageBufferFloat rgb_buffer;
+  rgb_buffer.image = reinterpret_cast<float(*)[3]>(out_buf.ptr);
+  rgb_buffer.width = width;
+  rgb_buffer.height = height;
+  rgb_buffer.channels = channels;
+
+  if (!pimpl->accelerator) {
+    throw std::runtime_error(
+        "enhance_micro_contrast_numpy: accelerator not initialized");
+  }
+  pimpl->accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold,
+                                             strength, target_contrast);
+
+  return output;
+}
+
+#endif // __arm64__
+
 // rawpy完全互換性のための処理パラメータ変換関数
 ProcessingParams create_params_from_rawpy_args(
     // Basic parameters
