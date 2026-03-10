@@ -51,9 +51,18 @@ kernel void enhance_micro_contrast(
 
     // 画像の再構成
     if (rgb_input[idx].y >= params.threshold) {
-        rgb_output[idx].x = local_mean[idx].x + enhanced_high_freq.x;
-        rgb_output[idx].y = local_mean[idx].y + enhanced_high_freq.y;
-        rgb_output[idx].z = local_mean[idx].z + enhanced_high_freq.z;
+        float3 out_rgb = float3(
+            local_mean[idx].x + enhanced_high_freq.x,
+            local_mean[idx].y + enhanced_high_freq.y,
+            local_mean[idx].z + enhanced_high_freq.z
+        );
+        // Preserve highlight detail without hard clipping by scaling
+        // down only if the enhancement pushes above 1.0.
+        float maxc = max(out_rgb.x, max(out_rgb.y, out_rgb.z));
+        if (maxc > 1.f) {
+            out_rgb /= maxc;
+        }
+        rgb_output[idx] = out_rgb;
     } else {
         rgb_output[idx] = rgb_input[idx];
     }

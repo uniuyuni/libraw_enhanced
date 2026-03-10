@@ -2883,9 +2883,9 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
     for (size_t i = 0; i < pixel_count; i++) {
         const float* in = rgb_input.image[i];
         float* out = rgb_output.image[i];
-        out[0] = fmaxf(0.0f, fminf(1.0f, transform[0][0] * in[0] + transform[0][1] * in[1] + transform[0][2] * in[2] + transform[0][3]));
-        out[1] = fmaxf(0.0f, fminf(1.0f, transform[1][0] * in[0] + transform[1][1] * in[1] + transform[1][2] * in[2] + transform[1][3]));
-        out[2] = fmaxf(0.0f, fminf(1.0f, transform[2][0] * in[0] + transform[2][1] * in[1] + transform[2][2] * in[2] + transform[2][3]));
+        out[0] = transform[0][0] * in[0] + transform[0][1] * in[1] + transform[0][2] * in[2] + transform[0][3];
+        out[1] = transform[1][0] * in[0] + transform[1][1] * in[1] + transform[1][2] * in[2] + transform[1][3];
+        out[2] = transform[2][0] * in[0] + transform[2][1] * in[1] + transform[2][2] * in[2] + transform[2][3];
     }
     return true;
 }
@@ -3244,9 +3244,21 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
 #endif
     for (uint32_t idx = 0; idx < width * height; ++idx) {
         if (I[idx][1] >= threshold) {
-            rgb_output.image[idx][0] = local_mean[idx][0] + enhanced_high_freq[idx][0];
-            rgb_output.image[idx][1] = local_mean[idx][1] + enhanced_high_freq[idx][1];
-            rgb_output.image[idx][2] = local_mean[idx][2] + enhanced_high_freq[idx][2];
+            float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
+            float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
+            float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
+            // Preserve highlight detail without hard clipping by scaling
+            // down only if the enhancement pushes above 1.0.
+            float maxc = std::max(r, std::max(g, b));
+            if (maxc > 1.f) {
+                float scale = 1.f / maxc;
+                r *= scale;
+                g *= scale;
+                b *= scale;
+            }
+            rgb_output.image[idx][0] = r;
+            rgb_output.image[idx][1] = g;
+            rgb_output.image[idx][2] = b;
         } else {
             rgb_output.image[idx][0] = rgb_input.image[idx][0];
             rgb_output.image[idx][1] = rgb_input.image[idx][1];

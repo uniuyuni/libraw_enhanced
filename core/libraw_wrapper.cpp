@@ -1240,14 +1240,16 @@ public:
     }
 
     // Tone mapping
+    float target_contrast = 0.06f;
     if (params.highlight_mode > 4) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
+    } else {
+      target_contrast *= 2.f;
     }
 
     // Highlight detail recovery
     if (params.highlight_mode > 3) {
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold,
-                                          8.f, 0.06f);
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     }
 
     // Get camera-specific color transformation matrix

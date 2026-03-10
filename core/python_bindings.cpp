@@ -258,7 +258,7 @@ PYBIND11_MODULE(_core, m) {
               float *out_ptr = static_cast<float *>(array_32.request().ptr);
 
               for (size_t i = 0; i < height * width * channels; i++) {
-                *out_ptr++ = std::clamp(*in_ptr++, 0.f, 1.f);
+                *out_ptr++ = *in_ptr++;
               }
               return array_32;
               /*
