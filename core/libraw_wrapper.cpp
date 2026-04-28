@@ -1,11 +1,14 @@
 #include "libraw_wrapper.h"
 #include "metal/constants.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <iostream>
 #include <memory>
 #include <random>
+#include <vector>
 
 // LibRaw ヘッダー
 #include <libraw/libraw.h>
@@ -494,7 +497,355 @@ public:
   // カラースケール処理
   //===============================================================
 
-  void scale_colors(const ImageBuffer &raw_buffer, float scale_mul[4]) {
+  inline uint32_t cfa_channel_at(size_t row, size_t col) const {
+    const auto &idata = processor.imgdata.idata;
+    if (idata.filters == FILTERS_XTRANS) {
+      return fcol_xtrans(static_cast<int>(row), static_cast<int>(col),
+                         idata.xtrans);
+    }
+    return fcol_bayer_native(static_cast<int>(row), static_cast<int>(col),
+                             idata.filters);
+  }
+
+  static float bilinear_sample_u16(const std::vector<ushort> &plane, size_t w,
+                                   size_t h, float y, float x) {
+    if (w < 2 || h < 2 || x < 0.0f || y < 0.0f || x >= static_cast<float>(w - 1) ||
+        y >= static_cast<float>(h - 1)) {
+      return -1.0f;
+    }
+
+    const size_t x0 = static_cast<size_t>(x);
+    const size_t y0 = static_cast<size_t>(y);
+    const float fx = x - static_cast<float>(x0);
+    const float fy = y - static_cast<float>(y0);
+
+    const size_t idx00 = y0 * w + x0;
+    const size_t idx01 = idx00 + 1;
+    const size_t idx10 = idx00 + w;
+    const size_t idx11 = idx10 + 1;
+
+    const float v00 = static_cast<float>(plane[idx00]);
+    const float v01 = static_cast<float>(plane[idx01]);
+    const float v10 = static_cast<float>(plane[idx10]);
+    const float v11 = static_cast<float>(plane[idx11]);
+
+    return (v00 * (1.0f - fx) + v01 * fx) * (1.0f - fy) +
+           (v10 * (1.0f - fx) + v11 * fx) * fy;
+  }
+
+  float estimate_ca_scale(const ImageBuffer &raw_buffer, uint32_t target_channel,
+                          const std::vector<ushort> &channel_plane,
+                          const std::vector<float> &guide,
+                          const std::vector<float> &guide_grad,
+                          float mean_grad) {
+    if (raw_buffer.width < 16 || raw_buffer.height < 16) {
+      return 1.0f;
+    }
+
+    struct SamplePoint {
+      uint32_t row;
+      uint32_t col;
+      float weight;
+    };
+
+    std::vector<SamplePoint> samples;
+    samples.reserve(32768);
+
+    const float grad_threshold = mean_grad * 0.8f;
+    const int stride = (raw_buffer.width * raw_buffer.height > 24000000) ? 4 : 2;
+
+    for (size_t row = 4; row + 4 < raw_buffer.height; row += stride) {
+      for (size_t col = 4; col + 4 < raw_buffer.width; col += stride) {
+        if (cfa_channel_at(row, col) != target_channel) {
+          continue;
+        }
+        const size_t idx = row * raw_buffer.width + col;
+        const float grad = guide_grad[idx];
+        if (grad < grad_threshold) {
+          continue;
+        }
+
+        const float weight =
+            1.0f + std::min(3.0f, grad / (mean_grad + 1e-6f));
+        samples.push_back(
+            {static_cast<uint32_t>(row), static_cast<uint32_t>(col), weight});
+      }
+    }
+
+    if (samples.size() < 256) {
+      return 1.0f;
+    }
+    if (samples.size() > 30000) {
+      const size_t step = samples.size() / 30000 + 1;
+      std::vector<SamplePoint> reduced;
+      reduced.reserve(30000);
+      for (size_t i = 0; i < samples.size(); i += step) {
+        reduced.push_back(samples[i]);
+      }
+      samples.swap(reduced);
+    }
+
+    const float center_y = static_cast<float>(raw_buffer.height) * 0.5f;
+    const float center_x = static_cast<float>(raw_buffer.width) * 0.5f;
+
+    auto evaluate = [&](float scale) {
+      double score = 0.0;
+      double weight_sum = 0.0;
+      size_t valid = 0;
+
+      for (const auto &s : samples) {
+        const float src_y =
+            (static_cast<float>(s.row) - center_y) * scale + center_y;
+        const float src_x =
+            (static_cast<float>(s.col) - center_x) * scale + center_x;
+
+        const float corrected = bilinear_sample_u16(
+            channel_plane, raw_buffer.width, raw_buffer.height, src_y, src_x);
+        if (corrected < 0.0f) {
+          continue;
+        }
+
+        const size_t idx =
+            static_cast<size_t>(s.row) * raw_buffer.width + s.col;
+        const float ref = guide[idx];
+        const float norm = std::max(64.0f, ref);
+        score += s.weight * std::fabs(corrected - ref) / norm;
+        weight_sum += s.weight;
+        valid++;
+      }
+
+      if (valid < 128 || weight_sum < 1e-6) {
+        return std::numeric_limits<double>::infinity();
+      }
+      return score / weight_sum;
+    };
+
+    float best_scale = 1.0f;
+    double best_score = std::numeric_limits<double>::infinity();
+
+    for (float scale = 0.995f; scale <= 1.00501f; scale += 0.001f) {
+      const double s = evaluate(scale);
+      if (s < best_score) {
+        best_score = s;
+        best_scale = scale;
+      }
+    }
+
+    const float fine_begin = std::max(0.992f, best_scale - 0.0012f);
+    const float fine_end = std::min(1.008f, best_scale + 0.0012f);
+    for (float scale = fine_begin; scale <= fine_end + 1e-6f;
+         scale += 0.0002f) {
+      const double s = evaluate(scale);
+      if (s < best_score) {
+        best_score = s;
+        best_scale = scale;
+      }
+    }
+
+    return std::clamp(best_scale, 0.99f, 1.01f);
+  }
+
+  float estimate_ca_scale_window(const ImageBuffer &raw_buffer,
+                                 uint32_t target_channel,
+                                 const std::vector<ushort> &channel_plane,
+                                 const std::vector<float> &guide,
+                                 const std::vector<float> &guide_grad,
+                                 float mean_grad, size_t row_begin,
+                                 size_t row_end, size_t col_begin,
+                                 size_t col_end, float center_scale) {
+    if (row_end <= row_begin + 8 || col_end <= col_begin + 8) {
+      return center_scale;
+    }
+
+    struct SamplePoint {
+      uint32_t row;
+      uint32_t col;
+      float weight;
+    };
+
+    std::vector<SamplePoint> samples;
+    samples.reserve(4096);
+    const float grad_threshold = mean_grad * 0.9f;
+    const int stride = 2;
+
+    const size_t rb = std::max<size_t>(4, row_begin);
+    const size_t re = std::min(raw_buffer.height - 4, row_end);
+    const size_t cb = std::max<size_t>(4, col_begin);
+    const size_t ce = std::min(raw_buffer.width - 4, col_end);
+
+    for (size_t row = rb; row < re; row += stride) {
+      for (size_t col = cb; col < ce; col += stride) {
+        if (cfa_channel_at(row, col) != target_channel) {
+          continue;
+        }
+        const size_t idx = row * raw_buffer.width + col;
+        const float grad = guide_grad[idx];
+        if (grad < grad_threshold) {
+          continue;
+        }
+        const float weight =
+            1.0f + std::min(3.0f, grad / (mean_grad + 1e-6f));
+        samples.push_back(
+            {static_cast<uint32_t>(row), static_cast<uint32_t>(col), weight});
+      }
+    }
+
+    if (samples.size() < 128) {
+      return center_scale;
+    }
+
+    const float center_y = static_cast<float>(raw_buffer.height) * 0.5f;
+    const float center_x = static_cast<float>(raw_buffer.width) * 0.5f;
+
+    auto evaluate = [&](float scale) {
+      double score = 0.0;
+      double weight_sum = 0.0;
+      size_t valid = 0;
+
+      for (const auto &s : samples) {
+        const float src_y =
+            (static_cast<float>(s.row) - center_y) * scale + center_y;
+        const float src_x =
+            (static_cast<float>(s.col) - center_x) * scale + center_x;
+        const float corrected = bilinear_sample_u16(
+            channel_plane, raw_buffer.width, raw_buffer.height, src_y, src_x);
+        if (corrected < 0.0f) {
+          continue;
+        }
+        const size_t idx =
+            static_cast<size_t>(s.row) * raw_buffer.width + s.col;
+        const float ref = guide[idx];
+        const float norm = std::max(64.0f, ref);
+        score += s.weight * std::fabs(corrected - ref) / norm;
+        weight_sum += s.weight;
+        valid++;
+      }
+
+      if (valid < 64 || weight_sum < 1e-6) {
+        return std::numeric_limits<double>::infinity();
+      }
+      return score / weight_sum;
+    };
+
+    float best_scale = center_scale;
+    double best_score = std::numeric_limits<double>::infinity();
+
+    const float coarse_begin = std::max(0.99f, center_scale - 0.0025f);
+    const float coarse_end = std::min(1.01f, center_scale + 0.0025f);
+    for (float scale = coarse_begin; scale <= coarse_end + 1e-6f;
+         scale += 0.0005f) {
+      const double s = evaluate(scale);
+      if (s < best_score) {
+        best_score = s;
+        best_scale = scale;
+      }
+    }
+
+    const float fine_begin = std::max(0.99f, best_scale - 0.0005f);
+    const float fine_end = std::min(1.01f, best_scale + 0.0005f);
+    for (float scale = fine_begin; scale <= fine_end + 1e-6f;
+         scale += 0.0001f) {
+      const double s = evaluate(scale);
+      if (s < best_score) {
+        best_score = s;
+        best_scale = scale;
+      }
+    }
+
+    return std::clamp(best_scale, 0.99f, 1.01f);
+  }
+
+  std::vector<float> build_ca_scale_map(
+      const ImageBuffer &raw_buffer, uint32_t target_channel,
+      const std::vector<ushort> &channel_plane, const std::vector<float> &guide,
+      const std::vector<float> &guide_grad, float mean_grad, float base_scale,
+      size_t &map_w, size_t &map_h) {
+    const size_t tile = 192;
+    map_w = std::max<size_t>(2, (raw_buffer.width + tile - 1) / tile + 1);
+    map_h = std::max<size_t>(2, (raw_buffer.height + tile - 1) / tile + 1);
+
+    std::vector<float> map(map_w * map_h, base_scale);
+
+    for (size_t gy = 0; gy < map_h; ++gy) {
+      const float y =
+          (map_h == 1)
+              ? 0.0f
+              : (static_cast<float>(gy) / static_cast<float>(map_h - 1)) *
+                    static_cast<float>(raw_buffer.height - 1);
+      for (size_t gx = 0; gx < map_w; ++gx) {
+        const float x =
+            (map_w == 1)
+                ? 0.0f
+                : (static_cast<float>(gx) / static_cast<float>(map_w - 1)) *
+                      static_cast<float>(raw_buffer.width - 1);
+
+        const size_t yc = static_cast<size_t>(y);
+        const size_t xc = static_cast<size_t>(x);
+        const size_t row_begin = (yc > tile) ? (yc - tile) : 0;
+        const size_t col_begin = (xc > tile) ? (xc - tile) : 0;
+        const size_t row_end = std::min(raw_buffer.height, yc + tile + 1);
+        const size_t col_end = std::min(raw_buffer.width, xc + tile + 1);
+
+        map[gy * map_w + gx] = estimate_ca_scale_window(
+            raw_buffer, target_channel, channel_plane, guide, guide_grad,
+            mean_grad, row_begin, row_end, col_begin, col_end, base_scale);
+      }
+    }
+
+    // Edge-aware smoothing (simple 3x3 kernel) to avoid tile boundaries.
+    if (map_w >= 3 && map_h >= 3) {
+      std::vector<float> smoothed = map;
+      for (size_t gy = 1; gy + 1 < map_h; ++gy) {
+        for (size_t gx = 1; gx + 1 < map_w; ++gx) {
+          float acc = 0.0f;
+          acc += map[(gy - 1) * map_w + (gx - 1)] * 1.0f;
+          acc += map[(gy - 1) * map_w + gx] * 2.0f;
+          acc += map[(gy - 1) * map_w + (gx + 1)] * 1.0f;
+          acc += map[gy * map_w + (gx - 1)] * 2.0f;
+          acc += map[gy * map_w + gx] * 4.0f;
+          acc += map[gy * map_w + (gx + 1)] * 2.0f;
+          acc += map[(gy + 1) * map_w + (gx - 1)] * 1.0f;
+          acc += map[(gy + 1) * map_w + gx] * 2.0f;
+          acc += map[(gy + 1) * map_w + (gx + 1)] * 1.0f;
+          smoothed[gy * map_w + gx] = acc * (1.0f / 16.0f);
+        }
+      }
+      map.swap(smoothed);
+    }
+
+    return map;
+  }
+
+  static float sample_scale_map(const std::vector<float> &map, size_t map_w,
+                                size_t map_h, size_t row, size_t col,
+                                size_t image_w, size_t image_h,
+                                float fallback_scale) {
+    if (map.empty() || map_w < 2 || map_h < 2 || image_w < 2 || image_h < 2) {
+      return fallback_scale;
+    }
+
+    const float gx =
+        (static_cast<float>(col) * static_cast<float>(map_w - 1)) /
+        static_cast<float>(image_w - 1);
+    const float gy =
+        (static_cast<float>(row) * static_cast<float>(map_h - 1)) /
+        static_cast<float>(image_h - 1);
+
+    const size_t x0 = std::min(map_w - 2, static_cast<size_t>(gx));
+    const size_t y0 = std::min(map_h - 2, static_cast<size_t>(gy));
+    const float fx = gx - static_cast<float>(x0);
+    const float fy = gy - static_cast<float>(y0);
+
+    const float m00 = map[y0 * map_w + x0];
+    const float m01 = map[y0 * map_w + x0 + 1];
+    const float m10 = map[(y0 + 1) * map_w + x0];
+    const float m11 = map[(y0 + 1) * map_w + x0 + 1];
+
+    return (m00 * (1.0f - fx) + m01 * fx) * (1.0f - fy) +
+           (m10 * (1.0f - fx) + m11 * fx) * fy;
+  }
+
+  void scale_colors(ImageBuffer &raw_buffer, float scale_mul[4]) {
     auto &imgdata = processor.imgdata;
 
     // 変数宣言
@@ -757,47 +1108,144 @@ public:
     }
 
     // ========================================
-    // 9. 色スケーリングの実行
+    // 9. 倍率色収差補正（R/Bチャンネル）
     // ========================================
     size = imgdata.sizes.iheight * imgdata.sizes.iwidth;
-    //        scale_colors_loop(scale_mul);
-    /*
-            // ========================================
-            // 10. 収差補正（RGB画像のみ）
-            // ========================================
-            if ((imgdata.params.aber[0] != 1 || imgdata.params.aber[2] != 1) &&
-       imgdata.idata.colors == 3) { for (c = 0; c < 4; c += 2) { if
-       (imgdata.params.aber[c] == 1) continue;
 
-                    // 一時画像バッファ確保
-                    img = (ushort *)malloc(size * sizeof(*img));
-                    for (i = 0; i < size; i++) {
-                        img[i] = image[i][c];
-                    }
+    // Auto mode: both red/blue CA scales are default (=1.0).
+    // NOTE: high-quality raw processors typically estimate TCA by minimizing
+    // R/G and B/G edge mismatch in high-gradient regions.
+    const bool auto_ca_requested =
+        std::fabs(imgdata.params.aber[0] - 1.0f) < 1e-6f &&
+        std::fabs(imgdata.params.aber[1] - 1.0f) < 1e-6f &&
+        std::fabs(imgdata.params.aber[2] - 1.0f) < 1e-6f;
 
-                    // バイリニア補間による収差補正
-                    for (row = 0; row < imgdata.sizes.iheight; row++) {
-                        ur = fr = (row - imgdata.sizes.iheight * 0.5) *
-       imgdata.params.aber[c] + iheight * 0.5; if (ur >
-       (unsigned)imgdata.sizes.iheight - 2) continue; fr -= ur;
+    std::vector<float> auto_red_map;
+    std::vector<float> auto_blue_map;
+    size_t ca_map_w = 0;
+    size_t ca_map_h = 0;
 
-                        for (col = 0; col < imgdata.sizes.iwidth; col++) {
-                            uc = fc = (col - imgdata.sizes.iwidth * 0.5) *
-       imgdata.params.aber[c] + imgdata.sizes.iwidth * 0.5; if (uc >
-       (unsigned)imgdata.sizes.iwidth - 2) continue; fc -= uc;
+    if (auto_ca_requested && raw_buffer.is_valid() && raw_buffer.width > 15 &&
+        raw_buffer.height > 15 && imgdata.idata.colors == 3) {
+      std::vector<float> guide(size);
+      std::vector<float> guide_grad(size, 0.0f);
 
-                            pix = img + ur * imgdata.sizes.iwidth + uc;
-                            image[row * imgdata.sizes.iwidth + col][c] =
-                                (pix[0] * (1 - fc) + pix[1] * fc) * (1 - fr) +
-                                (pix[imgdata.sizes.iwidth] * (1 - fc) +
-       pix[imgdata.sizes.iwidth + 1] * fc) * fr;
-                        }
-                    }
+      for (size_t row = 0; row < raw_buffer.height; ++row) {
+        for (size_t col = 0; col < raw_buffer.width; ++col) {
+          const uint32_t native = cfa_channel_at(row, col);
+          const uint32_t guide_channel = (native == 3) ? 1 : native;
+          const size_t idx = row * raw_buffer.width + col;
+          guide[idx] = static_cast<float>(raw_buffer.image[idx][guide_channel]);
+        }
+      }
 
-                    free(img);
-                }
+      double grad_acc = 0.0;
+      size_t grad_count = 0;
+      for (size_t row = 1; row + 1 < raw_buffer.height; ++row) {
+        for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
+          const size_t idx = row * raw_buffer.width + col;
+          const float gx = std::fabs(guide[idx + 1] - guide[idx - 1]);
+          const float gy =
+              std::fabs(guide[idx + raw_buffer.width] - guide[idx - raw_buffer.width]);
+          const float g = gx + gy;
+          guide_grad[idx] = g;
+          grad_acc += g;
+          grad_count++;
+        }
+      }
+
+      const float mean_grad = static_cast<float>(
+          grad_count ? (grad_acc / static_cast<double>(grad_count)) : 0.0);
+
+      std::vector<ushort> red_plane(size);
+      std::vector<ushort> blue_plane(size);
+      for (size_t i = 0; i < size; ++i) {
+        red_plane[i] = raw_buffer.image[i][0];
+        blue_plane[i] = raw_buffer.image[i][2];
+      }
+
+      const float auto_red =
+          estimate_ca_scale(raw_buffer, 0, red_plane, guide, guide_grad, mean_grad);
+      const float auto_blue =
+          estimate_ca_scale(raw_buffer, 2, blue_plane, guide, guide_grad, mean_grad);
+
+      ca_map_w = 0;
+      ca_map_h = 0;
+      auto_red_map = build_ca_scale_map(raw_buffer, 0, red_plane, guide,
+                                        guide_grad, mean_grad, auto_red, ca_map_w,
+                                        ca_map_h);
+      auto_blue_map = build_ca_scale_map(raw_buffer, 2, blue_plane, guide,
+                                         guide_grad, mean_grad, auto_blue, ca_map_w,
+                                         ca_map_h);
+
+      imgdata.params.aber[0] = auto_red;
+      imgdata.params.aber[2] = auto_blue;
+      std::cout << "📷 Auto CA estimated (global): R=" << auto_red
+                << " B=" << auto_blue << ", map=" << ca_map_w << "x" << ca_map_h
+                << std::endl;
+    }
+
+    if ((imgdata.params.aber[0] != 1.0f || imgdata.params.aber[2] != 1.0f) &&
+        imgdata.idata.colors == 3 && raw_buffer.is_valid() &&
+        raw_buffer.width > 1 && raw_buffer.height > 1) {
+      const float center_y = static_cast<float>(raw_buffer.height) * 0.5f;
+      const float center_x = static_cast<float>(raw_buffer.width) * 0.5f;
+
+      for (c = 0; c < 4; c += 2) {
+        const float base_scale = imgdata.params.aber[c];
+        if (std::fabs(base_scale - 1.0f) < 1e-6f || base_scale <= 0.0f) {
+          continue;
+        }
+
+        std::vector<ushort> channel_plane(size);
+        for (i = 0; i < size; i++) {
+          channel_plane[i] = raw_buffer.image[i][c];
+        }
+
+        const std::vector<float> *local_map = nullptr;
+        if (c == 0 && !auto_red_map.empty()) {
+          local_map = &auto_red_map;
+        } else if (c == 2 && !auto_blue_map.empty()) {
+          local_map = &auto_blue_map;
+        }
+
+        for (row = 0; row < raw_buffer.height; row++) {
+          for (col = 0; col < raw_buffer.width; col++) {
+            const float scale =
+                local_map ? sample_scale_map(*local_map, ca_map_w, ca_map_h, row,
+                                             col, raw_buffer.width,
+                                             raw_buffer.height, base_scale)
+                          : base_scale;
+            const float src_col_f =
+                (static_cast<float>(col) - center_x) * scale + center_x;
+            const float src_row_local =
+                (static_cast<float>(row) - center_y) * scale + center_y;
+            ur = static_cast<unsigned>(src_row_local);
+            if (ur >= raw_buffer.height - 1) {
+              continue;
             }
-    */
+            fr = src_row_local - static_cast<float>(ur);
+            uc = static_cast<unsigned>(src_col_f);
+            if (uc >= raw_buffer.width - 1) {
+              continue;
+            }
+            fc = src_col_f - static_cast<float>(uc);
+
+            pix = channel_plane.data() + ur * raw_buffer.width + uc;
+            const float corrected =
+                (pix[0] * (1.0f - fc) + pix[1] * fc) * (1.0f - fr) +
+                (pix[raw_buffer.width] * (1.0f - fc) +
+                 pix[raw_buffer.width + 1] * fc) *
+                    fr;
+
+            const float clamped =
+                std::min(65535.0f, std::max(0.0f, corrected));
+            raw_buffer.image[row * raw_buffer.width + col][c] =
+                static_cast<ushort>(clamped);
+          }
+        }
+      }
+    }
   }
 
   //===============================================================
