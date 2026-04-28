@@ -533,6 +533,14 @@ public:
            (v10 * (1.0f - fx) + v11 * fx) * fy;
   }
 
+  static inline double huber_loss(double x, double delta) {
+    const double ax = std::fabs(x);
+    if (ax <= delta) {
+      return 0.5 * ax * ax;
+    }
+    return delta * (ax - 0.5 * delta);
+  }
+
   float estimate_ca_scale(const ImageBuffer &raw_buffer, uint32_t target_channel,
                           const std::vector<ushort> &channel_plane,
                           const std::vector<float> &guide,
@@ -551,8 +559,12 @@ public:
     std::vector<SamplePoint> samples;
     samples.reserve(32768);
 
-    const float grad_threshold = mean_grad * 0.8f;
+    const float grad_threshold = mean_grad * 0.9f;
     const int stride = (raw_buffer.width * raw_buffer.height > 24000000) ? 4 : 2;
+    float max_channel = 0.0f;
+    for (size_t idx = 0; idx < raw_buffer.width * raw_buffer.height; ++idx) {
+      max_channel = std::max(max_channel, static_cast<float>(channel_plane[idx]));
+    }
 
     for (size_t row = 4; row + 4 < raw_buffer.height; row += stride) {
       for (size_t col = 4; col + 4 < raw_buffer.width; col += stride) {
@@ -562,6 +574,10 @@ public:
         const size_t idx = row * raw_buffer.width + col;
         const float grad = guide_grad[idx];
         if (grad < grad_threshold) {
+          continue;
+        }
+        const float v = static_cast<float>(channel_plane[idx]);
+        if (v < 128.0f || v > max_channel * 0.98f) {
           continue;
         }
 
@@ -609,7 +625,36 @@ public:
             static_cast<size_t>(s.row) * raw_buffer.width + s.col;
         const float ref = guide[idx];
         const float norm = std::max(64.0f, ref);
-        score += s.weight * std::fabs(corrected - ref) / norm;
+        const double inten_err = (corrected - ref) / norm;
+
+        const float corr_xp = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y,
+                                                  src_x + 1.0f);
+        const float corr_xm = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y,
+                                                  src_x - 1.0f);
+        const float corr_yp = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y + 1.0f,
+                                                  src_x);
+        const float corr_ym = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y - 1.0f,
+                                                  src_x);
+
+        double grad_err = 0.0;
+        if (corr_xp >= 0.0f && corr_xm >= 0.0f && corr_yp >= 0.0f &&
+            corr_ym >= 0.0f) {
+          const float cgx = corr_xp - corr_xm;
+          const float cgy = corr_yp - corr_ym;
+          const float ggx = guide[idx + 1] - guide[idx - 1];
+          const float ggy = guide[idx + raw_buffer.width] -
+                            guide[idx - raw_buffer.width];
+          const float gnorm = std::max(32.0f, std::fabs(ggx) + std::fabs(ggy));
+          grad_err = (std::fabs(cgx - ggx) + std::fabs(cgy - ggy)) / gnorm;
+        }
+
+        const double robust =
+            0.55 * huber_loss(inten_err, 0.20) + 0.45 * huber_loss(grad_err, 0.15);
+        score += s.weight * robust;
         weight_sum += s.weight;
         valid++;
       }
@@ -665,8 +710,12 @@ public:
 
     std::vector<SamplePoint> samples;
     samples.reserve(4096);
-    const float grad_threshold = mean_grad * 0.9f;
+    const float grad_threshold = mean_grad * 1.0f;
     const int stride = 2;
+    float max_channel = 0.0f;
+    for (size_t idx = 0; idx < raw_buffer.width * raw_buffer.height; ++idx) {
+      max_channel = std::max(max_channel, static_cast<float>(channel_plane[idx]));
+    }
 
     const size_t rb = std::max<size_t>(4, row_begin);
     const size_t re = std::min(raw_buffer.height - 4, row_end);
@@ -681,6 +730,10 @@ public:
         const size_t idx = row * raw_buffer.width + col;
         const float grad = guide_grad[idx];
         if (grad < grad_threshold) {
+          continue;
+        }
+        const float v = static_cast<float>(channel_plane[idx]);
+        if (v < 128.0f || v > max_channel * 0.98f) {
           continue;
         }
         const float weight =
@@ -716,7 +769,36 @@ public:
             static_cast<size_t>(s.row) * raw_buffer.width + s.col;
         const float ref = guide[idx];
         const float norm = std::max(64.0f, ref);
-        score += s.weight * std::fabs(corrected - ref) / norm;
+        const double inten_err = (corrected - ref) / norm;
+
+        const float corr_xp = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y,
+                                                  src_x + 1.0f);
+        const float corr_xm = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y,
+                                                  src_x - 1.0f);
+        const float corr_yp = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y + 1.0f,
+                                                  src_x);
+        const float corr_ym = bilinear_sample_u16(channel_plane, raw_buffer.width,
+                                                  raw_buffer.height, src_y - 1.0f,
+                                                  src_x);
+
+        double grad_err = 0.0;
+        if (corr_xp >= 0.0f && corr_xm >= 0.0f && corr_yp >= 0.0f &&
+            corr_ym >= 0.0f) {
+          const float cgx = corr_xp - corr_xm;
+          const float cgy = corr_yp - corr_ym;
+          const float ggx = guide[idx + 1] - guide[idx - 1];
+          const float ggy = guide[idx + raw_buffer.width] -
+                            guide[idx - raw_buffer.width];
+          const float gnorm = std::max(32.0f, std::fabs(ggx) + std::fabs(ggy));
+          grad_err = (std::fabs(cgx - ggx) + std::fabs(cgy - ggy)) / gnorm;
+        }
+
+        const double robust =
+            0.55 * huber_loss(inten_err, 0.20) + 0.45 * huber_loss(grad_err, 0.15);
+        score += s.weight * robust;
         weight_sum += s.weight;
         valid++;
       }
@@ -760,7 +842,7 @@ public:
       const std::vector<ushort> &channel_plane, const std::vector<float> &guide,
       const std::vector<float> &guide_grad, float mean_grad, float base_scale,
       size_t &map_w, size_t &map_h) {
-    const size_t tile = 192;
+    const size_t tile = 128;
     map_w = std::max<size_t>(2, (raw_buffer.width + tile - 1) / tile + 1);
     map_h = std::max<size_t>(2, (raw_buffer.height + tile - 1) / tile + 1);
 
@@ -792,25 +874,27 @@ public:
       }
     }
 
-    // Edge-aware smoothing (simple 3x3 kernel) to avoid tile boundaries.
+    // Quality-first smoothing (two passes) to reduce tile boundary artifacts.
     if (map_w >= 3 && map_h >= 3) {
-      std::vector<float> smoothed = map;
-      for (size_t gy = 1; gy + 1 < map_h; ++gy) {
-        for (size_t gx = 1; gx + 1 < map_w; ++gx) {
-          float acc = 0.0f;
-          acc += map[(gy - 1) * map_w + (gx - 1)] * 1.0f;
-          acc += map[(gy - 1) * map_w + gx] * 2.0f;
-          acc += map[(gy - 1) * map_w + (gx + 1)] * 1.0f;
-          acc += map[gy * map_w + (gx - 1)] * 2.0f;
-          acc += map[gy * map_w + gx] * 4.0f;
-          acc += map[gy * map_w + (gx + 1)] * 2.0f;
-          acc += map[(gy + 1) * map_w + (gx - 1)] * 1.0f;
-          acc += map[(gy + 1) * map_w + gx] * 2.0f;
-          acc += map[(gy + 1) * map_w + (gx + 1)] * 1.0f;
-          smoothed[gy * map_w + gx] = acc * (1.0f / 16.0f);
+      for (int pass = 0; pass < 2; ++pass) {
+        std::vector<float> smoothed = map;
+        for (size_t gy = 1; gy + 1 < map_h; ++gy) {
+          for (size_t gx = 1; gx + 1 < map_w; ++gx) {
+            float acc = 0.0f;
+            acc += map[(gy - 1) * map_w + (gx - 1)] * 1.0f;
+            acc += map[(gy - 1) * map_w + gx] * 2.0f;
+            acc += map[(gy - 1) * map_w + (gx + 1)] * 1.0f;
+            acc += map[gy * map_w + (gx - 1)] * 2.0f;
+            acc += map[gy * map_w + gx] * 4.0f;
+            acc += map[gy * map_w + (gx + 1)] * 2.0f;
+            acc += map[(gy + 1) * map_w + (gx - 1)] * 1.0f;
+            acc += map[(gy + 1) * map_w + gx] * 2.0f;
+            acc += map[(gy + 1) * map_w + (gx + 1)] * 1.0f;
+            smoothed[gy * map_w + gx] = acc * (1.0f / 16.0f);
+          }
         }
+        map.swap(smoothed);
       }
-      map.swap(smoothed);
     }
 
     return map;
@@ -1130,12 +1214,44 @@ public:
       std::vector<float> guide(size);
       std::vector<float> guide_grad(size, 0.0f);
 
+      // Build a robust green reference guide:
+      // use native green samples directly and interpolate at R/B positions.
       for (size_t row = 0; row < raw_buffer.height; ++row) {
         for (size_t col = 0; col < raw_buffer.width; ++col) {
           const uint32_t native = cfa_channel_at(row, col);
-          const uint32_t guide_channel = (native == 3) ? 1 : native;
           const size_t idx = row * raw_buffer.width + col;
-          guide[idx] = static_cast<float>(raw_buffer.image[idx][guide_channel]);
+          if (native == 1 || native == 3) {
+            guide[idx] = static_cast<float>(raw_buffer.image[idx][native]);
+            continue;
+          }
+
+          double acc = 0.0;
+          double wsum = 0.0;
+          for (int dy = -2; dy <= 2; ++dy) {
+            const int yy = static_cast<int>(row) + dy;
+            if (yy < 0 || yy >= static_cast<int>(raw_buffer.height)) {
+              continue;
+            }
+            for (int dx = -2; dx <= 2; ++dx) {
+              const int xx = static_cast<int>(col) + dx;
+              if (xx < 0 || xx >= static_cast<int>(raw_buffer.width)) {
+                continue;
+              }
+              const uint32_t n = cfa_channel_at(static_cast<size_t>(yy),
+                                                static_cast<size_t>(xx));
+              if (n != 1 && n != 3) {
+                continue;
+              }
+              const int dist = std::abs(dx) + std::abs(dy);
+              const double w = 1.0 / static_cast<double>(1 + dist);
+              const size_t nidx =
+                  static_cast<size_t>(yy) * raw_buffer.width + static_cast<size_t>(xx);
+              acc += static_cast<double>(raw_buffer.image[nidx][n]) * w;
+              wsum += w;
+            }
+          }
+          guide[idx] = static_cast<float>(
+              wsum > 0.0 ? (acc / wsum) : raw_buffer.image[idx][0]);
         }
       }
 
@@ -1144,10 +1260,20 @@ public:
       for (size_t row = 1; row + 1 < raw_buffer.height; ++row) {
         for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
           const size_t idx = row * raw_buffer.width + col;
-          const float gx = std::fabs(guide[idx + 1] - guide[idx - 1]);
-          const float gy =
-              std::fabs(guide[idx + raw_buffer.width] - guide[idx - raw_buffer.width]);
-          const float g = gx + gy;
+          // Sobel-like gradient magnitude for stronger edge confidence.
+          const float gx = (guide[idx - raw_buffer.width + 1] +
+                            2.0f * guide[idx + 1] +
+                            guide[idx + raw_buffer.width + 1]) -
+                           (guide[idx - raw_buffer.width - 1] +
+                            2.0f * guide[idx - 1] +
+                            guide[idx + raw_buffer.width - 1]);
+          const float gy = (guide[idx + raw_buffer.width - 1] +
+                            2.0f * guide[idx + raw_buffer.width] +
+                            guide[idx + raw_buffer.width + 1]) -
+                           (guide[idx - raw_buffer.width - 1] +
+                            2.0f * guide[idx - raw_buffer.width] +
+                            guide[idx - raw_buffer.width + 1]);
+          const float g = std::sqrt(gx * gx + gy * gy);
           guide_grad[idx] = g;
           grad_acc += g;
           grad_count++;
