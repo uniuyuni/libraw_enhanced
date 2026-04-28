@@ -711,7 +711,6 @@ public:
     std::vector<SamplePoint> samples;
     samples.reserve(4096);
     const float grad_threshold = mean_grad * 1.0f;
-    const int stride = 2;
     float max_channel = 0.0f;
     for (size_t idx = 0; idx < raw_buffer.width * raw_buffer.height; ++idx) {
       max_channel = std::max(max_channel, static_cast<float>(channel_plane[idx]));
@@ -721,6 +720,9 @@ public:
     const size_t re = std::min(raw_buffer.height - 4, row_end);
     const size_t cb = std::max<size_t>(4, col_begin);
     const size_t ce = std::min(raw_buffer.width - 4, col_end);
+    const size_t window_h = re - rb;
+    const size_t window_w = ce - cb;
+    const int stride = (window_h > 320 || window_w > 320) ? 3 : 2;
 
     for (size_t row = rb; row < re; row += stride) {
       for (size_t col = cb; col < ce; col += stride) {
@@ -745,6 +747,15 @@ public:
 
     if (samples.size() < 128) {
       return center_scale;
+    }
+    if (samples.size() > 1200) {
+      const size_t step = samples.size() / 1200 + 1;
+      std::vector<SamplePoint> reduced;
+      reduced.reserve(1200);
+      for (size_t i = 0; i < samples.size(); i += step) {
+        reduced.push_back(samples[i]);
+      }
+      samples.swap(reduced);
     }
 
     const float center_y = static_cast<float>(raw_buffer.height) * 0.5f;
@@ -842,24 +853,58 @@ public:
       const std::vector<ushort> &channel_plane, const std::vector<float> &guide,
       const std::vector<float> &guide_grad, float mean_grad, float base_scale,
       size_t &map_w, size_t &map_h) {
-    const size_t tile = 128;
+    const double mpix = static_cast<double>(raw_buffer.width * raw_buffer.height) /
+                        1000000.0;
+    size_t tile = 160;
+    if (mpix > 16.0) {
+      tile = 192;
+    }
+    if (mpix > 28.0) {
+      tile = 256;
+    }
+
+    // Keep control-grid size bounded to avoid explosive runtime on high-res raw.
+    constexpr size_t kMaxMapNodes = 420;
+    while (true) {
+      const size_t test_w =
+          std::max<size_t>(2, (raw_buffer.width + tile - 1) / tile + 1);
+      const size_t test_h =
+          std::max<size_t>(2, (raw_buffer.height + tile - 1) / tile + 1);
+      if (test_w * test_h <= kMaxMapNodes || tile >= 512) {
+        break;
+      }
+      tile += 32;
+    }
+
     map_w = std::max<size_t>(2, (raw_buffer.width + tile - 1) / tile + 1);
     map_h = std::max<size_t>(2, (raw_buffer.height + tile - 1) / tile + 1);
 
     std::vector<float> map(map_w * map_h, base_scale);
 
+    std::vector<float> grid_y(map_h, 0.0f);
+    std::vector<float> grid_x(map_w, 0.0f);
     for (size_t gy = 0; gy < map_h; ++gy) {
-      const float y =
+      grid_y[gy] =
           (map_h == 1)
               ? 0.0f
               : (static_cast<float>(gy) / static_cast<float>(map_h - 1)) *
                     static_cast<float>(raw_buffer.height - 1);
-      for (size_t gx = 0; gx < map_w; ++gx) {
-        const float x =
-            (map_w == 1)
-                ? 0.0f
-                : (static_cast<float>(gx) / static_cast<float>(map_w - 1)) *
-                      static_cast<float>(raw_buffer.width - 1);
+    }
+    for (size_t gx = 0; gx < map_w; ++gx) {
+      grid_x[gx] =
+          (map_w == 1)
+              ? 0.0f
+              : (static_cast<float>(gx) / static_cast<float>(map_w - 1)) *
+                    static_cast<float>(raw_buffer.width - 1);
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2)
+#endif
+    for (int gy = 0; gy < static_cast<int>(map_h); ++gy) {
+      for (int gx = 0; gx < static_cast<int>(map_w); ++gx) {
+        const float y = grid_y[static_cast<size_t>(gy)];
+        const float x = grid_x[static_cast<size_t>(gx)];
 
         const size_t yc = static_cast<size_t>(y);
         const size_t xc = static_cast<size_t>(x);
@@ -868,7 +913,8 @@ public:
         const size_t row_end = std::min(raw_buffer.height, yc + tile + 1);
         const size_t col_end = std::min(raw_buffer.width, xc + tile + 1);
 
-        map[gy * map_w + gx] = estimate_ca_scale_window(
+        map[static_cast<size_t>(gy) * map_w + static_cast<size_t>(gx)] =
+            estimate_ca_scale_window(
             raw_buffer, target_channel, channel_plane, guide, guide_grad,
             mean_grad, row_begin, row_end, col_begin, col_end, base_scale);
       }
@@ -1335,38 +1381,46 @@ public:
           local_map = &auto_blue_map;
         }
 
-        for (row = 0; row < raw_buffer.height; row++) {
-          for (col = 0; col < raw_buffer.width; col++) {
+        const bool use_local_map = (local_map != nullptr);
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int row_i = 0; row_i < static_cast<int>(raw_buffer.height); row_i++) {
+          const size_t row_local = static_cast<size_t>(row_i);
+          for (size_t col_local = 0; col_local < raw_buffer.width; col_local++) {
             const float scale =
-                local_map ? sample_scale_map(*local_map, ca_map_w, ca_map_h, row,
-                                             col, raw_buffer.width,
-                                             raw_buffer.height, base_scale)
-                          : base_scale;
+                use_local_map
+                    ? sample_scale_map(*local_map, ca_map_w, ca_map_h, row_local,
+                                       col_local, raw_buffer.width,
+                                       raw_buffer.height, base_scale)
+                    : base_scale;
             const float src_col_f =
-                (static_cast<float>(col) - center_x) * scale + center_x;
+                (static_cast<float>(col_local) - center_x) * scale + center_x;
             const float src_row_local =
-                (static_cast<float>(row) - center_y) * scale + center_y;
-            ur = static_cast<unsigned>(src_row_local);
-            if (ur >= raw_buffer.height - 1) {
+                (static_cast<float>(row_local) - center_y) * scale + center_y;
+            const unsigned ur_local = static_cast<unsigned>(src_row_local);
+            if (ur_local >= raw_buffer.height - 1) {
               continue;
             }
-            fr = src_row_local - static_cast<float>(ur);
-            uc = static_cast<unsigned>(src_col_f);
-            if (uc >= raw_buffer.width - 1) {
+            const float fr_local = src_row_local - static_cast<float>(ur_local);
+            const unsigned uc_local = static_cast<unsigned>(src_col_f);
+            if (uc_local >= raw_buffer.width - 1) {
               continue;
             }
-            fc = src_col_f - static_cast<float>(uc);
+            const float fc_local = src_col_f - static_cast<float>(uc_local);
 
-            pix = channel_plane.data() + ur * raw_buffer.width + uc;
+            const ushort *pix_local =
+                channel_plane.data() + ur_local * raw_buffer.width + uc_local;
             const float corrected =
-                (pix[0] * (1.0f - fc) + pix[1] * fc) * (1.0f - fr) +
-                (pix[raw_buffer.width] * (1.0f - fc) +
-                 pix[raw_buffer.width + 1] * fc) *
-                    fr;
+                (pix_local[0] * (1.0f - fc_local) + pix_local[1] * fc_local) *
+                    (1.0f - fr_local) +
+                (pix_local[raw_buffer.width] * (1.0f - fc_local) +
+                 pix_local[raw_buffer.width + 1] * fc_local) *
+                    fr_local;
 
             const float clamped =
                 std::min(65535.0f, std::max(0.0f, corrected));
-            raw_buffer.image[row * raw_buffer.width + col][c] =
+            raw_buffer.image[row_local * raw_buffer.width + col_local][c] =
                 static_cast<ushort>(clamped);
           }
         }
