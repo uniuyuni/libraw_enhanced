@@ -541,6 +541,177 @@ public:
     return delta * (ax - 0.5 * delta);
   }
 
+  void build_green_guide_and_gradient(const ImageBuffer &raw_buffer,
+                                      std::vector<float> &guide,
+                                      std::vector<float> &guide_grad,
+                                      float &mean_grad, float &max_guide) {
+    const size_t size = raw_buffer.width * raw_buffer.height;
+    guide.assign(size, 0.0f);
+    guide_grad.assign(size, 0.0f);
+
+    // Build green-reference guide (G samples + local interpolation on R/B).
+    for (size_t row = 0; row < raw_buffer.height; ++row) {
+      for (size_t col = 0; col < raw_buffer.width; ++col) {
+        const uint32_t native = cfa_channel_at(row, col);
+        const size_t idx = row * raw_buffer.width + col;
+        if (native == 1 || native == 3) {
+          guide[idx] = static_cast<float>(raw_buffer.image[idx][native]);
+          continue;
+        }
+
+        double acc = 0.0;
+        double wsum = 0.0;
+        for (int dy = -2; dy <= 2; ++dy) {
+          const int yy = static_cast<int>(row) + dy;
+          if (yy < 0 || yy >= static_cast<int>(raw_buffer.height)) {
+            continue;
+          }
+          for (int dx = -2; dx <= 2; ++dx) {
+            const int xx = static_cast<int>(col) + dx;
+            if (xx < 0 || xx >= static_cast<int>(raw_buffer.width)) {
+              continue;
+            }
+            const uint32_t n = cfa_channel_at(static_cast<size_t>(yy),
+                                              static_cast<size_t>(xx));
+            if (n != 1 && n != 3) {
+              continue;
+            }
+            const int dist = std::abs(dx) + std::abs(dy);
+            const double w = 1.0 / static_cast<double>(1 + dist);
+            const size_t nidx =
+                static_cast<size_t>(yy) * raw_buffer.width + static_cast<size_t>(xx);
+            acc += static_cast<double>(raw_buffer.image[nidx][n]) * w;
+            wsum += w;
+          }
+        }
+        guide[idx] = static_cast<float>(
+            wsum > 0.0 ? (acc / wsum) : raw_buffer.image[idx][0]);
+      }
+    }
+
+    double grad_acc = 0.0;
+    size_t grad_count = 0;
+    max_guide = 0.0f;
+    for (size_t i = 0; i < size; ++i) {
+      max_guide = std::max(max_guide, guide[i]);
+    }
+
+    for (size_t row = 1; row + 1 < raw_buffer.height; ++row) {
+      for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
+        const size_t idx = row * raw_buffer.width + col;
+        const float gx = (guide[idx - raw_buffer.width + 1] +
+                          2.0f * guide[idx + 1] +
+                          guide[idx + raw_buffer.width + 1]) -
+                         (guide[idx - raw_buffer.width - 1] +
+                          2.0f * guide[idx - 1] +
+                          guide[idx + raw_buffer.width - 1]);
+        const float gy = (guide[idx + raw_buffer.width - 1] +
+                          2.0f * guide[idx + raw_buffer.width] +
+                          guide[idx + raw_buffer.width + 1]) -
+                         (guide[idx - raw_buffer.width - 1] +
+                          2.0f * guide[idx - raw_buffer.width] +
+                          guide[idx - raw_buffer.width + 1]);
+        const float g = std::sqrt(gx * gx + gy * gy);
+        guide_grad[idx] = g;
+        grad_acc += g;
+        grad_count++;
+      }
+    }
+
+    mean_grad = static_cast<float>(
+        grad_count ? (grad_acc / static_cast<double>(grad_count)) : 0.0);
+  }
+
+  void refine_highlight_ca_edges(ImageBuffer &raw_buffer, uint32_t channel,
+                                 const std::vector<float> &guide,
+                                 const std::vector<float> &guide_grad,
+                                 float max_guide, float mean_grad) {
+    if (raw_buffer.width < 5 || raw_buffer.height < 5) {
+      return;
+    }
+
+    const size_t size = raw_buffer.width * raw_buffer.height;
+    std::vector<ushort> src(size);
+    for (size_t i = 0; i < size; ++i) {
+      src[i] = raw_buffer.image[i][channel];
+    }
+
+    const float sat_thr = max_guide * 0.90f;
+    const float edge_thr = std::max(2.0f, mean_grad * 1.1f);
+
+    static const float kShift[][2] = {
+        {0.0f, 0.0f},   {-0.75f, 0.0f}, {0.75f, 0.0f},  {0.0f, -0.75f},
+        {0.0f, 0.75f},  {-0.5f, -0.5f}, {0.5f, -0.5f},  {-0.5f, 0.5f},
+        {0.5f, 0.5f},   {-1.0f, 0.0f},  {1.0f, 0.0f},   {0.0f, -1.0f},
+        {0.0f, 1.0f},
+    };
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int row_i = 1; row_i < static_cast<int>(raw_buffer.height) - 1; ++row_i) {
+      const size_t row = static_cast<size_t>(row_i);
+      for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
+        const size_t idx = row * raw_buffer.width + col;
+        const float g = guide[idx];
+        if (g < sat_thr || guide_grad[idx] < edge_thr) {
+          continue;
+        }
+
+        double best_cost = std::numeric_limits<double>::infinity();
+        float best_value = static_cast<float>(src[idx]);
+
+        for (const auto &s : kShift) {
+          const float y = static_cast<float>(row) + s[0];
+          const float x = static_cast<float>(col) + s[1];
+          const float v = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                              y, x);
+          if (v < 0.0f) {
+            continue;
+          }
+
+          const float vp = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y, x + 1.0f);
+          const float vm = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y, x - 1.0f);
+          const float hp = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y + 1.0f, x);
+          const float hm = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y - 1.0f, x);
+
+          const double inten = std::fabs(v - g) / std::max(64.0f, g);
+          double grad = 0.0;
+          if (vp >= 0.0f && vm >= 0.0f && hp >= 0.0f && hm >= 0.0f) {
+            const float cgx = vp - vm;
+            const float cgy = hp - hm;
+            const float ggx = guide[idx + 1] - guide[idx - 1];
+            const float ggy =
+                guide[idx + raw_buffer.width] - guide[idx - raw_buffer.width];
+            grad = (std::fabs(cgx - ggx) + std::fabs(cgy - ggy)) /
+                   std::max(32.0f, std::fabs(ggx) + std::fabs(ggy));
+          }
+
+          const double cost =
+              0.6 * huber_loss(inten, 0.20) + 0.4 * huber_loss(grad, 0.20);
+          if (cost < best_cost) {
+            best_cost = cost;
+            best_value = v;
+          }
+        }
+
+        const float hi_w = std::clamp((g - sat_thr) / std::max(1.0f, max_guide - sat_thr),
+                                      0.0f, 1.0f);
+        const float edge_w =
+            std::clamp(guide_grad[idx] / std::max(1.0f, edge_thr * 2.0f), 0.0f, 1.0f);
+        const float alpha = 0.15f + 0.65f * hi_w * edge_w;
+        const float merged =
+            (1.0f - alpha) * static_cast<float>(src[idx]) + alpha * best_value;
+        raw_buffer.image[idx][channel] =
+            static_cast<ushort>(std::clamp(merged, 0.0f, 65535.0f));
+      }
+    }
+  }
+
   float estimate_ca_scale(const ImageBuffer &raw_buffer, uint32_t target_channel,
                           const std::vector<ushort> &channel_plane,
                           const std::vector<float> &guide,
@@ -1257,77 +1428,12 @@ public:
 
     if (auto_ca_requested && raw_buffer.is_valid() && raw_buffer.width > 15 &&
         raw_buffer.height > 15 && imgdata.idata.colors == 3) {
-      std::vector<float> guide(size);
-      std::vector<float> guide_grad(size, 0.0f);
-
-      // Build a robust green reference guide:
-      // use native green samples directly and interpolate at R/B positions.
-      for (size_t row = 0; row < raw_buffer.height; ++row) {
-        for (size_t col = 0; col < raw_buffer.width; ++col) {
-          const uint32_t native = cfa_channel_at(row, col);
-          const size_t idx = row * raw_buffer.width + col;
-          if (native == 1 || native == 3) {
-            guide[idx] = static_cast<float>(raw_buffer.image[idx][native]);
-            continue;
-          }
-
-          double acc = 0.0;
-          double wsum = 0.0;
-          for (int dy = -2; dy <= 2; ++dy) {
-            const int yy = static_cast<int>(row) + dy;
-            if (yy < 0 || yy >= static_cast<int>(raw_buffer.height)) {
-              continue;
-            }
-            for (int dx = -2; dx <= 2; ++dx) {
-              const int xx = static_cast<int>(col) + dx;
-              if (xx < 0 || xx >= static_cast<int>(raw_buffer.width)) {
-                continue;
-              }
-              const uint32_t n = cfa_channel_at(static_cast<size_t>(yy),
-                                                static_cast<size_t>(xx));
-              if (n != 1 && n != 3) {
-                continue;
-              }
-              const int dist = std::abs(dx) + std::abs(dy);
-              const double w = 1.0 / static_cast<double>(1 + dist);
-              const size_t nidx =
-                  static_cast<size_t>(yy) * raw_buffer.width + static_cast<size_t>(xx);
-              acc += static_cast<double>(raw_buffer.image[nidx][n]) * w;
-              wsum += w;
-            }
-          }
-          guide[idx] = static_cast<float>(
-              wsum > 0.0 ? (acc / wsum) : raw_buffer.image[idx][0]);
-        }
-      }
-
-      double grad_acc = 0.0;
-      size_t grad_count = 0;
-      for (size_t row = 1; row + 1 < raw_buffer.height; ++row) {
-        for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
-          const size_t idx = row * raw_buffer.width + col;
-          // Sobel-like gradient magnitude for stronger edge confidence.
-          const float gx = (guide[idx - raw_buffer.width + 1] +
-                            2.0f * guide[idx + 1] +
-                            guide[idx + raw_buffer.width + 1]) -
-                           (guide[idx - raw_buffer.width - 1] +
-                            2.0f * guide[idx - 1] +
-                            guide[idx + raw_buffer.width - 1]);
-          const float gy = (guide[idx + raw_buffer.width - 1] +
-                            2.0f * guide[idx + raw_buffer.width] +
-                            guide[idx + raw_buffer.width + 1]) -
-                           (guide[idx - raw_buffer.width - 1] +
-                            2.0f * guide[idx - raw_buffer.width] +
-                            guide[idx - raw_buffer.width + 1]);
-          const float g = std::sqrt(gx * gx + gy * gy);
-          guide_grad[idx] = g;
-          grad_acc += g;
-          grad_count++;
-        }
-      }
-
-      const float mean_grad = static_cast<float>(
-          grad_count ? (grad_acc / static_cast<double>(grad_count)) : 0.0);
+      std::vector<float> guide;
+      std::vector<float> guide_grad;
+      float mean_grad = 0.0f;
+      float max_guide = 0.0f;
+      build_green_guide_and_gradient(raw_buffer, guide, guide_grad, mean_grad,
+                                     max_guide);
 
       std::vector<ushort> red_plane(size);
       std::vector<ushort> blue_plane(size);
@@ -1355,6 +1461,13 @@ public:
       std::cout << "📷 Auto CA estimated (global): R=" << auto_red
                 << " B=" << auto_blue << ", map=" << ca_map_w << "x" << ca_map_h
                 << std::endl;
+
+      // Highlight-boundary residual refinement:
+      // complements block-based lateral CA correction for severe clipped edges.
+      refine_highlight_ca_edges(raw_buffer, 0, guide, guide_grad, max_guide,
+                                mean_grad);
+      refine_highlight_ca_edges(raw_buffer, 2, guide, guide_grad, max_guide,
+                                mean_grad);
     }
 
     if ((imgdata.params.aber[0] != 1.0f || imgdata.params.aber[2] != 1.0f) &&

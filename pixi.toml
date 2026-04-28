@@ -1,0 +1,30 @@
+[workspace]
+name = "libraw-enhanced"
+version = "0.1.0"
+description = "Development environment for libraw_enhanced"
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+python = "3.11.*"
+pip = "*"
+setuptools = ">=69"
+wheel = "*"
+numpy = ">=1.26"
+pybind11 = ">=2.12"
+pytest = ">=8"
+pillow = ">=10"
+llvm-openmp = "*"
+pkg-config = "*"
+cmake = "*"
+make = "*"
+
+[activation.env]
+# setup.py の既定値 (/Users/.../PythonProjects/third_party/...) を上書きして、
+# このリポジトリ内に libraw-install を作る。
+LIBRAW_LOCAL_PREFIX = "./third_party/libraw-install"
+
+[tasks]
+build-libraw = "mkdir -p \"./third_party/libraw-install\" && cd \"./external/LibRaw-master\" && ./configure --prefix=\"$(pwd)/../../third_party/libraw-install\" && make -j$(sysctl -n hw.ncpu) && make install"
+install-libraw-enhanced = "python -m pip install -e \".[dev]\""
+test = "pytest tests -v"
