@@ -1808,8 +1808,13 @@ public:
     }
 
     // Get camera-specific color transformation matrix
+    // LibRaw の identify() は adobe_coeff に normalized_model を渡す。maker_index も同一のルールで使う。
+    const char *ccm_model =
+        (imgdata.idata.normalized_model[0] != '\0')
+            ? imgdata.idata.normalized_model
+            : imgdata.idata.model;
     ColorTransformMatrix camera_matrix = compute_camera_transform(
-        imgdata.idata.make, imgdata.idata.model, ColorSpace::XYZ);
+        imgdata.idata.maker_index, imgdata.idata.make, ccm_model, ColorSpace::XYZ);
     if (!camera_matrix.valid) {
       std::cout << "⚠️ Camera not in database, using fallback matrix"
                 << std::endl;
@@ -1882,7 +1887,8 @@ public:
 
     // Get camera-specific color transformation matrix
     camera_matrix = compute_camera_transform(
-        imgdata.idata.make, imgdata.idata.model, params.output_color_space);
+        imgdata.idata.maker_index, imgdata.idata.make, ccm_model,
+        params.output_color_space);
     if (!camera_matrix.valid) {
       std::cout << "⚠️ Camera not in database, using fallback matrix"
                 << std::endl;
