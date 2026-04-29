@@ -114,6 +114,10 @@ PYBIND11_MODULE(_core, m) {
       // Metal-specific settings
       .def_readwrite("use_gpu_acceleration",
                      &ProcessingParams::use_gpu_acceleration)
+      .def_readwrite("highlight_fringe_suppression",
+                     &ProcessingParams::highlight_fringe_suppression)
+      .def_readwrite("highlight_fringe_strength",
+                     &ProcessingParams::highlight_fringe_strength)
       .def_property(
           "color_matrix",
           [](ProcessingParams &self) -> py::array_t<float> {
@@ -388,7 +392,9 @@ PYBIND11_MODULE(_core, m) {
         py::arg("bad_pixels_path") = std::string(""),
 
         // LibRaw Enhanced extensions
-        py::arg("use_gpu_acceleration") = false, py::arg("preprocess") = false);
+        py::arg("use_gpu_acceleration") = false, py::arg("preprocess") = false,
+        py::arg("highlight_fringe_suppression") = true,
+        py::arg("highlight_fringe_strength") = 0.65f);
 #else
 
   // Metal非対応環境用のスタブ関数

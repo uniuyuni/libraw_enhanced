@@ -168,7 +168,9 @@ class RawImage:
                    
                    # LibRaw Enhanced extensions
                    use_gpu_acceleration: Optional[bool] = False,
-                   preprocess: bool = False) -> np.ndarray:
+                   preprocess: bool = False,
+                   highlight_fringe_suppression: bool = True,
+                   highlight_fringe_strength: float = 0.65) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 
@@ -232,6 +234,8 @@ class RawImage:
             metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
             use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
             preprocess: If true, stops processing before demosaicing and returns the raw/modified bayer data.
+            highlight_fringe_suppression: Suppress highlight-edge magenta fringing before demosaic.
+            highlight_fringe_strength: Strength of pre-demosaic fringe suppression (0.0-1.0).
             
         Returns:
 
@@ -307,6 +311,8 @@ class RawImage:
             # LibRaw Enhanced extensions
             'use_gpu_acceleration': gpu_acceleration,
             'preprocess': preprocess,
+            'highlight_fringe_suppression': highlight_fringe_suppression,
+            'highlight_fringe_strength': float(np.clip(highlight_fringe_strength, 0.0, 1.0)),
         }
                 
         # Convert parameter dict to the format expected by C++

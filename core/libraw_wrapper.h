@@ -183,7 +183,9 @@ ProcessingParams create_params_from_rawpy_args(
     const std::string &bad_pixels_path = "",
 
     // LibRaw Enhanced extensions
-    bool use_gpu_acceleration = false, bool preprocess = false);
+    bool use_gpu_acceleration = false, bool preprocess = false,
+    bool highlight_fringe_suppression = true,
+    float highlight_fringe_strength = 0.65f);
 
 // Platform detection functions
 bool is_apple_silicon();

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <vector>
@@ -505,6 +506,178 @@ public:
     }
     return fcol_bayer_native(static_cast<int>(row), static_cast<int>(col),
                              idata.filters);
+  }
+
+  //===============================================================
+  // Highlight-boundary fringe suppression (pre-demosaic CFA domain)
+  //===============================================================
+  void suppress_highlight_boundary_fringe(ImageBufferFloat &cfa_buffer,
+                                          float white_level, float strength) {
+    if (!cfa_buffer.is_valid() || cfa_buffer.width < 8 || cfa_buffer.height < 8) {
+      return;
+    }
+
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    if (strength <= 0.0f) {
+      return;
+    }
+
+    const size_t width = cfa_buffer.width;
+    const size_t height = cfa_buffer.height;
+    const size_t size = width * height;
+    float(*image)[3] = cfa_buffer.image;
+
+    std::vector<float> src_r(size, 0.0f);
+    std::vector<float> src_g(size, 0.0f);
+    std::vector<float> src_b(size, 0.0f);
+    std::vector<float> luma(size, 0.0f);
+    float global_max = 0.0f;
+
+    for (size_t i = 0; i < size; ++i) {
+      const float r = image[i][0];
+      const float g = image[i][1];
+      const float b = image[i][2];
+      src_r[i] = r;
+      src_g[i] = g;
+      src_b[i] = b;
+      const float y = std::max(r, std::max(g, b));
+      luma[i] = y;
+      global_max = std::max(global_max, y);
+    }
+
+    if (global_max <= 0.0f) {
+      return;
+    }
+
+    const float white_ref =
+        (white_level > 1.0f) ? std::min(white_level, global_max) : global_max;
+    const float sat_thr = std::min(global_max * 0.995f, white_ref * 0.90f);
+    const float edge_thr = std::max(16.0f, sat_thr * 0.08f);
+
+    std::vector<float> dst_r = src_r;
+    std::vector<float> dst_g = src_g;
+    std::vector<float> dst_b = src_b;
+
+    long long rb_updates = 0;
+    long long g_updates = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : rb_updates, g_updates)
+#endif
+    for (int row_i = 2; row_i < static_cast<int>(height) - 2; ++row_i) {
+      const size_t row = static_cast<size_t>(row_i);
+      for (size_t col = 2; col + 2 < width; ++col) {
+        const size_t idx = row * width + col;
+
+        float local_max = 0.0f;
+        float local_min = std::numeric_limits<float>::max();
+        for (int dy = -1; dy <= 1; ++dy) {
+          const size_t yy = static_cast<size_t>(row_i + dy);
+          for (int dx = -1; dx <= 1; ++dx) {
+            const size_t xx = static_cast<size_t>(static_cast<int>(col) + dx);
+            const float v = luma[yy * width + xx];
+            local_max = std::max(local_max, v);
+            local_min = std::min(local_min, v);
+          }
+        }
+
+        // Limit correction to clipped highlight boundaries only.
+        if (local_max < sat_thr || (local_max - local_min) < edge_thr) {
+          continue;
+        }
+
+        float r_acc = 0.0f, g_acc = 0.0f, b_acc = 0.0f;
+        float r_w = 0.0f, g_w = 0.0f, b_w = 0.0f;
+        for (int dy = -2; dy <= 2; ++dy) {
+          const size_t yy = static_cast<size_t>(row_i + dy);
+          for (int dx = -2; dx <= 2; ++dx) {
+            const size_t xx = static_cast<size_t>(static_cast<int>(col) + dx);
+            const size_t nidx = yy * width + xx;
+            const float w = 1.0f / static_cast<float>(1 + std::abs(dx) + std::abs(dy));
+
+            const float rv = src_r[nidx];
+            const float gv = src_g[nidx];
+            const float bv = src_b[nidx];
+            if (rv > 0.0f) {
+              r_acc += rv * w;
+              r_w += w;
+            }
+            if (gv > 0.0f) {
+              g_acc += gv * w;
+              g_w += w;
+            }
+            if (bv > 0.0f) {
+              b_acc += bv * w;
+              b_w += w;
+            }
+          }
+        }
+
+        if (g_w <= 1e-6f || (r_w <= 1e-6f && b_w <= 1e-6f)) {
+          continue;
+        }
+
+        const float g_est = g_acc / g_w;
+        const float r_est = (r_w > 1e-6f) ? (r_acc / r_w) : g_est;
+        const float b_est = (b_w > 1e-6f) ? (b_acc / b_w) : g_est;
+
+        // Purple fringe candidate: magenta-dominant, high-luminance transition.
+        const float purple_excess = 0.5f * (r_est + b_est) - g_est;
+        if (purple_excess <= sat_thr * 0.015f) {
+          continue;
+        }
+        if (r_est < g_est * 1.02f || b_est < g_est * 1.02f) {
+          continue;
+        }
+
+        const float edge_weight =
+            std::clamp((local_max - local_min) / std::max(1.0f, sat_thr * 0.25f),
+                       0.0f, 1.0f);
+        const float purple_weight =
+            std::clamp(purple_excess / std::max(1.0f, sat_thr * 0.12f), 0.0f, 1.0f);
+        const float alpha =
+            std::clamp(strength * edge_weight * purple_weight, 0.0f, 0.85f);
+        if (alpha < 0.02f) {
+          continue;
+        }
+
+        uint32_t native = cfa_channel_at(row, col);
+        if (native == 3) {
+          native = 1;
+        }
+
+        const float rb_target = g_est * 1.04f;
+        if (native == 0) {
+          const float base = src_r[idx];
+          const float clipped = std::min(base, rb_target);
+          dst_r[idx] = base * (1.0f - alpha) + clipped * alpha;
+          rb_updates++;
+        } else if (native == 2) {
+          const float base = src_b[idx];
+          const float clipped = std::min(base, rb_target);
+          dst_b[idx] = base * (1.0f - alpha) + clipped * alpha;
+          rb_updates++;
+        } else if (native == 1) {
+          // Green compensation improves LoCA-like fringe without global desaturation.
+          const float g_target = std::min(local_max, 0.5f * (r_est + b_est));
+          if (g_target > src_g[idx] * 1.05f) {
+            const float g_alpha = std::min(0.35f, alpha * 0.5f);
+            dst_g[idx] = src_g[idx] * (1.0f - g_alpha) + g_target * g_alpha;
+            g_updates++;
+          }
+        }
+      }
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+      image[i][0] = std::max(0.0f, dst_r[i]);
+      image[i][1] = std::max(0.0f, dst_g[i]);
+      image[i][2] = std::max(0.0f, dst_b[i]);
+    }
+
+    std::cout << "✅ Highlight fringe suppression (pre-demosaic): RB="
+              << rb_updates << " G=" << g_updates << " (strength=" << strength
+              << ")" << std::endl;
   }
 
   static float bilinear_sample_u16(const std::vector<ushort> &plane, size_t w,
@@ -1920,6 +2093,11 @@ public:
       return false;
     }
 
+    if (params.highlight_fringe_suppression) {
+      suppress_highlight_boundary_fringe(rgb_buffer2, maximum_result.maximum,
+                                         params.highlight_fringe_strength);
+    }
+
     // Get camera-specific color transformation matrix
     // LibRaw の identify() は adobe_coeff に normalized_model を渡す。maker_index も同一のルールで使う。
     const char *ccm_model =
@@ -2764,6 +2942,8 @@ public:
 #ifdef __arm64__
   void set_processing_params(const ProcessingParams &params) {
     current_params = params;
+    current_params.highlight_fringe_strength =
+        std::clamp(current_params.highlight_fringe_strength, 0.0f, 1.0f);
 
     // Map all parameters to LibRaw
 
@@ -2998,6 +3178,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.use_gpu_acceleration = p.second;
     else if (p.first == "preprocess")
       params.preprocess = p.second;
+    else if (p.first == "highlight_fringe_suppression")
+      params.highlight_fringe_suppression = p.second;
   }
 
   for (const auto &p : int_params) {
@@ -3045,6 +3227,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.chromatic_aberration_red = p.second;
     else if (p.first == "chromatic_aberration_blue")
       params.chromatic_aberration_blue = p.second;
+    else if (p.first == "highlight_fringe_strength")
+      params.highlight_fringe_strength = p.second;
   }
 
   for (const auto &p : string_params) {
@@ -3260,7 +3444,8 @@ ProcessingParams create_params_from_rawpy_args(
     const std::string &bad_pixels_path,
 
     // LibRaw Enhanced extensions
-    bool use_gpu_acceleration, bool preprocess) {
+    bool use_gpu_acceleration, bool preprocess,
+    bool highlight_fringe_suppression, float highlight_fringe_strength) {
   ProcessingParams params;
 
   // Map all parameters to ProcessingParams structure
@@ -3324,6 +3509,8 @@ ProcessingParams create_params_from_rawpy_args(
   // Metal-specific settings
   params.use_gpu_acceleration = use_gpu_acceleration;
   params.preprocess = preprocess;
+  params.highlight_fringe_suppression = highlight_fringe_suppression;
+  params.highlight_fringe_strength = highlight_fringe_strength;
 
   return params;
 }

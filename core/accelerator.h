@@ -103,6 +103,8 @@ struct ProcessingParams {
 
   // LibRaw Enhanced extensions
   bool preprocess = false; // Skip demosaic and return raw Bayer/X-Trans data
+  bool highlight_fringe_suppression = true; // Auto suppress highlight-edge fringe
+  float highlight_fringe_strength = 0.65f;  // 0.0-1.0 suppression strength
 
   ProcessingParams() {
     // Initialize color matrix to identity
