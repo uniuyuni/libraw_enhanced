@@ -922,11 +922,13 @@ public:
         }
         const size_t idx = row * raw_buffer.width + col;
         const float grad = guide_grad[idx];
-        if (grad < grad_threshold) {
+        const float v = static_cast<float>(channel_plane[idx]);
+        // Keep clipped-edge samples for CA estimation; they are critical for
+        // highlight-fringe suppression and were previously filtered out.
+        if (v < 96.0f) {
           continue;
         }
-        const float v = static_cast<float>(channel_plane[idx]);
-        if (v < 128.0f || v > max_channel * 0.98f) {
+        if (grad < grad_threshold && v < max_channel * 0.92f) {
           continue;
         }
 
@@ -1080,11 +1082,13 @@ public:
         }
         const size_t idx = row * raw_buffer.width + col;
         const float grad = guide_grad[idx];
-        if (grad < grad_threshold) {
+        const float v = static_cast<float>(channel_plane[idx]);
+        // Keep clipped-edge samples for CA estimation; they are critical for
+        // highlight-fringe suppression and were previously filtered out.
+        if (v < 96.0f) {
           continue;
         }
-        const float v = static_cast<float>(channel_plane[idx]);
-        if (v < 128.0f || v > max_channel * 0.98f) {
+        if (grad < grad_threshold && v < max_channel * 0.92f) {
           continue;
         }
         const float weight =
@@ -1987,6 +1991,110 @@ public:
   }
 
   //===============================================================
+  // Post-demosaic highlight-edge purple defringe
+  //===============================================================
+  void suppress_highlight_purple_fringe_post(ImageBufferFloat &rgb_buffer,
+                                             float strength) {
+    if (!rgb_buffer.is_valid() || rgb_buffer.width < 8 || rgb_buffer.height < 8) {
+      return;
+    }
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    if (strength <= 0.0f) {
+      return;
+    }
+
+    const size_t width = rgb_buffer.width;
+    const size_t height = rgb_buffer.height;
+    const size_t size = width * height;
+    float(*image)[3] = rgb_buffer.image;
+
+    std::vector<float> r(size), g(size), b(size), lum(size);
+    float global_max = 0.0f;
+    for (size_t i = 0; i < size; ++i) {
+      r[i] = image[i][0];
+      g[i] = image[i][1];
+      b[i] = image[i][2];
+      lum[i] = std::max(r[i], std::max(g[i], b[i]));
+      global_max = std::max(global_max, lum[i]);
+    }
+    if (global_max <= 0.0f) {
+      return;
+    }
+
+    const float hi_thr = std::max(0.80f, global_max * 0.62f);
+    const float edge_thr = std::max(0.03f, global_max * 0.015f);
+
+    long long corrected = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : corrected)
+#endif
+    for (int row_i = 2; row_i < static_cast<int>(height) - 2; ++row_i) {
+      const size_t row = static_cast<size_t>(row_i);
+      for (size_t col = 2; col + 2 < width; ++col) {
+        const size_t idx = row * width + col;
+        const float l = lum[idx];
+        if (l < hi_thr) {
+          continue;
+        }
+
+        float local_max = 0.0f;
+        float local_min = std::numeric_limits<float>::max();
+        for (int dy = -1; dy <= 1; ++dy) {
+          const size_t yy = static_cast<size_t>(row_i + dy);
+          for (int dx = -1; dx <= 1; ++dx) {
+            const size_t xx = static_cast<size_t>(static_cast<int>(col) + dx);
+            const size_t nidx = yy * width + xx;
+            const float rn = r[nidx], gn = g[nidx], bn = b[nidx];
+            const float ln = lum[nidx];
+            local_max = std::max(local_max, ln);
+            local_min = std::min(local_min, ln);
+          }
+        }
+        if ((local_max - local_min) < edge_thr) {
+          continue;
+        }
+
+        const float rc = r[idx], gc = g[idx], bc = b[idx];
+        const float rb = 0.5f * (rc + bc);
+        if (rb <= gc * 1.03f) {
+          continue;
+        }
+
+        const float excess = rb - gc;
+        if (excess <= 0.0f) {
+          continue;
+        }
+
+        const float sat_w = std::clamp((l - hi_thr) /
+                                           std::max(1e-6f, global_max - hi_thr),
+                                       0.0f, 1.0f);
+        const float edge_w =
+            std::clamp((local_max - local_min) / std::max(1e-6f, edge_thr * 3.0f),
+                       0.0f, 1.0f);
+        const float alpha = std::clamp(
+            strength * (0.40f + 0.60f * sat_w) * edge_w, 0.0f, 0.95f);
+        if (alpha < 0.02f) {
+          continue;
+        }
+
+        const float reduce = alpha * excess * 0.85f;
+        const float new_r = std::max(0.0f, rc - reduce);
+        const float new_b = std::max(0.0f, bc - reduce);
+        const float g_lift = std::min(reduce * 0.45f, excess * 0.45f);
+        const float new_g = gc + g_lift;
+
+        image[idx][0] = new_r;
+        image[idx][1] = new_g;
+        image[idx][2] = new_b;
+        corrected++;
+      }
+    }
+
+    std::cout << "✅ Post-demosaic highlight defringe corrected " << corrected
+              << " pixels (strength=" << strength << ")" << std::endl;
+  }
+
+  //===============================================================
   // Main RAW to RGB processing pipeline
   //===============================================================
 
@@ -2179,6 +2287,13 @@ public:
     // Highlight detail recovery
     if (params.highlight_mode > 3) {
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+    }
+
+    // Residual suppression in linear RGB: targets purple fringe that survives
+    // highlight reconstruction and micro-contrast.
+    if (params.highlight_fringe_suppression) {
+      suppress_highlight_purple_fringe_post(rgb_buffer,
+                                            params.highlight_fringe_strength);
     }
 
     // Get camera-specific color transformation matrix
