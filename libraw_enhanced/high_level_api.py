@@ -170,7 +170,7 @@ class RawImage:
                    use_gpu_acceleration: Optional[bool] = False,
                    preprocess: bool = False,
                    highlight_fringe_suppression: bool = True,
-                   highlight_fringe_strength: float = 0.65) -> np.ndarray:
+                   highlight_fringe_strength: float = 0.85) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 

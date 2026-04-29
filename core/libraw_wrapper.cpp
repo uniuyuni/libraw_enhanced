@@ -631,12 +631,16 @@ public:
         }
 
         const float edge_weight =
-            std::clamp((local_max - local_min) / std::max(1.0f, sat_thr * 0.25f),
+            std::clamp((local_max - local_min) / std::max(1.0f, sat_thr * 0.20f),
                        0.0f, 1.0f);
         const float purple_weight =
-            std::clamp(purple_excess / std::max(1.0f, sat_thr * 0.12f), 0.0f, 1.0f);
-        const float alpha =
-            std::clamp(strength * edge_weight * purple_weight, 0.0f, 0.85f);
+            std::clamp(purple_excess / std::max(1.0f, sat_thr * 0.09f), 0.0f, 1.0f);
+        const float highlight_weight =
+            std::clamp((local_max - sat_thr) / std::max(1.0f, sat_thr * 0.10f),
+                       0.0f, 1.0f);
+        const float alpha = std::clamp(
+            strength * (0.35f + 0.65f * highlight_weight) * edge_weight * purple_weight,
+            0.0f, 0.95f);
         if (alpha < 0.02f) {
           continue;
         }
@@ -646,7 +650,8 @@ public:
           native = 1;
         }
 
-        const float rb_target = g_est * 1.04f;
+        const float rb_target =
+            (local_max > white_ref * 0.97f) ? (g_est * 1.00f) : (g_est * 1.02f);
         if (native == 0) {
           const float base = src_r[idx];
           const float clipped = std::min(base, rb_target);
@@ -661,7 +666,7 @@ public:
           // Green compensation improves LoCA-like fringe without global desaturation.
           const float g_target = std::min(local_max, 0.5f * (r_est + b_est));
           if (g_target > src_g[idx] * 1.05f) {
-            const float g_alpha = std::min(0.35f, alpha * 0.5f);
+            const float g_alpha = std::min(0.45f, alpha * 0.65f);
             dst_g[idx] = src_g[idx] * (1.0f - g_alpha) + g_target * g_alpha;
             g_updates++;
           }
@@ -3526,10 +3531,9 @@ bool is_apple_silicon() {
 }
 
 bool is_available() {
-  // Backward compatibility - check if Metal is available without creating
-  // instances
+  // Backward compatibility helper used by Python package initialization.
 #ifdef __arm64__
-  return is_available(); // Simple check - Apple Silicon has Metal support
+  return true;
 #else
   return false;
 #endif

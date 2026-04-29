@@ -185,10 +185,11 @@ ProcessingParams create_params_from_rawpy_args(
     // LibRaw Enhanced extensions
     bool use_gpu_acceleration = false, bool preprocess = false,
     bool highlight_fringe_suppression = true,
-    float highlight_fringe_strength = 0.65f);
+    float highlight_fringe_strength = 0.85f);
 
 // Platform detection functions
 bool is_apple_silicon();
+bool is_available();
 std::vector<std::string> get_device_list();
 
 #endif
