@@ -1984,8 +1984,101 @@ public:
       }
     }
 
+    // LoCA-specific green compensation on highlight boundaries:
+    // if R/B remain dominant after highlight recovery, lift G locally and
+    // slightly trim R/B to avoid purple halos while preserving detail.
+    size_t loca_compensated = 0;
+    for (std::deque<size_t>::iterator it = highlight.begin();
+         it != highlight.end(); ++it) {
+      const size_t idx = *it;
+      const size_t y = idx / width;
+      const size_t x = idx % width;
+      if (x <= 1 || x >= width - 2 || y <= 1 || y >= height - 2) {
+        continue;
+      }
+
+      float *p = image[idx];
+      const float l = std::max(p[0], std::max(p[1], p[2]));
+      if (l < saturation_threshold * 0.90f) {
+        continue;
+      }
+
+      float local_max = 0.0f;
+      float local_min = std::numeric_limits<float>::max();
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          const size_t nidx = static_cast<size_t>(static_cast<int>(y) + dy) * width +
+                              static_cast<size_t>(static_cast<int>(x) + dx);
+          const float *np = image[nidx];
+          const float nl = std::max(np[0], std::max(np[1], np[2]));
+          local_max = std::max(local_max, nl);
+          local_min = std::min(local_min, nl);
+        }
+      }
+      if ((local_max - local_min) < 0.015f) {
+        continue;
+      }
+
+      const float rb = 0.5f * (p[0] + p[2]);
+      if (rb <= p[1] * 1.04f) {
+        continue;
+      }
+
+      // Estimate local neutral/valid G/RB ratio from nearby highlight region.
+      double ratio_sum = 0.0;
+      double ratio_w = 0.0;
+      for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+          const size_t nidx = static_cast<size_t>(static_cast<int>(y) + dy) * width +
+                              static_cast<size_t>(static_cast<int>(x) + dx);
+          const float *np = image[nidx];
+          const float nrb = 0.5f * (np[0] + np[2]);
+          const float nl = std::max(np[0], std::max(np[1], np[2]));
+          if (nl < saturation_threshold * 0.75f || nrb <= 1e-6f) {
+            continue;
+          }
+          const float ratio = np[1] / nrb;
+          if (ratio < 0.70f || ratio > 1.35f) {
+            continue;
+          }
+          const double w = 1.0 / static_cast<double>(1 + std::abs(dx) + std::abs(dy));
+          ratio_sum += ratio * w;
+          ratio_w += w;
+        }
+      }
+
+      const float local_ratio = static_cast<float>(ratio_w > 0.0 ? ratio_sum / ratio_w : 1.0);
+      const float desired_g = rb * std::clamp(local_ratio, 0.95f, 1.08f);
+      const float g_missing = desired_g - p[1];
+      if (g_missing <= 0.0f) {
+        continue;
+      }
+
+      const float sat_w = std::clamp((l - saturation_threshold) /
+                                         std::max(1e-6f, std::max(1.0f, max_val) - saturation_threshold),
+                                     0.0f, 1.0f);
+      const float edge_w =
+          std::clamp((local_max - local_min) / 0.08f, 0.0f, 1.0f);
+      const float alpha = std::clamp(0.30f + 0.55f * sat_w * edge_w, 0.0f, 0.90f);
+
+      const float g_boost = alpha * std::min(g_missing, (rb - p[1]) * 0.90f);
+      p[1] += g_boost;
+
+      // Mild RB trim to prevent over-magenta ring after G lift.
+      const float rb_residual = std::max(0.0f, 0.5f * (p[0] + p[2]) - p[1]);
+      if (rb_residual > 0.0f) {
+        const float trim = std::min(rb_residual * alpha * 0.45f,
+                                    0.5f * (p[0] + p[2]) * 0.12f);
+        p[0] = std::max(0.0f, p[0] - trim);
+        p[2] = std::max(0.0f, p[2] - trim);
+      }
+      p[1] = std::max(0.0f, p[1]);
+      loca_compensated++;
+    }
+
     std::cout << "✅ Highlight recovery completed. Highlight: "
               << highlight.size() << " pixels.  White: " << white.size()
+              << " pixels.  LoCA fixed: " << loca_compensated
               << " pixels." << std::endl;
     return max_val;
   }

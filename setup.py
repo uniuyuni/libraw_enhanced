@@ -271,7 +271,7 @@ def create_extension():
     extra_compile_args = [
         '-std=c++17',
         '-O3',
-        '-DVERSION_INFO="0.7.1"',  # エスケープ修正
+        '-DVERSION_INFO="0.7.2"',  # エスケープ修正
     ]
     
     # リンクフラグ
@@ -326,7 +326,7 @@ def create_extension():
     
     # プリプロセッサ定義
     define_macros = [
-        ('VERSION_INFO', '"0.7.1"'),  # 引用符修正
+        ('VERSION_INFO', '"0.7.2"'),  # 引用符修正
     ]
     
     if is_apple_platform():
