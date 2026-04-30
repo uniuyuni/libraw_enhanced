@@ -50,19 +50,35 @@ kernel void enhance_micro_contrast(
     float4 enhanced_high_freq = high_freq * (1.f + enhance_factor);
 
     // 画像の再構成
-    if (rgb_input[idx].y >= params.threshold) {
-        float3 out_rgb = float3(
-            local_mean[idx].x + enhanced_high_freq.x,
-            local_mean[idx].y + enhanced_high_freq.y,
-            local_mean[idx].z + enhanced_high_freq.z
-        );
-        // Preserve highlight detail without hard clipping by scaling
-        // down only if the enhancement pushes above 1.0.
-        float maxc = max(out_rgb.x, max(out_rgb.y, out_rgb.z));
-        if (maxc > 1.f) {
-            out_rgb /= maxc;
+    // NOTE:
+    // maxc>1 での一括スケーリングは階調圧縮が強いため、
+    // チャンネルごとのソフトショルダーでハイライトを処理する。
+    float transition = max(0.02f, params.threshold * 0.08f);
+    float t0 = params.threshold - transition;
+    float t1 = params.threshold + transition;
+    float highlight_w = clamp((rgb_input[idx].y - t0) / max(1e-6f, (t1 - t0)), 0.0f, 1.0f);
+
+    if (highlight_w > 0.0f) {
+        float3 out_rgb = float3(0.0f);
+        float3 mean_rgb = float3(local_mean[idx].x, local_mean[idx].y, local_mean[idx].z);
+        float3 delta_rgb = float3(enhanced_high_freq.x, enhanced_high_freq.y, enhanced_high_freq.z);
+
+        for (uint c = 0; c < 3; ++c) {
+            float mean_v = mean_rgb[c];
+            float delta = delta_rgb[c];
+            float recon;
+
+            if (delta > 0.0f) {
+                float room = max(1e-6f, 1.0f - mean_v);
+                recon = mean_v + room * (1.0f - exp(-delta / room));
+            } else {
+                recon = mean_v + delta;
+            }
+
+            out_rgb[c] = max(0.0f, recon);
         }
-        rgb_output[idx] = out_rgb;
+
+        rgb_output[idx] = rgb_input[idx] * (1.0f - highlight_w) + out_rgb * highlight_w;
     } else {
         rgb_output[idx] = rgb_input[idx];
     }
