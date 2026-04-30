@@ -395,6 +395,21 @@ class RawImage:
             raise RuntimeError("No RAW file loaded. Call load_file() first.")
         return self._wrapper.get_threshold()
 
+    def get_output_geometry(self, half_size: bool = False) -> Dict[str, Any]:
+        """
+        センサー固有変換（例: Fuji honeycomb rotate）を含めた
+        想定出力サイズを返す。
+
+        Args:
+            half_size: half-size 出力前提で計算するか
+
+        Returns:
+            dict: width/height と補助フラグ
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded. Call load_file() first.")
+        return self._wrapper.get_output_geometry(bool(half_size))
+
     def recover_highlights(self,
                            image: np.ndarray,
                            threshold: float = -1.0) -> np.ndarray:

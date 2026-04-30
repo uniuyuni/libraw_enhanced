@@ -117,6 +117,7 @@ public:
   void set_processing_params(const ProcessingParams &params);
   void set_gpu_acceleration(bool enable);
   std::string get_device_info() const;
+  py::dict get_output_geometry_dict(bool half_size = false) const;
 
   // Standalone image processing methods (accept numpy float32 array, return new
   // array)

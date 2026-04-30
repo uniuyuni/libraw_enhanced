@@ -2389,6 +2389,64 @@ public:
                                             params.highlight_fringe_strength);
     }
 
+    // Fuji SuperCCD honeycomb sensors require an additional geometric
+    // rotation/stretch step after demosaic to match the final orientation.
+    if (imgdata.rawdata.ioparams.fuji_width > 0 && imgdata.params.use_fuji_rotate) {
+      const int shrink = imgdata.rawdata.ioparams.shrink;
+      int fuji_width = (imgdata.rawdata.ioparams.fuji_width - 1 + shrink) >> shrink;
+      if (fuji_width > 0) {
+        const double step = std::sqrt(0.5);
+        const size_t src_w = rgb_buffer.width;
+        const size_t src_h = rgb_buffer.height;
+        const int wide_i = static_cast<int>(fuji_width / step);
+        const int high_i = static_cast<int>((static_cast<int>(src_h) - fuji_width) / step);
+
+        if (wide_i > 1 && high_i > 1) {
+          const size_t wide = static_cast<size_t>(wide_i);
+          const size_t high = static_cast<size_t>(high_i);
+          std::vector<float> rotated_data(wide * high * 3, 0.0f);
+          float (*rot)[3] = reinterpret_cast<float(*)[3]>(rotated_data.data());
+
+          for (size_t row = 0; row < high; ++row) {
+            for (size_t col = 0; col < wide; ++col) {
+              const float r = static_cast<float>(
+                  fuji_width + (static_cast<double>(row) - static_cast<double>(col)) * step);
+              const float c = static_cast<float>(
+                  (static_cast<double>(row) + static_cast<double>(col)) * step);
+              const size_t ur = static_cast<size_t>(r);
+              const size_t uc = static_cast<size_t>(c);
+              if (ur >= src_h - 1 || uc >= src_w - 1) {
+                continue;
+              }
+
+              const float fr = r - static_cast<float>(ur);
+              const float fc = c - static_cast<float>(uc);
+              const float *p00 = rgb_buffer.image[ur * src_w + uc];
+              const float *p01 = rgb_buffer.image[ur * src_w + (uc + 1)];
+              const float *p10 = rgb_buffer.image[(ur + 1) * src_w + uc];
+              const float *p11 = rgb_buffer.image[(ur + 1) * src_w + (uc + 1)];
+              float *dst = rot[row * wide + col];
+
+              for (int ch = 0; ch < 3; ++ch) {
+                const float top = p00[ch] * (1.0f - fc) + p01[ch] * fc;
+                const float bottom = p10[ch] * (1.0f - fc) + p11[ch] * fc;
+                dst[ch] = top * (1.0f - fr) + bottom * fr;
+              }
+            }
+          }
+
+          rgb_buffer_image.swap(rotated_data);
+          rgb_buffer.width = wide;
+          rgb_buffer.height = high;
+          rgb_buffer.image =
+              reinterpret_cast<float(*)[3]>(rgb_buffer_image.data());
+          std::cout << "✅ Applied Fuji rotate: " << src_w << "x" << src_h
+                    << " -> " << rgb_buffer.width << "x" << rgb_buffer.height
+                    << std::endl;
+        }
+      }
+    }
+
     // Get camera-specific color transformation matrix
     camera_matrix = compute_camera_transform(
         imgdata.idata.maker_index, imgdata.idata.make, ccm_model,
@@ -2902,8 +2960,62 @@ public:
 
   bool copy_bayer_image(int shrink_factor) {
     auto &sizes = processor.imgdata.sizes;
+    auto &ioparams = processor.imgdata.rawdata.ioparams;
+    const bool is_fuji_honeycomb =
+        (ioparams.fuji_width > 0 && processor.imgdata.idata.filters >= 1000);
+    const bool fuji_layout =
+        processor.get_internal_data_pointer()->unpacker_data.fuji_layout != 0;
 
-    // Standard bayer processing
+    // Fuji CCD honeycomb mapping path (aligned with upstream LibRaw raw2image).
+    if (is_fuji_honeycomb) {
+      const int copy_rows = std::max(0, sizes.raw_height - sizes.top_margin * 2);
+      const int copy_cols =
+          ioparams.fuji_width << static_cast<int>(!fuji_layout);
+
+      for (int row = 0; row < copy_rows; row++) {
+        for (int col = 0; col < copy_cols; col++) {
+          int r, c;
+          if (fuji_layout) {
+            r = ioparams.fuji_width - 1 - col + (row >> 1);
+            c = col + ((row + 1) >> 1);
+          } else {
+            r = ioparams.fuji_width - 1 + row - (col >> 1);
+            c = row + ((col + 1) >> 1);
+          }
+
+          const int src_row = row + sizes.top_margin;
+          const int src_col = col + sizes.left_margin;
+          if (src_row < 0 || src_row >= sizes.raw_height || src_col < 0 ||
+              src_col >= sizes.raw_width) {
+            continue;
+          }
+          if (r < 0 || c < 0 || r >= sizes.height || c >= sizes.width) {
+            continue;
+          }
+
+          const int dst_row = r >> shrink_factor;
+          const int dst_col = c >> shrink_factor;
+          if (dst_row < 0 || dst_col < 0 || dst_row >= sizes.iheight ||
+              dst_col >= sizes.iwidth) {
+            continue;
+          }
+
+          const int src_idx = src_row * sizes.raw_pitch / 2 + src_col;
+          const int dst_idx = dst_row * sizes.iwidth + dst_col;
+          const uint16_t val = processor.imgdata.rawdata.raw_image[src_idx];
+          const uint32_t color_channel =
+              fcol_bayer_native(r, c, processor.imgdata.idata.filters);
+
+          processor.imgdata.image[dst_idx][color_channel] = val;
+          if (color_channel == 3) {
+            processor.imgdata.image[dst_idx][1] = val;
+          }
+        }
+      }
+      return true;
+    }
+
+    // Standard Bayer processing.
     for (int row = 0;
          row < sizes.height && row < sizes.raw_height - sizes.top_margin;
          row++) {
@@ -3499,6 +3611,51 @@ static float compute_default_threshold(LibRaw &processor) {
 
 float LibRawWrapper::get_threshold() const {
   return compute_default_threshold(pimpl->processor);
+}
+
+py::dict LibRawWrapper::get_output_geometry_dict(bool half_size) const {
+  const auto &imgdata = pimpl->processor.imgdata;
+  const auto &sizes = imgdata.sizes;
+
+  int width = static_cast<int>(sizes.width);
+  int height = static_cast<int>(sizes.height);
+
+  const bool can_shrink = half_size && imgdata.idata.filters &&
+                          !imgdata.rawdata.color4_image &&
+                          !imgdata.rawdata.color3_image;
+  const int shrink = can_shrink ? 1 : 0;
+  if (can_shrink) {
+    width = (width + 1) >> 1;
+    height = (height + 1) >> 1;
+  }
+
+  const bool is_fuji_honeycomb =
+      imgdata.rawdata.ioparams.fuji_width > 0 && imgdata.idata.filters >= 1000;
+  const bool use_fuji_rotate = imgdata.params.use_fuji_rotate != 0;
+  int rotated_width = width;
+  int rotated_height = height;
+
+  if (is_fuji_honeycomb && use_fuji_rotate) {
+    const int fuji_width =
+        (imgdata.rawdata.ioparams.fuji_width - 1 + shrink) >> shrink;
+    if (fuji_width > 0) {
+      const double step = std::sqrt(0.5);
+      const int wide = static_cast<int>(fuji_width / step);
+      const int high = static_cast<int>((height - fuji_width) / step);
+      if (wide > 1 && high > 1) {
+        rotated_width = wide;
+        rotated_height = high;
+      }
+    }
+  }
+
+  py::dict result;
+  result["width"] = rotated_width;
+  result["height"] = rotated_height;
+  result["is_fuji_honeycomb"] = is_fuji_honeycomb;
+  result["use_fuji_rotate"] = use_fuji_rotate;
+  result["is_fuji_rotated_output"] = is_fuji_honeycomb && use_fuji_rotate;
+  return result;
 }
 
 py::array_t<float>
