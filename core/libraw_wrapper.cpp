@@ -2084,40 +2084,84 @@ public:
   }
 
   //===============================================================
-  // RGB-ratio preserving highlight soft knee
+  // Highlight-only blend of the tone-mapped result
   //===============================================================
-  void apply_highlight_soft_knee(ImageBufferFloat &rgb_buffer) {
-    if (!rgb_buffer.is_valid()) {
+  void blend_highlight_tonemap(ImageBufferFloat &base_buffer,
+                               const ImageBufferFloat &tonemapped_buffer) {
+    if (!base_buffer.is_valid() || !tonemapped_buffer.is_valid() ||
+        base_buffer.width != tonemapped_buffer.width ||
+        base_buffer.height != tonemapped_buffer.height ||
+        base_buffer.channels != 3 || tonemapped_buffer.channels != 3) {
       return;
     }
 
-    constexpr float knee = 0.92f;
-    constexpr float shoulder = 1.0f - knee;
-    const size_t size = rgb_buffer.width * rgb_buffer.height;
-    float(*image)[3] = rgb_buffer.image;
+    constexpr float edge0 = 0.55f;
+    constexpr float edge1 = 0.90f;
+    const size_t size = base_buffer.width * base_buffer.height;
 
-    long long compressed = 0;
+    long long blended = 0;
 #ifdef _OPENMP
-#pragma omp parallel for reduction(+ : compressed)
+#pragma omp parallel for reduction(+ : blended)
 #endif
     for (size_t idx = 0; idx < size; ++idx) {
-      float *p = image[idx];
-      const float maxc = std::max(p[0], std::max(p[1], p[2]));
-      if (maxc <= knee) {
+      float *base = base_buffer.image[idx];
+      const float *tm = tonemapped_buffer.image[idx];
+      const float maxc = std::max(base[0], std::max(base[1], base[2]));
+      float w = (maxc - edge0) / (edge1 - edge0);
+      w = std::clamp(w, 0.0f, 1.0f);
+      w = w * w * (3.0f - 2.0f * w);
+      if (w <= 0.0f) {
         continue;
       }
 
-      const float x = maxc - knee;
-      const float mapped = knee + x / (1.0f + x / shoulder);
-      const float scale = mapped / std::max(maxc, 1e-6f);
-      p[0] *= scale;
-      p[1] *= scale;
-      p[2] *= scale;
-      compressed++;
+      base[0] = base[0] * (1.0f - w) + tm[0] * w;
+      base[1] = base[1] * (1.0f - w) + tm[1] * w;
+      base[2] = base[2] * (1.0f - w) + tm[2] * w;
+      blended++;
     }
 
-    std::cout << "✅ Highlight soft-knee completed. Compressed: "
-              << compressed << " pixels." << std::endl;
+    std::cout << "✅ Highlight tone-map blend completed. Blended: "
+              << blended << " pixels." << std::endl;
+  }
+
+  void add_highlight_detail(ImageBufferFloat &target_buffer,
+                            const ImageBufferFloat &detail_buffer) {
+    if (!target_buffer.is_valid() || !detail_buffer.is_valid() ||
+        target_buffer.width != detail_buffer.width ||
+        target_buffer.height != detail_buffer.height ||
+        target_buffer.channels != 3 || detail_buffer.channels != 3) {
+      return;
+    }
+
+    constexpr float edge0 = 0.55f;
+    constexpr float edge1 = 0.90f;
+    constexpr float strength = 0.6f;
+    const size_t size = target_buffer.width * target_buffer.height;
+
+    long long detailed = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : detailed)
+#endif
+    for (size_t idx = 0; idx < size; ++idx) {
+      float *target = target_buffer.image[idx];
+      const float *detail = detail_buffer.image[idx];
+      const float maxc = std::max(target[0], std::max(target[1], target[2]));
+      float w = (maxc - edge0) / (edge1 - edge0);
+      w = std::clamp(w, 0.0f, 1.0f);
+      w = w * w * (3.0f - 2.0f * w);
+      if (w <= 0.0f) {
+        continue;
+      }
+
+      const float amount = strength * w;
+      target[0] += detail[0] * amount;
+      target[1] += detail[1] * amount;
+      target[2] += detail[2] * amount;
+      detailed++;
+    }
+
+    std::cout << "✅ Highlight detail reuse completed. Detailed: "
+              << detailed << " pixels." << std::endl;
   }
 
   //===============================================================
@@ -2406,23 +2450,49 @@ public:
       recover_highlights(rgb_buffer, threshold); // * 0.75f);
     }
 
-    // Tone mapping
+    // Tone mapping / highlight detail recovery
     float target_contrast = 0.06f;
     if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
-    } else if (params.highlight_mode < 5) {
-      target_contrast *= 2.f;
-    }
-
-    // Highlight detail recovery
-    if (params.highlight_mode > 3) {
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
-    }
+    } else if (params.highlight_mode == 5) {
+      std::vector<float> recovered_data(rgb_buffer.width * rgb_buffer.height *
+                                        rgb_buffer.channels);
+      ImageBufferFloat recovered_buffer = {
+          reinterpret_cast<float(*)[3]>(recovered_data.data()),
+          rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
+      std::memcpy(recovered_buffer.image, rgb_buffer.image,
+                  recovered_data.size() * sizeof(float));
 
-    // Mode 5 keeps the legacy ACES tone map disabled and only rolls off
-    // recovered/strengthened highlights with a shared RGB scale.
-    if (params.highlight_mode == 5) {
-      apply_highlight_soft_knee(rgb_buffer);
+      std::vector<float> tone_mapped_data(rgb_buffer.width * rgb_buffer.height *
+                                          rgb_buffer.channels);
+      ImageBufferFloat tone_mapped_buffer = {
+          reinterpret_cast<float(*)[3]>(tone_mapped_data.data()),
+          rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
+      std::memcpy(tone_mapped_buffer.image, rgb_buffer.image,
+                  tone_mapped_data.size() * sizeof(float));
+
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+      if (accelerator->tone_mapping(tone_mapped_buffer, tone_mapped_buffer, 1.f)) {
+        std::vector<float> detail_data(rgb_buffer.width * rgb_buffer.height *
+                                       rgb_buffer.channels);
+        ImageBufferFloat detail_buffer = {
+            reinterpret_cast<float(*)[3]>(detail_data.data()),
+            rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
+        const size_t detail_count = detail_data.size();
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (size_t i = 0; i < detail_count; ++i) {
+          detail_data[i] = reinterpret_cast<float *>(rgb_buffer.image)[i] -
+                           reinterpret_cast<float *>(recovered_buffer.image)[i];
+        }
+        add_highlight_detail(tone_mapped_buffer, detail_buffer);
+        blend_highlight_tonemap(rgb_buffer, tone_mapped_buffer);
+      }
+    } else if (params.highlight_mode > 3) {
+      target_contrast *= 2.f;
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     }
 
     // Residual suppression in linear RGB: targets purple fringe that survives

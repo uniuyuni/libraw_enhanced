@@ -26,6 +26,9 @@ def find_raw_files():
     """テスト用RAWファイルを検索"""
     test_dir = Path(__file__).parent
     fixtures_dir = test_dir / "fixtures"
+    target_raw = fixtures_dir / "DSCF0009.RAF"
+    if target_raw.exists():
+        return [target_raw]
     
     raw_extensions = ['.CR2', '.RAF', '.ARW', 
                       '.DNG', '.ORF', '.NEF',
@@ -44,6 +47,38 @@ def find_raw_files():
     
     return sorted(raw_files)
 
+def compress_highlights_for_jpeg(rgb, knee=1.0, shoulder=0.25):
+    """JPG出力前に1.0超過ハイライトだけをRGB比保持で緩く圧縮する。"""
+    compressed = np.array(rgb, dtype=np.float32, copy=True)
+    maxc = np.max(compressed, axis=2)
+    mask = maxc > knee
+    if not np.any(mask):
+        return compressed, 0
+
+    excess = maxc[mask] - knee
+    hard_scale = knee / np.maximum(maxc[mask], 1e-6)
+    blend = excess / (excess + shoulder)
+    scale = (1.0 - blend) + hard_scale * blend
+    compressed[mask] *= scale[:, None]
+    return compressed, int(np.count_nonzero(mask))
+
+def enhance_highlight_microcontrast_for_jpeg(rgb, threshold=0.65, amount=10.0, sigma=1.0):
+    """JPG出力前の圧縮後ハイライトにだけローカルコントラストを戻す。"""
+    src = np.ascontiguousarray(rgb, dtype=np.float32)
+    height, width, bands = src.shape
+    vips = pyvips.Image.new_from_memory(src.data, width, height, bands, "float")
+    blurred = vips.gaussblur(sigma)
+    blurred_np = np.frombuffer(blurred.write_to_memory(), dtype=np.float32)
+    blurred_np = blurred_np.reshape((height, width, bands))
+
+    maxc = np.max(src, axis=2)
+    mask = np.clip((maxc - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
+    mask = mask * mask * (3.0 - 2.0 * mask)
+
+    detail = src - blurred_np
+    enhanced = src + detail * (amount * mask[:, :, None])
+    return enhanced.astype(np.float32, copy=False), int(np.count_nonzero(mask > 0.0))
+
 def process_raw_file(raw_path, output_dir):
     """RAWファイルを処理してJPG出力"""
     print(f"\n📸 Processing: {raw_path.name}")
@@ -53,20 +88,7 @@ def process_raw_file(raw_path, output_dir):
         # 複数の処理パラメータでテスト
         test_configs = [
             {
-                "name": "Linear CPU sRGB",
-                "params": {
-                    "use_camera_wb": True,
-                    "use_auto_wb": False,
-                    "half_size": False,
-                    "output_bps": 32,
-                    "demosaic_algorithm": lre.DemosaicAlgorithm.Linear,
-                    "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.sRGB,
-                    "highlight_mode": 4,
-                }
-            },
-            {
-                "name": "AMaZE CPU WideGamutRGB",
+                "name": "DSCF0009 mode5 internal highlight blend sRGB",
                 "params": {
                     "use_camera_wb": True,
                     "use_auto_wb": False,
@@ -74,8 +96,8 @@ def process_raw_file(raw_path, output_dir):
                     "output_bps": 32,
                     "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
                     "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.WideGamutRGB,
-                    "highlight_mode": 4,
+                    "output_color": lre.ColorSpace.sRGB,
+                    "highlight_mode": 5,
                 }
             },
         ]
@@ -119,9 +141,17 @@ def process_raw_file(raw_path, output_dir):
                     print(f"📊 Output dtype: {rgb.dtype}")
                     print(f"📈 Value range: [{np.min(rgb)}, {np.max(rgb)}]")
 
+                    rgb_compressed, compressed_pixels = compress_highlights_for_jpeg(rgb)
+                    print(f"📉 Highlight-compressed pixels: {compressed_pixels}")
+                    print(f"📈 Compressed range: [{np.min(rgb_compressed)}, {np.max(rgb_compressed)}]")
+
+                    rgb_enhanced, enhanced_pixels = enhance_highlight_microcontrast_for_jpeg(rgb_compressed)
+                    print(f"📉 Highlight microcontrast pixels: {enhanced_pixels}")
+                    print(f"📈 Enhanced range: [{np.min(rgb_enhanced)}, {np.max(rgb_enhanced)}]")
+
                     # JPGファイル名生成
                     base_name = raw_path.stem
-                    save_filename = f"{base_name}_{config['name']}.jpg"
+                    save_filename = f"{base_name}_mode5_internal_highlight_blend.jpg"
                     save_path = output_dir / save_filename
 
                     profile_name = [
@@ -136,18 +166,23 @@ def process_raw_file(raw_path, output_dir):
                         "icc/ITU-R BT.2020.icc",
                     ]
 
+                    rgb_clipped = np.clip(rgb_enhanced, 0.0, 1.0)
+                    clipped_pixels = int(np.count_nonzero(rgb_enhanced != rgb_clipped))
+                    print(f"📉 Clipped for JPEG: {clipped_pixels} channel values")
+
                     # データ読み込み
-                    vips = pyvips.Image.new_from_array((rgb * 255).astype(np.uint8))
+                    vips = pyvips.Image.new_from_array((rgb_clipped * 255 + 0.5).astype(np.uint8))
 
                     # iccプロファイル読み込み
                     #with open(profile_name[config['params']['output_color']], 'rb') as f:
                     #    icc_bytes = f.read()
-                    print(f"💾 load icc: {profile_name[config['params']['output_color']]}")
+                    profile_path = profile_name[int(config['params']['output_color'])]
+                    print(f"💾 load icc: {profile_path}")
 
                     #vips = vips.icc_import(input_profile=profile_name[config['params']['output_color']])
 
                     # JPG保存
-                    vips.write_to_file(save_path, Q=95, profile=profile_name[config['params']['output_color']])
+                    vips.write_to_file(save_path, Q=95, profile=profile_path)
                     #vips.write_to_file(save_path, Q=95)
                     print(f"💾 Saved: {save_path}")
                     """
@@ -161,7 +196,12 @@ def process_raw_file(raw_path, output_dir):
                         'process_time': process_time,
                         'output_path': save_path,
                         'shape': rgb.shape,
-                        'value_range': [np.min(rgb), np.max(rgb)]
+                        'value_range': [np.min(rgb), np.max(rgb)],
+                        'compressed_range': [np.min(rgb_compressed), np.max(rgb_compressed)],
+                        'enhanced_range': [np.min(rgb_enhanced), np.max(rgb_enhanced)],
+                        'highlight_compressed_pixels': compressed_pixels,
+                        'highlight_microcontrast_pixels': enhanced_pixels,
+                        'jpeg_clipped_values': clipped_pixels,
                     })
                 
             except Exception as e:
@@ -240,6 +280,23 @@ def main():
         print(f"\n🏆 Overall: No processing attempts made")
     
     return 0 if total_success > 0 else 1
+
+def test_dscf0009_highlight_soft_knee_jpg():
+    """DSCF0009.RAF をmode5内部ハイライトブレンドでJPG出力する。"""
+    raw_path = Path(__file__).parent / "fixtures" / "DSCF0009.RAF"
+    assert raw_path.exists(), f"Missing RAW fixture: {raw_path}"
+
+    output_dir = Path(__file__).parent / "results"
+    output_dir.mkdir(exist_ok=True)
+    save_path = output_dir / "DSCF0009_mode5_internal_highlight_blend.jpg"
+    if save_path.exists():
+        save_path.unlink()
+
+    results = process_raw_file(raw_path, output_dir)
+    assert results
+    assert all(result["success"] for result in results), results
+    assert save_path.exists()
+    assert save_path.stat().st_size > 0
 
 if __name__ == "__main__":
     sys.exit(main())
