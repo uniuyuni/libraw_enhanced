@@ -2124,46 +2124,6 @@ public:
               << blended << " pixels." << std::endl;
   }
 
-  void add_highlight_detail(ImageBufferFloat &target_buffer,
-                            const ImageBufferFloat &detail_buffer) {
-    if (!target_buffer.is_valid() || !detail_buffer.is_valid() ||
-        target_buffer.width != detail_buffer.width ||
-        target_buffer.height != detail_buffer.height ||
-        target_buffer.channels != 3 || detail_buffer.channels != 3) {
-      return;
-    }
-
-    constexpr float edge0 = 0.55f;
-    constexpr float edge1 = 0.90f;
-    constexpr float strength = 0.6f;
-    const size_t size = target_buffer.width * target_buffer.height;
-
-    long long detailed = 0;
-#ifdef _OPENMP
-#pragma omp parallel for reduction(+ : detailed)
-#endif
-    for (size_t idx = 0; idx < size; ++idx) {
-      float *target = target_buffer.image[idx];
-      const float *detail = detail_buffer.image[idx];
-      const float maxc = std::max(target[0], std::max(target[1], target[2]));
-      float w = (maxc - edge0) / (edge1 - edge0);
-      w = std::clamp(w, 0.0f, 1.0f);
-      w = w * w * (3.0f - 2.0f * w);
-      if (w <= 0.0f) {
-        continue;
-      }
-
-      const float amount = strength * w;
-      target[0] += detail[0] * amount;
-      target[1] += detail[1] * amount;
-      target[2] += detail[2] * amount;
-      detailed++;
-    }
-
-    std::cout << "✅ Highlight detail reuse completed. Detailed: "
-              << detailed << " pixels." << std::endl;
-  }
-
   //===============================================================
   // Post-demosaic highlight-edge purple defringe
   //===============================================================
@@ -2456,14 +2416,6 @@ public:
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     } else if (params.highlight_mode == 5) {
-      std::vector<float> recovered_data(rgb_buffer.width * rgb_buffer.height *
-                                        rgb_buffer.channels);
-      ImageBufferFloat recovered_buffer = {
-          reinterpret_cast<float(*)[3]>(recovered_data.data()),
-          rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
-      std::memcpy(recovered_buffer.image, rgb_buffer.image,
-                  recovered_data.size() * sizeof(float));
-
       std::vector<float> tone_mapped_data(rgb_buffer.width * rgb_buffer.height *
                                           rgb_buffer.channels);
       ImageBufferFloat tone_mapped_buffer = {
@@ -2472,24 +2424,10 @@ public:
       std::memcpy(tone_mapped_buffer.image, rgb_buffer.image,
                   tone_mapped_data.size() * sizeof(float));
 
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
       if (accelerator->tone_mapping(tone_mapped_buffer, tone_mapped_buffer, 1.f)) {
-        std::vector<float> detail_data(rgb_buffer.width * rgb_buffer.height *
-                                       rgb_buffer.channels);
-        ImageBufferFloat detail_buffer = {
-            reinterpret_cast<float(*)[3]>(detail_data.data()),
-            rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
-        const size_t detail_count = detail_data.size();
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-        for (size_t i = 0; i < detail_count; ++i) {
-          detail_data[i] = reinterpret_cast<float *>(rgb_buffer.image)[i] -
-                           reinterpret_cast<float *>(recovered_buffer.image)[i];
-        }
-        add_highlight_detail(tone_mapped_buffer, detail_buffer);
         blend_highlight_tonemap(rgb_buffer, tone_mapped_buffer);
       }
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     } else if (params.highlight_mode > 3) {
       target_contrast *= 2.f;
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
