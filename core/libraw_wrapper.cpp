@@ -511,6 +511,180 @@ public:
   //===============================================================
   // Highlight-boundary fringe suppression (pre-demosaic CFA domain)
   //===============================================================
+  void suppress_highlight_boundary_fringe(ImageBufferFloat &cfa_buffer,
+                                          float white_level, float strength) {
+    if (!cfa_buffer.is_valid() || cfa_buffer.width < 8 || cfa_buffer.height < 8) {
+      return;
+    }
+
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    if (strength <= 0.0f) {
+      return;
+    }
+
+    const size_t width = cfa_buffer.width;
+    const size_t height = cfa_buffer.height;
+    const size_t size = width * height;
+    float(*image)[3] = cfa_buffer.image;
+
+    std::vector<float> src_r(size, 0.0f);
+    std::vector<float> src_g(size, 0.0f);
+    std::vector<float> src_b(size, 0.0f);
+    std::vector<float> luma(size, 0.0f);
+    float global_max = 0.0f;
+
+    for (size_t i = 0; i < size; ++i) {
+      const float r = image[i][0];
+      const float g = image[i][1];
+      const float b = image[i][2];
+      src_r[i] = r;
+      src_g[i] = g;
+      src_b[i] = b;
+      const float y = std::max(r, std::max(g, b));
+      luma[i] = y;
+      global_max = std::max(global_max, y);
+    }
+
+    if (global_max <= 0.0f) {
+      return;
+    }
+
+    const float white_ref =
+        (white_level > 1.0f) ? std::min(white_level, global_max) : global_max;
+    const float sat_thr = std::min(global_max * 0.995f, white_ref * 0.90f);
+    const float edge_thr = std::max(16.0f, sat_thr * 0.08f);
+
+    std::vector<float> dst_r = src_r;
+    std::vector<float> dst_g = src_g;
+    std::vector<float> dst_b = src_b;
+
+    long long rb_updates = 0;
+    long long g_updates = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : rb_updates, g_updates)
+#endif
+    for (int row_i = 2; row_i < static_cast<int>(height) - 2; ++row_i) {
+      const size_t row = static_cast<size_t>(row_i);
+      for (size_t col = 2; col + 2 < width; ++col) {
+        const size_t idx = row * width + col;
+
+        float local_max = 0.0f;
+        float local_min = std::numeric_limits<float>::max();
+        for (int dy = -1; dy <= 1; ++dy) {
+          const size_t yy = static_cast<size_t>(row_i + dy);
+          for (int dx = -1; dx <= 1; ++dx) {
+            const size_t xx = static_cast<size_t>(static_cast<int>(col) + dx);
+            const float v = luma[yy * width + xx];
+            local_max = std::max(local_max, v);
+            local_min = std::min(local_min, v);
+          }
+        }
+
+        // Limit correction to clipped highlight boundaries only.
+        if (local_max < sat_thr || (local_max - local_min) < edge_thr) {
+          continue;
+        }
+
+        float r_acc = 0.0f, g_acc = 0.0f, b_acc = 0.0f;
+        float r_w = 0.0f, g_w = 0.0f, b_w = 0.0f;
+        for (int dy = -2; dy <= 2; ++dy) {
+          const size_t yy = static_cast<size_t>(row_i + dy);
+          for (int dx = -2; dx <= 2; ++dx) {
+            const size_t xx = static_cast<size_t>(static_cast<int>(col) + dx);
+            const size_t nidx = yy * width + xx;
+            const float w = 1.0f / static_cast<float>(1 + std::abs(dx) + std::abs(dy));
+
+            const float rv = src_r[nidx];
+            const float gv = src_g[nidx];
+            const float bv = src_b[nidx];
+            if (rv > 0.0f) {
+              r_acc += rv * w;
+              r_w += w;
+            }
+            if (gv > 0.0f) {
+              g_acc += gv * w;
+              g_w += w;
+            }
+            if (bv > 0.0f) {
+              b_acc += bv * w;
+              b_w += w;
+            }
+          }
+        }
+
+        if (g_w <= 1e-6f || (r_w <= 1e-6f && b_w <= 1e-6f)) {
+          continue;
+        }
+
+        const float g_est = g_acc / g_w;
+        const float r_est = (r_w > 1e-6f) ? (r_acc / r_w) : g_est;
+        const float b_est = (b_w > 1e-6f) ? (b_acc / b_w) : g_est;
+
+        // Purple fringe candidate: magenta-dominant, high-luminance transition.
+        const float purple_excess = 0.5f * (r_est + b_est) - g_est;
+        if (purple_excess <= sat_thr * 0.015f) {
+          continue;
+        }
+        if (r_est < g_est * 1.02f || b_est < g_est * 1.02f) {
+          continue;
+        }
+
+        const float edge_weight =
+            std::clamp((local_max - local_min) / std::max(1.0f, sat_thr * 0.20f),
+                       0.0f, 1.0f);
+        const float purple_weight =
+            std::clamp(purple_excess / std::max(1.0f, sat_thr * 0.09f), 0.0f, 1.0f);
+        const float highlight_weight =
+            std::clamp((local_max - sat_thr) / std::max(1.0f, sat_thr * 0.10f),
+                       0.0f, 1.0f);
+        const float alpha = std::clamp(
+            strength * (0.35f + 0.65f * highlight_weight) * edge_weight * purple_weight,
+            0.0f, 0.95f);
+        if (alpha < 0.02f) {
+          continue;
+        }
+
+        uint32_t native = cfa_channel_at(row, col);
+        if (native == 3) {
+          native = 1;
+        }
+
+        const float rb_target =
+            (local_max > white_ref * 0.97f) ? (g_est * 1.00f) : (g_est * 1.02f);
+        if (native == 0) {
+          const float base = src_r[idx];
+          const float clipped = std::min(base, rb_target);
+          dst_r[idx] = base * (1.0f - alpha) + clipped * alpha;
+          rb_updates++;
+        } else if (native == 2) {
+          const float base = src_b[idx];
+          const float clipped = std::min(base, rb_target);
+          dst_b[idx] = base * (1.0f - alpha) + clipped * alpha;
+          rb_updates++;
+        } else if (native == 1) {
+          // Green compensation improves LoCA-like fringe without global desaturation.
+          const float g_target = std::min(local_max, 0.5f * (r_est + b_est));
+          if (g_target > src_g[idx] * 1.05f) {
+            const float g_alpha = std::min(0.45f, alpha * 0.65f);
+            dst_g[idx] = src_g[idx] * (1.0f - g_alpha) + g_target * g_alpha;
+            g_updates++;
+          }
+        }
+      }
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+      image[i][0] = std::max(0.0f, dst_r[i]);
+      image[i][1] = std::max(0.0f, dst_g[i]);
+      image[i][2] = std::max(0.0f, dst_b[i]);
+    }
+
+    std::cout << "✅ Highlight fringe suppression (pre-demosaic): RB="
+              << rb_updates << " G=" << g_updates << " (strength=" << strength
+              << ")" << std::endl;
+  }
+
   static float bilinear_sample_u16(const std::vector<ushort> &plane, size_t w,
                                    size_t h, float y, float x) {
     if (w < 2 || h < 2 || x < 0.0f || y < 0.0f || x >= static_cast<float>(w - 1) ||
@@ -624,6 +798,96 @@ public:
 
     mean_grad = static_cast<float>(
         grad_count ? (grad_acc / static_cast<double>(grad_count)) : 0.0);
+  }
+
+  void refine_highlight_ca_edges(ImageBuffer &raw_buffer, uint32_t channel,
+                                 const std::vector<float> &guide,
+                                 const std::vector<float> &guide_grad,
+                                 float max_guide, float mean_grad) {
+    if (raw_buffer.width < 5 || raw_buffer.height < 5) {
+      return;
+    }
+
+    const size_t size = raw_buffer.width * raw_buffer.height;
+    std::vector<ushort> src(size);
+    for (size_t i = 0; i < size; ++i) {
+      src[i] = raw_buffer.image[i][channel];
+    }
+
+    const float sat_thr = max_guide * 0.90f;
+    const float edge_thr = std::max(2.0f, mean_grad * 1.1f);
+
+    static const float kShift[][2] = {
+        {0.0f, 0.0f},   {-0.75f, 0.0f}, {0.75f, 0.0f},  {0.0f, -0.75f},
+        {0.0f, 0.75f},  {-0.5f, -0.5f}, {0.5f, -0.5f},  {-0.5f, 0.5f},
+        {0.5f, 0.5f},   {-1.0f, 0.0f},  {1.0f, 0.0f},   {0.0f, -1.0f},
+        {0.0f, 1.0f},
+    };
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int row_i = 1; row_i < static_cast<int>(raw_buffer.height) - 1; ++row_i) {
+      const size_t row = static_cast<size_t>(row_i);
+      for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
+        const size_t idx = row * raw_buffer.width + col;
+        const float g = guide[idx];
+        if (g < sat_thr || guide_grad[idx] < edge_thr) {
+          continue;
+        }
+
+        double best_cost = std::numeric_limits<double>::infinity();
+        float best_value = static_cast<float>(src[idx]);
+
+        for (const auto &s : kShift) {
+          const float y = static_cast<float>(row) + s[0];
+          const float x = static_cast<float>(col) + s[1];
+          const float v = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                              y, x);
+          if (v < 0.0f) {
+            continue;
+          }
+
+          const float vp = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y, x + 1.0f);
+          const float vm = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y, x - 1.0f);
+          const float hp = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y + 1.0f, x);
+          const float hm = bilinear_sample_u16(src, raw_buffer.width, raw_buffer.height,
+                                               y - 1.0f, x);
+
+          const double inten = std::fabs(v - g) / std::max(64.0f, g);
+          double grad = 0.0;
+          if (vp >= 0.0f && vm >= 0.0f && hp >= 0.0f && hm >= 0.0f) {
+            const float cgx = vp - vm;
+            const float cgy = hp - hm;
+            const float ggx = guide[idx + 1] - guide[idx - 1];
+            const float ggy =
+                guide[idx + raw_buffer.width] - guide[idx - raw_buffer.width];
+            grad = (std::fabs(cgx - ggx) + std::fabs(cgy - ggy)) /
+                   std::max(32.0f, std::fabs(ggx) + std::fabs(ggy));
+          }
+
+          const double cost =
+              0.6 * huber_loss(inten, 0.20) + 0.4 * huber_loss(grad, 0.20);
+          if (cost < best_cost) {
+            best_cost = cost;
+            best_value = v;
+          }
+        }
+
+        const float hi_w = std::clamp((g - sat_thr) / std::max(1.0f, max_guide - sat_thr),
+                                      0.0f, 1.0f);
+        const float edge_w =
+            std::clamp(guide_grad[idx] / std::max(1.0f, edge_thr * 2.0f), 0.0f, 1.0f);
+        const float alpha = 0.15f + 0.65f * hi_w * edge_w;
+        const float merged =
+            (1.0f - alpha) * static_cast<float>(src[idx]) + alpha * best_value;
+        raw_buffer.image[idx][channel] =
+            static_cast<ushort>(std::clamp(merged, 0.0f, 65535.0f));
+      }
+    }
   }
 
   float estimate_ca_scale(const ImageBuffer &raw_buffer, uint32_t target_channel,
@@ -1380,6 +1644,12 @@ public:
                 << " B=" << auto_blue << ", map=" << ca_map_w << "x" << ca_map_h
                 << std::endl;
 
+      // Highlight-boundary residual refinement:
+      // complements block-based lateral CA correction for severe clipped edges.
+      refine_highlight_ca_edges(raw_buffer, 0, guide, guide_grad, max_guide,
+                                mean_grad);
+      refine_highlight_ca_edges(raw_buffer, 2, guide, guide_grad, max_guide,
+                                mean_grad);
     }
 
     if ((imgdata.params.aber[0] != 1.0f || imgdata.params.aber[2] != 1.0f) &&
@@ -1813,6 +2083,161 @@ public:
     return max_val;
   }
 
+  void box_filter_normalized(const std::vector<float> &src,
+                             std::vector<float> &dst,
+                             std::vector<float> &tmp,
+                             size_t width, size_t height, int radius) {
+    if (src.size() != width * height || dst.size() != src.size() ||
+        tmp.size() != src.size() || width == 0 || height == 0) {
+      return;
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t y = 0; y < height; ++y) {
+      const size_t row = y * width;
+      float sum = 0.0f;
+      const size_t first_right = std::min(width - 1, static_cast<size_t>(radius));
+      for (size_t x = 0; x <= first_right; ++x) {
+        sum += src[row + x];
+      }
+
+      for (size_t x = 0; x < width; ++x) {
+        const size_t left = x > static_cast<size_t>(radius)
+                                ? x - static_cast<size_t>(radius)
+                                : 0;
+        const size_t right = std::min(width - 1, x + static_cast<size_t>(radius));
+        tmp[row + x] = sum / static_cast<float>(right - left + 1);
+
+        const size_t remove_x = x >= static_cast<size_t>(radius)
+                                    ? x - static_cast<size_t>(radius)
+                                    : width;
+        const size_t add_x = x + static_cast<size_t>(radius) + 1;
+        if (remove_x < width) {
+          sum -= src[row + remove_x];
+        }
+        if (add_x < width) {
+          sum += src[row + add_x];
+        }
+      }
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t x = 0; x < width; ++x) {
+      float sum = 0.0f;
+      const size_t first_bottom = std::min(height - 1, static_cast<size_t>(radius));
+      for (size_t y = 0; y <= first_bottom; ++y) {
+        sum += tmp[y * width + x];
+      }
+
+      for (size_t y = 0; y < height; ++y) {
+        const size_t top = y > static_cast<size_t>(radius)
+                               ? y - static_cast<size_t>(radius)
+                               : 0;
+        const size_t bottom = std::min(height - 1, y + static_cast<size_t>(radius));
+        dst[y * width + x] = sum / static_cast<float>(bottom - top + 1);
+
+        const size_t remove_y = y >= static_cast<size_t>(radius)
+                                    ? y - static_cast<size_t>(radius)
+                                    : height;
+        const size_t add_y = y + static_cast<size_t>(radius) + 1;
+        if (remove_y < height) {
+          sum -= tmp[remove_y * width + x];
+        }
+        if (add_y < height) {
+          sum += tmp[add_y * width + x];
+        }
+      }
+    }
+  }
+
+  float aces_tone_map_scalar(float x) const {
+    static constexpr float a = 2.51f;
+    static constexpr float b = 0.03f;
+    static constexpr float c = 2.43f;
+    static constexpr float d = 0.59f;
+    static constexpr float e = 0.14f;
+    return (x * (a * x + b)) / (x * (c * x + d) + e);
+  }
+
+  void apply_detail_preserving_tonemap(ImageBufferFloat &rgb_buffer) {
+    if (!rgb_buffer.is_valid() || rgb_buffer.channels != 3) {
+      return;
+    }
+
+    const size_t width = rgb_buffer.width;
+    const size_t height = rgb_buffer.height;
+    const size_t size = width * height;
+    if (size == 0) {
+      return;
+    }
+
+    constexpr int radius = 12;
+    constexpr float eps = 0.0025f;
+    constexpr float edge0 = 0.55f;
+    constexpr float edge1 = 0.90f;
+
+    std::vector<float> guide(size);
+    std::vector<float> mean(size);
+    std::vector<float> work(size);
+    std::vector<float> b(size);
+    std::vector<float> tmp(size);
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t i = 0; i < size; ++i) {
+      const float *p = rgb_buffer.image[i];
+      guide[i] = std::max(0.0f, std::max(p[0], std::max(p[1], p[2])));
+      work[i] = guide[i] * guide[i];
+    }
+
+    box_filter_normalized(guide, mean, tmp, width, height, radius);
+    box_filter_normalized(work, work, tmp, width, height, radius);
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t i = 0; i < size; ++i) {
+      const float var = std::max(0.0f, work[i] - mean[i] * mean[i]);
+      const float a = var / (var + eps);
+      work[i] = a;
+      b[i] = mean[i] * (1.0f - a);
+    }
+
+    box_filter_normalized(work, work, tmp, width, height, radius);
+    box_filter_normalized(b, b, tmp, width, height, radius);
+
+    long long mapped_pixels = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : mapped_pixels)
+#endif
+    for (size_t i = 0; i < size; ++i) {
+      const float base = std::max(1e-6f, work[i] * guide[i] + b[i]);
+      const float mapped_base = aces_tone_map_scalar(base);
+      float gain = std::clamp(mapped_base / base, 0.0f, 1.0f);
+
+      float w = (base - edge0) / (edge1 - edge0);
+      w = std::clamp(w, 0.0f, 1.0f);
+      w = w * w * (3.0f - 2.0f * w);
+      if (w <= 0.0f) {
+        continue;
+      }
+
+      gain = 1.0f + (gain - 1.0f) * w;
+      rgb_buffer.image[i][0] *= gain;
+      rgb_buffer.image[i][1] *= gain;
+      rgb_buffer.image[i][2] *= gain;
+      mapped_pixels++;
+    }
+
+    std::cout << "✅ Detail-preserving tone map completed. Mapped: "
+              << mapped_pixels << " pixels." << std::endl;
+  }
+
   //===============================================================
   // Post-demosaic highlight-edge purple defringe
   //===============================================================
@@ -2029,6 +2454,11 @@ public:
       return false;
     }
 
+    if (params.highlight_fringe_suppression) {
+      suppress_highlight_boundary_fringe(rgb_buffer2, maximum_result.maximum,
+                                         params.highlight_fringe_strength);
+    }
+
     // Get camera-specific color transformation matrix
     // LibRaw の identify() は adobe_coeff に normalized_model を渡す。maker_index も同一のルールで使う。
     const char *ccm_model =
@@ -2094,17 +2524,24 @@ public:
       recover_highlights(rgb_buffer, threshold); // * 0.75f);
     }
 
-    // Tone mapping
+    // Tone mapping / highlight detail recovery
     float target_contrast = 0.06f;
-    if (params.highlight_mode > 4) {
+    if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
-    } else {
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+    } else if (params.highlight_mode == 5) {
+      apply_detail_preserving_tonemap(rgb_buffer);
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+    } else if (params.highlight_mode > 3) {
       target_contrast *= 2.f;
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     }
 
-    // Highlight detail recovery
-    if (params.highlight_mode > 3) {
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+    // Residual suppression in linear RGB: targets purple fringe that survives
+    // highlight reconstruction and micro-contrast.
+    if (params.highlight_fringe_suppression) {
+      suppress_highlight_purple_fringe_post(rgb_buffer,
+                                            params.highlight_fringe_strength);
     }
 
     // Fuji SuperCCD honeycomb sensors require an additional geometric
@@ -2985,6 +3422,8 @@ public:
 #ifdef __arm64__
   void set_processing_params(const ProcessingParams &params) {
     current_params = params;
+    current_params.highlight_fringe_strength =
+        std::clamp(current_params.highlight_fringe_strength, 0.0f, 1.0f);
 
     // Map all parameters to LibRaw
 
@@ -3219,6 +3658,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.use_gpu_acceleration = p.second;
     else if (p.first == "preprocess")
       params.preprocess = p.second;
+    else if (p.first == "highlight_fringe_suppression")
+      params.highlight_fringe_suppression = p.second;
   }
 
   for (const auto &p : int_params) {
@@ -3266,6 +3707,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.chromatic_aberration_red = p.second;
     else if (p.first == "chromatic_aberration_blue")
       params.chromatic_aberration_blue = p.second;
+    else if (p.first == "highlight_fringe_strength")
+      params.highlight_fringe_strength = p.second;
   }
 
   for (const auto &p : string_params) {
@@ -3526,7 +3969,8 @@ ProcessingParams create_params_from_rawpy_args(
     const std::string &bad_pixels_path,
 
     // LibRaw Enhanced extensions
-    bool use_gpu_acceleration, bool preprocess) {
+    bool use_gpu_acceleration, bool preprocess,
+    bool highlight_fringe_suppression, float highlight_fringe_strength) {
   ProcessingParams params;
 
   // Map all parameters to ProcessingParams structure
@@ -3590,6 +4034,8 @@ ProcessingParams create_params_from_rawpy_args(
   // Metal-specific settings
   params.use_gpu_acceleration = use_gpu_acceleration;
   params.preprocess = preprocess;
+  params.highlight_fringe_suppression = highlight_fringe_suppression;
+  params.highlight_fringe_strength = highlight_fringe_strength;
 
   return params;
 }
