@@ -2083,45 +2083,159 @@ public:
     return max_val;
   }
 
-  //===============================================================
-  // Highlight-only blend of the tone-mapped result
-  //===============================================================
-  void blend_highlight_tonemap(ImageBufferFloat &base_buffer,
-                               const ImageBufferFloat &tonemapped_buffer) {
-    if (!base_buffer.is_valid() || !tonemapped_buffer.is_valid() ||
-        base_buffer.width != tonemapped_buffer.width ||
-        base_buffer.height != tonemapped_buffer.height ||
-        base_buffer.channels != 3 || tonemapped_buffer.channels != 3) {
+  void box_filter_normalized(const std::vector<float> &src,
+                             std::vector<float> &dst,
+                             std::vector<float> &tmp,
+                             size_t width, size_t height, int radius) {
+    if (src.size() != width * height || dst.size() != src.size() ||
+        tmp.size() != src.size() || width == 0 || height == 0) {
       return;
     }
 
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t y = 0; y < height; ++y) {
+      const size_t row = y * width;
+      float sum = 0.0f;
+      const size_t first_right = std::min(width - 1, static_cast<size_t>(radius));
+      for (size_t x = 0; x <= first_right; ++x) {
+        sum += src[row + x];
+      }
+
+      for (size_t x = 0; x < width; ++x) {
+        const size_t left = x > static_cast<size_t>(radius)
+                                ? x - static_cast<size_t>(radius)
+                                : 0;
+        const size_t right = std::min(width - 1, x + static_cast<size_t>(radius));
+        tmp[row + x] = sum / static_cast<float>(right - left + 1);
+
+        const size_t remove_x = x >= static_cast<size_t>(radius)
+                                    ? x - static_cast<size_t>(radius)
+                                    : width;
+        const size_t add_x = x + static_cast<size_t>(radius) + 1;
+        if (remove_x < width) {
+          sum -= src[row + remove_x];
+        }
+        if (add_x < width) {
+          sum += src[row + add_x];
+        }
+      }
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t x = 0; x < width; ++x) {
+      float sum = 0.0f;
+      const size_t first_bottom = std::min(height - 1, static_cast<size_t>(radius));
+      for (size_t y = 0; y <= first_bottom; ++y) {
+        sum += tmp[y * width + x];
+      }
+
+      for (size_t y = 0; y < height; ++y) {
+        const size_t top = y > static_cast<size_t>(radius)
+                               ? y - static_cast<size_t>(radius)
+                               : 0;
+        const size_t bottom = std::min(height - 1, y + static_cast<size_t>(radius));
+        dst[y * width + x] = sum / static_cast<float>(bottom - top + 1);
+
+        const size_t remove_y = y >= static_cast<size_t>(radius)
+                                    ? y - static_cast<size_t>(radius)
+                                    : height;
+        const size_t add_y = y + static_cast<size_t>(radius) + 1;
+        if (remove_y < height) {
+          sum -= tmp[remove_y * width + x];
+        }
+        if (add_y < height) {
+          sum += tmp[add_y * width + x];
+        }
+      }
+    }
+  }
+
+  float aces_tone_map_scalar(float x) const {
+    static constexpr float a = 2.51f;
+    static constexpr float b = 0.03f;
+    static constexpr float c = 2.43f;
+    static constexpr float d = 0.59f;
+    static constexpr float e = 0.14f;
+    return (x * (a * x + b)) / (x * (c * x + d) + e);
+  }
+
+  void apply_detail_preserving_tonemap(ImageBufferFloat &rgb_buffer) {
+    if (!rgb_buffer.is_valid() || rgb_buffer.channels != 3) {
+      return;
+    }
+
+    const size_t width = rgb_buffer.width;
+    const size_t height = rgb_buffer.height;
+    const size_t size = width * height;
+    if (size == 0) {
+      return;
+    }
+
+    constexpr int radius = 12;
+    constexpr float eps = 0.0025f;
     constexpr float edge0 = 0.55f;
     constexpr float edge1 = 0.90f;
-    const size_t size = base_buffer.width * base_buffer.height;
 
-    long long blended = 0;
+    std::vector<float> guide(size);
+    std::vector<float> mean(size);
+    std::vector<float> work(size);
+    std::vector<float> b(size);
+    std::vector<float> tmp(size);
+
 #ifdef _OPENMP
-#pragma omp parallel for reduction(+ : blended)
+#pragma omp parallel for
 #endif
-    for (size_t idx = 0; idx < size; ++idx) {
-      float *base = base_buffer.image[idx];
-      const float *tm = tonemapped_buffer.image[idx];
-      const float maxc = std::max(base[0], std::max(base[1], base[2]));
-      float w = (maxc - edge0) / (edge1 - edge0);
+    for (size_t i = 0; i < size; ++i) {
+      const float *p = rgb_buffer.image[i];
+      guide[i] = std::max(0.0f, std::max(p[0], std::max(p[1], p[2])));
+      work[i] = guide[i] * guide[i];
+    }
+
+    box_filter_normalized(guide, mean, tmp, width, height, radius);
+    box_filter_normalized(work, work, tmp, width, height, radius);
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (size_t i = 0; i < size; ++i) {
+      const float var = std::max(0.0f, work[i] - mean[i] * mean[i]);
+      const float a = var / (var + eps);
+      work[i] = a;
+      b[i] = mean[i] * (1.0f - a);
+    }
+
+    box_filter_normalized(work, work, tmp, width, height, radius);
+    box_filter_normalized(b, b, tmp, width, height, radius);
+
+    long long mapped_pixels = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : mapped_pixels)
+#endif
+    for (size_t i = 0; i < size; ++i) {
+      const float base = std::max(1e-6f, work[i] * guide[i] + b[i]);
+      const float mapped_base = aces_tone_map_scalar(base);
+      float gain = std::clamp(mapped_base / base, 0.0f, 1.0f);
+
+      float w = (base - edge0) / (edge1 - edge0);
       w = std::clamp(w, 0.0f, 1.0f);
       w = w * w * (3.0f - 2.0f * w);
       if (w <= 0.0f) {
         continue;
       }
 
-      base[0] = base[0] * (1.0f - w) + tm[0] * w;
-      base[1] = base[1] * (1.0f - w) + tm[1] * w;
-      base[2] = base[2] * (1.0f - w) + tm[2] * w;
-      blended++;
+      gain = 1.0f + (gain - 1.0f) * w;
+      rgb_buffer.image[i][0] *= gain;
+      rgb_buffer.image[i][1] *= gain;
+      rgb_buffer.image[i][2] *= gain;
+      mapped_pixels++;
     }
 
-    std::cout << "✅ Highlight tone-map blend completed. Blended: "
-              << blended << " pixels." << std::endl;
+    std::cout << "✅ Detail-preserving tone map completed. Mapped: "
+              << mapped_pixels << " pixels." << std::endl;
   }
 
   //===============================================================
@@ -2416,17 +2530,7 @@ public:
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     } else if (params.highlight_mode == 5) {
-      std::vector<float> tone_mapped_data(rgb_buffer.width * rgb_buffer.height *
-                                          rgb_buffer.channels);
-      ImageBufferFloat tone_mapped_buffer = {
-          reinterpret_cast<float(*)[3]>(tone_mapped_data.data()),
-          rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
-      std::memcpy(tone_mapped_buffer.image, rgb_buffer.image,
-                  tone_mapped_data.size() * sizeof(float));
-
-      if (accelerator->tone_mapping(tone_mapped_buffer, tone_mapped_buffer, 1.f)) {
-        blend_highlight_tonemap(rgb_buffer, tone_mapped_buffer);
-      }
+      apply_detail_preserving_tonemap(rgb_buffer);
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     } else if (params.highlight_mode > 3) {
       target_contrast *= 2.f;
