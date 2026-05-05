@@ -2084,6 +2084,43 @@ public:
   }
 
   //===============================================================
+  // RGB-ratio preserving highlight soft knee
+  //===============================================================
+  void apply_highlight_soft_knee(ImageBufferFloat &rgb_buffer) {
+    if (!rgb_buffer.is_valid()) {
+      return;
+    }
+
+    constexpr float knee = 0.92f;
+    constexpr float shoulder = 1.0f - knee;
+    const size_t size = rgb_buffer.width * rgb_buffer.height;
+    float(*image)[3] = rgb_buffer.image;
+
+    long long compressed = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : compressed)
+#endif
+    for (size_t idx = 0; idx < size; ++idx) {
+      float *p = image[idx];
+      const float maxc = std::max(p[0], std::max(p[1], p[2]));
+      if (maxc <= knee) {
+        continue;
+      }
+
+      const float x = maxc - knee;
+      const float mapped = knee + x / (1.0f + x / shoulder);
+      const float scale = mapped / std::max(maxc, 1e-6f);
+      p[0] *= scale;
+      p[1] *= scale;
+      p[2] *= scale;
+      compressed++;
+    }
+
+    std::cout << "✅ Highlight soft-knee completed. Compressed: "
+              << compressed << " pixels." << std::endl;
+  }
+
+  //===============================================================
   // Post-demosaic highlight-edge purple defringe
   //===============================================================
   void suppress_highlight_purple_fringe_post(ImageBufferFloat &rgb_buffer,
@@ -2371,15 +2408,21 @@ public:
 
     // Tone mapping
     float target_contrast = 0.06f;
-    if (params.highlight_mode > 4) {
+    if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
-    } else {
+    } else if (params.highlight_mode < 5) {
       target_contrast *= 2.f;
     }
 
     // Highlight detail recovery
     if (params.highlight_mode > 3) {
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+    }
+
+    // Mode 5 keeps the legacy ACES tone map disabled and only rolls off
+    // recovered/strengthened highlights with a shared RGB scale.
+    if (params.highlight_mode == 5) {
+      apply_highlight_soft_knee(rgb_buffer);
     }
 
     // Residual suppression in linear RGB: targets purple fringe that survives
