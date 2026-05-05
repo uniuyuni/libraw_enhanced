@@ -2216,6 +2216,9 @@ public:
 #pragma omp parallel for reduction(+ : mapped_pixels)
 #endif
     for (size_t i = 0; i < size; ++i) {
+      const float src_r = rgb_buffer.image[i][0];
+      const float src_g = rgb_buffer.image[i][1];
+      const float src_b = rgb_buffer.image[i][2];
       const float base = std::max(1e-6f, work[i] * guide[i] + b[i]);
       const float mapped_base = aces_tone_map_scalar(base);
       float gain = std::clamp(mapped_base / base, 0.0f, 1.0f);
@@ -2231,6 +2234,30 @@ public:
       rgb_buffer.image[i][0] *= gain;
       rgb_buffer.image[i][1] *= gain;
       rgb_buffer.image[i][2] *= gain;
+
+      float *p = rgb_buffer.image[i];
+      const float src_mx = std::max(src_r, std::max(src_g, src_b));
+      const float src_mn = std::min(src_r, std::min(src_g, src_b));
+      float chroma_w = ((src_mx - src_mn) - 0.025f) / 0.135f;
+      chroma_w = std::clamp(chroma_w, 0.0f, 1.0f);
+      chroma_w = chroma_w * chroma_w * (3.0f - 2.0f * chroma_w);
+      const float color_w = 0.55f * w * chroma_w;
+      if (color_w > 0.0f) {
+        const float aces_r = aces_tone_map_scalar(src_r);
+        const float aces_g = aces_tone_map_scalar(src_g);
+        const float aces_b = aces_tone_map_scalar(src_b);
+        const float aces_l =
+            std::max(1e-6f, std::max(aces_r, std::max(aces_g, aces_b)));
+        const float out_l = std::max(1e-6f, std::max(p[0], std::max(p[1], p[2])));
+
+        const float target_r = out_l * (aces_r / aces_l);
+        const float target_g = out_l * (aces_g / aces_l);
+        const float target_b = out_l * (aces_b / aces_l);
+
+        p[0] = p[0] * (1.0f - color_w) + target_r * color_w;
+        p[1] = p[1] * (1.0f - color_w) + target_g * color_w;
+        p[2] = p[2] * (1.0f - color_w) + target_b * color_w;
+      }
       mapped_pixels++;
     }
 
