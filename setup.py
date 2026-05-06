@@ -287,7 +287,6 @@ def create_extension():
         'core/python_bindings.cpp',
         'core/libraw_wrapper.cpp',
         'core/camera_matrices.cpp',
-        'external/LibRaw-master/src/metadata/identify.cpp',
     ]
     
     # Apple プラットフォームでのみMetal統合ファイルを追加
@@ -339,11 +338,18 @@ def create_extension():
         
         # Objective-C++ compilation flags (handled by CustomBuildExt for .mm files)
         extra_compile_args.extend(['-fmodules'])
-        
-        # OpenMPサポートを追加
+
+        # OpenMPサポートを追加（オプショナル）
         if libomp_include and libomp_lib:
             extra_compile_args.extend(['-Xpreprocessor', '-fopenmp'])
-            extra_link_args.extend(['-lomp'])
+            # libomp パスが有効な場合のみリンク
+            if os.path.exists(os.path.join(libomp_lib, 'libomp.dylib')) or \
+               os.path.exists(os.path.join(libomp_lib, 'libomp.a')):
+                extra_link_args.extend(['-lomp'])
+            else:
+                print(f"Warning: libomp library not found at {libomp_lib}, OpenMP may not work")
+        else:
+            print("Warning: libomp not configured, building without OpenMP support")
         
         # デバッグ情報（デバッグビルド時）- O3は維持
         if os.environ.get('DEBUG'):
