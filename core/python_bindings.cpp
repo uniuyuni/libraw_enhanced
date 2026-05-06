@@ -310,6 +310,9 @@ PYBIND11_MODULE(_core, m) {
            })
       .def("set_gpu_acceleration", &LibRawWrapper::set_gpu_acceleration)
       .def("get_device_info", &LibRawWrapper::get_device_info)
+      .def("get_output_geometry", &LibRawWrapper::get_output_geometry_dict,
+           py::arg("half_size") = false,
+           "Get expected output geometry after sensor-specific transforms.")
       // Standalone numpy image processing
       .def("get_threshold", &LibRawWrapper::get_threshold,
            "Get threshold value = maximum / data_maximum (computed from "
