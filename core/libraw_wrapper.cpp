@@ -2299,11 +2299,6 @@ public:
       return false;
     }
 
-    if (params.highlight_fringe_suppression) {
-      suppress_highlight_boundary_fringe(rgb_buffer2, maximum_result.maximum,
-                                         params.highlight_fringe_strength);
-    }
-
     // Get camera-specific color transformation matrix
     // LibRaw の identify() は adobe_coeff に normalized_model を渡す。maker_index も同一のルールで使う。
     const char *ccm_model =
@@ -2380,13 +2375,6 @@ public:
     // Highlight detail recovery
     if (params.highlight_mode > 3) {
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
-    }
-
-    // Residual suppression in linear RGB: targets purple fringe that survives
-    // highlight reconstruction and micro-contrast.
-    if (params.highlight_fringe_suppression) {
-      suppress_highlight_purple_fringe_post(rgb_buffer,
-                                            params.highlight_fringe_strength);
     }
 
     // Fuji SuperCCD honeycomb sensors require an additional geometric
@@ -3267,8 +3255,6 @@ public:
 #ifdef __arm64__
   void set_processing_params(const ProcessingParams &params) {
     current_params = params;
-    current_params.highlight_fringe_strength =
-        std::clamp(current_params.highlight_fringe_strength, 0.0f, 1.0f);
 
     // Map all parameters to LibRaw
 
@@ -3503,8 +3489,6 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.use_gpu_acceleration = p.second;
     else if (p.first == "preprocess")
       params.preprocess = p.second;
-    else if (p.first == "highlight_fringe_suppression")
-      params.highlight_fringe_suppression = p.second;
   }
 
   for (const auto &p : int_params) {
@@ -3552,8 +3536,6 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.chromatic_aberration_red = p.second;
     else if (p.first == "chromatic_aberration_blue")
       params.chromatic_aberration_blue = p.second;
-    else if (p.first == "highlight_fringe_strength")
-      params.highlight_fringe_strength = p.second;
   }
 
   for (const auto &p : string_params) {
@@ -3814,8 +3796,7 @@ ProcessingParams create_params_from_rawpy_args(
     const std::string &bad_pixels_path,
 
     // LibRaw Enhanced extensions
-    bool use_gpu_acceleration, bool preprocess,
-    bool highlight_fringe_suppression, float highlight_fringe_strength) {
+    bool use_gpu_acceleration, bool preprocess) {
   ProcessingParams params;
 
   // Map all parameters to ProcessingParams structure
@@ -3879,8 +3860,6 @@ ProcessingParams create_params_from_rawpy_args(
   // Metal-specific settings
   params.use_gpu_acceleration = use_gpu_acceleration;
   params.preprocess = preprocess;
-  params.highlight_fringe_suppression = highlight_fringe_suppression;
-  params.highlight_fringe_strength = highlight_fringe_strength;
 
   return params;
 }

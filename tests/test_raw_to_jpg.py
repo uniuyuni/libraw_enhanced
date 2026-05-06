@@ -98,7 +98,6 @@ def process_raw_file(raw_path, output_dir):
                     "use_gpu_acceleration": True,
                     "output_color": lre.ColorSpace.WideGamutRGB,
                     "highlight_mode": 6,
-                    #"highlight_fringe_suppression": False,
                 }
             },
         ]
