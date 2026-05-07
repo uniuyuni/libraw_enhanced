@@ -58,7 +58,8 @@ public:
     
     ~Impl() = default;
     
-    ColorTransformMatrix compute_transform(const char* make, const char* model, int output_color_space) {
+    ColorTransformMatrix compute_transform(unsigned preferred_maker_idx, const char* make, const char* model,
+                                           int output_color_space) {
         ColorTransformMatrix result;
 
         if (output_color_space < 0 || output_color_space > 8) {
@@ -66,8 +67,11 @@ public:
         }
 
         try {
-            // Get LibRaw make index
-            unsigned make_idx = get_libraw_make_index(make);
+            // identify() と同じ maker_index を優先（LibRaw の adobe_coeff はこの index を使う）
+            unsigned make_idx = preferred_maker_idx;
+            if (make_idx == LIBRAW_CAMERAMAKER_Unknown) {
+                make_idx = get_libraw_make_index(make);
+            }
             
             // Setup minimal LibRaw instance state for adobe_coeff to work
             libraw_instance.imgdata.idata.colors = 3; // RGB
@@ -359,7 +363,14 @@ CameraMatrixManager::~CameraMatrixManager() = default;
 ColorTransformMatrix CameraMatrixManager::get_color_transform(const char* camera_make,
                                                              const char* camera_model,
                                                              int output_color_space) {
-    return pimpl_->compute_transform(camera_make, camera_model, output_color_space);
+    return pimpl_->compute_transform(LIBRAW_CAMERAMAKER_Unknown, camera_make, camera_model, output_color_space);
+}
+
+ColorTransformMatrix CameraMatrixManager::get_color_transform(unsigned maker_index,
+                                                             const char* camera_make,
+                                                             const char* camera_model,
+                                                             int output_color_space) {
+    return pimpl_->compute_transform(maker_index, camera_make, camera_model, output_color_space);
 }
 
 bool CameraMatrixManager::is_camera_supported(const char* camera_make, const char* camera_model) {
@@ -384,6 +395,12 @@ ColorTransformMatrix CameraMatrixManager::get_fallback_transform(int output_colo
 ColorTransformMatrix compute_camera_transform(const char* make, const char* model, int color_space) {
     static CameraMatrixManager manager; // Singleton instance
     return manager.get_color_transform(make, model, color_space);
+}
+
+ColorTransformMatrix compute_camera_transform(unsigned maker_index, const char* make, const char* model,
+                                              int color_space) {
+    static CameraMatrixManager manager;
+    return manager.get_color_transform(maker_index, make, model, color_space);
 }
 
 } // namespace libraw_enhanced

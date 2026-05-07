@@ -42,6 +42,11 @@ public:
     ColorTransformMatrix get_color_transform(const char* camera_make,
                                            const char* camera_model,
                                            int output_color_space = 1);  // 1=sRGB
+    /// LibRaw の identify() が設定した maker_index と同一のルールで照合する（文字列逆引きより優先）
+    ColorTransformMatrix get_color_transform(unsigned maker_index,
+                                           const char* camera_make,
+                                           const char* camera_model,
+                                           int output_color_space = 1);
     
     // Check if camera is supported in LibRaw database
     bool is_camera_supported(const char* camera_make, const char* camera_model);
@@ -56,5 +61,7 @@ private:
 
 // Convenience functions for common operations
 ColorTransformMatrix compute_camera_transform(const char* make, const char* model, int color_space = 1);
+ColorTransformMatrix compute_camera_transform(unsigned maker_index, const char* make, const char* model,
+                                              int color_space = 1);
 
 } // namespace libraw_enhanced

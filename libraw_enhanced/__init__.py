@@ -11,6 +11,53 @@ __author__ = "LibRaw Enhanced Team"
 
 import warnings
 import platform
+import os
+
+# --- Runtime dependency preload (macOS / OpenMP) -----------------------------
+# The native extension links against OpenMP symbols (___kmpc_*). In some launch
+# contexts (notably spawned child processes), libomp is not yet in the global
+# symbol table and importing `_core` fails with:
+#   symbol not found in flat namespace '___kmpc_barrier'
+# Preloading libomp with RTLD_GLOBAL avoids that.
+def _preload_libomp_if_present():
+    try:
+        import ctypes
+        import ctypes.util
+    except Exception:
+        return
+
+    # Prefer explicit path inside pixi/conda prefix.
+    candidates = []
+    prefix = os.environ.get("CONDA_PREFIX") or os.environ.get("VIRTUAL_ENV") or os.environ.get("PREFIX")
+    if prefix:
+        candidates.append(os.path.join(prefix, "lib", "libomp.dylib"))
+
+    # Fallback: sys.prefix (pixi env prefix).
+    try:
+        import sys
+        candidates.append(os.path.join(sys.prefix, "lib", "libomp.dylib"))
+    except Exception:
+        pass
+
+    # Fallback: locate by name.
+    try:
+        found = ctypes.util.find_library("omp")
+        if found:
+            candidates.append(found)
+    except Exception:
+        pass
+
+    # Load first existing candidate.
+    for path in candidates:
+        try:
+            if path and os.path.exists(path):
+                ctypes.CDLL(path, mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+                return
+        except Exception:
+            continue
+
+_preload_libomp_if_present()
+del _preload_libomp_if_present
 
 # Core extension import with fallback
 try:

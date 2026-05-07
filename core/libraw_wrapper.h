@@ -188,6 +188,7 @@ ProcessingParams create_params_from_rawpy_args(
 
 // Platform detection functions
 bool is_apple_silicon();
+bool is_available();
 std::vector<std::string> get_device_list();
 
 #endif
