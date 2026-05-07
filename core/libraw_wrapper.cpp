@@ -2140,12 +2140,15 @@ public:
     float target_contrast = 0.06f;
     if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
-    } else if (params.highlight_mode == 5) {
+      
+    } else if (params.highlight_mode > 4) {
       apply_detail_preserving_tonemap(rgb_buffer);
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+
     } else if (params.highlight_mode > 3) {
       target_contrast *= 2.f;
+    }
+
+    if (params.highlight_mode > 3) {
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
     }
 
