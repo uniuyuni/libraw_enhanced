@@ -114,10 +114,6 @@ PYBIND11_MODULE(_core, m) {
       // Metal-specific settings
       .def_readwrite("use_gpu_acceleration",
                      &ProcessingParams::use_gpu_acceleration)
-      .def_readwrite("highlight_fringe_suppression",
-                     &ProcessingParams::highlight_fringe_suppression)
-      .def_readwrite("highlight_fringe_strength",
-                     &ProcessingParams::highlight_fringe_strength)
       .def_property(
           "color_matrix",
           [](ProcessingParams &self) -> py::array_t<float> {
@@ -344,8 +340,6 @@ PYBIND11_MODULE(_core, m) {
 #ifdef __arm64__
   m.def("is_apple_silicon", &is_apple_silicon,
         "Check if running on Apple Silicon");
-  m.def("is_available", &is_available,
-        "Check if accelerated pipeline is available");
   m.def("get_device_list", &get_device_list, "Get list of devices");
 
   m.def("create_params_from_rawpy_args", &create_params_from_rawpy_args,
@@ -397,9 +391,7 @@ PYBIND11_MODULE(_core, m) {
         py::arg("bad_pixels_path") = std::string(""),
 
         // LibRaw Enhanced extensions
-        py::arg("use_gpu_acceleration") = false, py::arg("preprocess") = false,
-        py::arg("highlight_fringe_suppression") = true,
-        py::arg("highlight_fringe_strength") = 0.85f);
+        py::arg("use_gpu_acceleration") = false, py::arg("preprocess") = false);
 #else
 
   // Metal非対応環境用のスタブ関数

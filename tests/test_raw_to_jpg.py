@@ -26,7 +26,7 @@ def find_raw_files():
     """テスト用RAWファイルを検索"""
     test_dir = Path(__file__).parent
     fixtures_dir = test_dir / "fixtures"
-    target_raw = fixtures_dir / "DSCF0009.RAF"
+    target_raw = fixtures_dir / "X-T5 Room.RAF"
     if target_raw.exists():
         return [target_raw]
     
@@ -88,7 +88,7 @@ def process_raw_file(raw_path, output_dir):
         # 複数の処理パラメータでテスト
         test_configs = [
             {
-                "name": "DSCF0009 mode5 internal highlight blend sRGB",
+                "name": "X-T5 Room recover2",
                 "params": {
                     "use_camera_wb": True,
                     "use_auto_wb": False,
@@ -96,7 +96,7 @@ def process_raw_file(raw_path, output_dir):
                     "output_bps": 32,
                     "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
                     "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.sRGB,
+                    "output_color": lre.ColorSpace.WideGamutRGB,
                     "highlight_mode": 5,
                 }
             },
@@ -145,13 +145,13 @@ def process_raw_file(raw_path, output_dir):
                     print(f"📉 Highlight-compressed pixels: {compressed_pixels}")
                     print(f"📈 Compressed range: [{np.min(rgb_compressed)}, {np.max(rgb_compressed)}]")
 
-                    rgb_enhanced, enhanced_pixels = enhance_highlight_microcontrast_for_jpeg(rgb_compressed)
+                    rgb_enhanced, enhanced_pixels = rgb_compressed, 0
                     print(f"📉 Highlight microcontrast pixels: {enhanced_pixels}")
                     print(f"📈 Enhanced range: [{np.min(rgb_enhanced)}, {np.max(rgb_enhanced)}]")
 
                     # JPGファイル名生成
                     base_name = raw_path.stem
-                    save_filename = f"{base_name}_mode5_internal_highlight_blend.jpg"
+                    save_filename = f"{base_name}_recover2.jpg"
                     save_path = output_dir / save_filename
 
                     profile_name = [
@@ -282,13 +282,13 @@ def main():
     return 0 if total_success > 0 else 1
 
 def test_dscf0009_highlight_soft_knee_jpg():
-    """DSCF0009.RAF をmode5内部ハイライトブレンドでJPG出力する。"""
-    raw_path = Path(__file__).parent / "fixtures" / "DSCF0009.RAF"
+    """X-T5 Room.RAF をmode5内部ハイライトブレンドでJPG出力する。"""
+    raw_path = Path(__file__).parent / "fixtures" / "X-T5 Room.RAF"
     assert raw_path.exists(), f"Missing RAW fixture: {raw_path}"
 
     output_dir = Path(__file__).parent / "results"
     output_dir.mkdir(exist_ok=True)
-    save_path = output_dir / "DSCF0009_mode5_internal_highlight_blend.jpg"
+    save_path = output_dir / "X-T5 Room recover2.jpg"
     if save_path.exists():
         save_path.unlink()
 

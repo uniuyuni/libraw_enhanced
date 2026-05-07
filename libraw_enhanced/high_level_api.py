@@ -168,9 +168,7 @@ class RawImage:
                    
                    # LibRaw Enhanced extensions
                    use_gpu_acceleration: Optional[bool] = False,
-                   preprocess: bool = False,
-                   highlight_fringe_suppression: bool = True,
-                   highlight_fringe_strength: float = 0.85) -> np.ndarray:
+                   preprocess: bool = False) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 
@@ -234,9 +232,7 @@ class RawImage:
             metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
             use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
             preprocess: If true, stops processing before demosaicing and returns the raw/modified bayer data.
-            highlight_fringe_suppression: Suppress highlight-edge magenta fringing before demosaic.
-            highlight_fringe_strength: Strength of pre-demosaic fringe suppression (0.0-1.0).
-            
+                        
         Returns:
 
             numpy.ndarray: Processed RGB image array (height, width, channels)
@@ -311,8 +307,6 @@ class RawImage:
             # LibRaw Enhanced extensions
             'use_gpu_acceleration': gpu_acceleration,
             'preprocess': preprocess,
-            'highlight_fringe_suppression': highlight_fringe_suppression,
-            'highlight_fringe_strength': float(np.clip(highlight_fringe_strength, 0.0, 1.0)),
         }
                 
         # Convert parameter dict to the format expected by C++
@@ -409,27 +403,6 @@ class RawImage:
         if not self._is_loaded:
             raise RuntimeError("No RAW file loaded. Call load_file() first.")
         return self._wrapper.get_output_geometry(bool(half_size))
-
-    def recover_highlights(self,
-                           image: np.ndarray,
-                           threshold: float = -1.0) -> np.ndarray:
-        """
-        ハイライトリカバリを実行し、新しい numpy 配列を返す。
-
-        Args:
-            image: 入力画像 (H, W, 3) float32 numpy 配列, 値域 0.0-1.0
-            threshold: 飽和閾値。-1 のとき maximum/data_maximum を自動使用。
-
-        Returns:
-            numpy.ndarray: 処理後の新しい (H, W, 3) float32 配列
-
-        Raises:
-            RuntimeError: RAW ファイルが読み込まれていない場合
-        """
-        if not self._is_loaded:
-            raise RuntimeError("No RAW file loaded. Call load_file() first.")
-        arr = np.ascontiguousarray(image, dtype=np.float32)
-        return self._wrapper.recover_highlights(arr, threshold)
 
     def tone_mapping(self,
                      image: np.ndarray,

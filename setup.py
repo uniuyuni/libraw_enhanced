@@ -233,7 +233,6 @@ def create_extension():
         'core/python_bindings.cpp',
         'core/libraw_wrapper.cpp',
         'core/camera_matrices.cpp',
-        'external/LibRaw-master/src/metadata/identify.cpp',
     ]
     
     # Apple プラットフォームでのみMetal統合ファイルを追加
