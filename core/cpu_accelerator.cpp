@@ -3241,54 +3241,31 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
     }
 
     // 画像の再構成
-    // NOTE:
-    // 以前は maxc>1 の場合に RGB 全体を 1/maxc で一括スケーリングしていたが、
-    // これだと強調後のハイライト階調が潰れやすい。
-    // ここではチャンネルごとの正方向ディテールにソフトショルダーを適用し、
-    // strength=8.0 を維持しつつ階調破綻を抑える。
 #ifdef _OPENMP
     #pragma omp parallel for
 #endif
     for (uint32_t idx = 0; idx < width * height; ++idx) {
-        const float g_src = I[idx][1];
-        const float transition = std::max(0.02f, threshold * 0.08f);
-        const float t0 = threshold - transition;
-        const float t1 = threshold + transition;
-        float highlight_w = (g_src - t0) / std::max(1e-6f, (t1 - t0));
-        highlight_w = std::clamp(highlight_w, 0.0f, 1.0f);
-
-        if (highlight_w <= 0.0f) {
+        if (I[idx][1] >= threshold) {
+            float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
+            float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
+            float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
+            // Preserve highlight detail without hard clipping by scaling
+            // down only if the enhancement pushes above 1.0.
+            float maxc = std::max(r, std::max(g, b));
+            if (maxc > 1.f) {
+                float scale = 1.f / maxc;
+                r *= scale;
+                g *= scale;
+                b *= scale;
+            }
+            rgb_output.image[idx][0] = r;
+            rgb_output.image[idx][1] = g;
+            rgb_output.image[idx][2] = b;
+        } else {
             rgb_output.image[idx][0] = rgb_input.image[idx][0];
             rgb_output.image[idx][1] = rgb_input.image[idx][1];
             rgb_output.image[idx][2] = rgb_input.image[idx][2];
-            continue;
         }
-
-        float out[3];
-        for (int c = 0; c < 3; ++c) {
-            const float mean_v = local_mean[idx][c];
-            const float delta = enhanced_high_freq[idx][c];
-            float recon;
-
-            if (delta > 0.0f) {
-                const float room = std::max(1e-6f, 1.0f - mean_v);
-                // Asymptotic shoulder: mean + room * (1 - exp(-delta/room))
-                // Positive detail remains monotonic while avoiding hard clamp at 1.0.
-                recon = mean_v + room * (1.0f - std::exp(-delta / room));
-            } else {
-                recon = mean_v + delta;
-            }
-
-            out[c] = std::max(0.0f, recon);
-        }
-
-        // Smoothly blend near threshold to avoid on/off boundary artifacts.
-        rgb_output.image[idx][0] =
-            rgb_input.image[idx][0] * (1.0f - highlight_w) + out[0] * highlight_w;
-        rgb_output.image[idx][1] =
-            rgb_input.image[idx][1] * (1.0f - highlight_w) + out[1] * highlight_w;
-        rgb_output.image[idx][2] =
-            rgb_input.image[idx][2] * (1.0f - highlight_w) + out[2] * highlight_w;
     }
 
     return true;
