@@ -247,5 +247,8 @@ test_output*/
 tests/fixtures*/
 tests/results*/
 
-# External
-#external*/
+# External reference (not needed for build)
+external/
+
+# ICC profiles (download from Google Drive: https://drive.google.com/drive/folders/1dWrL7ciw5DWlk9zFEBf63Gz9uKsWjJ_W)
+icc/
