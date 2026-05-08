@@ -3,6 +3,7 @@
 #include "metal/constants.h"
 #include "metal/shader_common.h"
 #include <iostream>
+#include <iomanip>
 #include <chrono>
 #include <thread>
 #include <cmath>
@@ -3267,6 +3268,174 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
             rgb_output.image[idx][2] = rgb_input.image[idx][2];
         }
     }
+
+    return true;
+}
+
+//===================================================================
+// Defringe: Edge-gated Gaussian opponent-chroma suppression
+//
+// Algorithm (darktable defringe inspired, adapted for HDR float32):
+//   1. Compute luminance Y and opponent chroma Cr=R-G, Cb=B-G
+//   2. Sobel edge map on Y, normalized to [0,1] (scale-invariant)
+//   3. Separable Gaussian blur of Cr and Cb → reference chroma
+//   4. At each edge pixel: excess = (|Cr-blur_Cr| + |Cb-blur_Cb|) / max(Y, 0.05)
+//      If excess > chroma_threshold: replace Cr/Cb with blurred values,
+//      preserve luminance exactly (G = Y - 0.299*Cr - 0.114*Cb)
+//
+// Values > 1.0 are handled correctly because:
+//   - Sobel is normalized by its own maximum → edge_threshold scale-invariant
+//   - Chroma excess is divided by Y → relative ratio, HDR-safe
+//===================================================================
+bool CPUAccelerator::defringe(
+    const ImageBufferFloat& rgb_input,
+    ImageBufferFloat& rgb_output,
+    float radius,
+    float edge_threshold,
+    float chroma_threshold)
+{
+    if (!rgb_input.is_valid()) return false;
+
+    const size_t W = rgb_input.width;
+    const size_t H = rgb_input.height;
+    const size_t N = W * H;
+    const float (*src)[3] = rgb_input.image;
+    float (*dst)[3]       = rgb_output.image;
+
+    // Copy input to output (pixels not corrected keep original values)
+    std::memcpy(dst, src, N * 3 * sizeof(float));
+
+    // ----------------------------------------------------------------
+    // Step 1: Luminance Y and opponent chroma Cr, Cb
+    // ----------------------------------------------------------------
+    std::vector<float> Y(N), Cr(N), Cb(N);
+    for (size_t i = 0; i < N; i++) {
+        const float r = src[i][0], g = src[i][1], b = src[i][2];
+        Y[i]  = 0.299f * r + 0.587f * g + 0.114f * b;
+        Cr[i] = r - g;  // red-green opponent
+        Cb[i] = b - g;  // blue-green opponent
+    }
+
+    // ----------------------------------------------------------------
+    // Step 2: Sobel edge map on Y, normalized to [0,1]
+    // ----------------------------------------------------------------
+    std::vector<float> edge(N, 0.f);
+    {
+        // Sobel kernels
+        // Gx: [[-1,0,1],[-2,0,2],[-1,0,1]]
+        // Gy: [[-1,-2,-1],[0,0,0],[1,2,1]]
+        float max_edge = 0.f;
+        for (size_t y = 1; y + 1 < H; y++) {
+            for (size_t x = 1; x + 1 < W; x++) {
+                float gx =
+                    -Y[(y-1)*W+(x-1)] + Y[(y-1)*W+(x+1)]
+                    -2.f*Y[y*W+(x-1)] + 2.f*Y[y*W+(x+1)]
+                    -Y[(y+1)*W+(x-1)] + Y[(y+1)*W+(x+1)];
+                float gy =
+                    -Y[(y-1)*W+(x-1)] - 2.f*Y[(y-1)*W+x] - Y[(y-1)*W+(x+1)]
+                    +Y[(y+1)*W+(x-1)] + 2.f*Y[(y+1)*W+x] + Y[(y+1)*W+(x+1)];
+                float mag = std::sqrt(gx*gx + gy*gy);
+                edge[y*W+x] = mag;
+                if (mag > max_edge) max_edge = mag;
+            }
+        }
+        // Normalize: edge threshold becomes scale-invariant (handles HDR)
+        if (max_edge > 0.f) {
+            float inv = 1.f / max_edge;
+            for (auto& v : edge) v *= inv;
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Step 3: Separable Gaussian blur of Cr and Cb
+    //   sigma = radius / 3  so kernel extends to ±radius pixels
+    // ----------------------------------------------------------------
+    const float sigma = std::max(radius / 3.f, 0.5f);
+    const int   ks    = static_cast<int>(std::ceil(3.f * sigma));
+
+    std::vector<float> kernel(2 * ks + 1);
+    {
+        float ksum = 0.f;
+        for (int k = -ks; k <= ks; k++) {
+            float v = std::exp(-0.5f * (float)(k * k) / (sigma * sigma));
+            kernel[k + ks] = v;
+            ksum += v;
+        }
+        for (auto& v : kernel) v /= ksum;
+    }
+
+    // Separable 2-pass Gaussian blur
+    auto gaussian_blur = [&](const std::vector<float>& in,
+                              std::vector<float>& out) {
+        std::vector<float> tmp(N, 0.f);
+        // Horizontal pass
+        for (size_t y = 0; y < H; y++) {
+            for (size_t x = 0; x < W; x++) {
+                float acc = 0.f;
+                for (int k = -ks; k <= ks; k++) {
+                    int xx = std::max(0, std::min((int)W - 1, (int)x + k));
+                    acc += kernel[k + ks] * in[y * W + xx];
+                }
+                tmp[y * W + x] = acc;
+            }
+        }
+        // Vertical pass
+        for (size_t y = 0; y < H; y++) {
+            for (size_t x = 0; x < W; x++) {
+                float acc = 0.f;
+                for (int k = -ks; k <= ks; k++) {
+                    int yy = std::max(0, std::min((int)H - 1, (int)y + k));
+                    acc += kernel[k + ks] * tmp[yy * W + x];
+                }
+                out[y * W + x] = acc;
+            }
+        }
+    };
+
+    std::vector<float> blur_Cr(N), blur_Cb(N);
+    gaussian_blur(Cr, blur_Cr);
+    gaussian_blur(Cb, blur_Cb);
+
+    // ----------------------------------------------------------------
+    // Step 4: Fringe correction
+    //   excess = (|Cr - blur_Cr| + |Cb - blur_Cb|) / max(Y, 0.05)
+    //   Relative threshold → HDR-safe (values > 1.0 handled correctly)
+    // ----------------------------------------------------------------
+    size_t corrected_count = 0;
+    for (size_t y = 0; y < H; y++) {
+        for (size_t x = 0; x < W; x++) {
+            const size_t i = y * W + x;
+
+            if (edge[i] < edge_threshold) continue;
+
+            float excess_r = std::fabs(Cr[i] - blur_Cr[i]);
+            float excess_b = std::fabs(Cb[i] - blur_Cb[i]);
+            float excess   = excess_r + excess_b;
+
+            // Normalize by local luminance; clamp minimum to avoid
+            // division-by-near-zero in dark shadows
+            float luma        = std::max(Y[i], 0.05f);
+            float norm_excess = excess / luma;
+
+            if (norm_excess > chroma_threshold) {
+                // Replace Cr/Cb with blurred (fringe-free) reference.
+                // Preserve luminance exactly:
+                //   Y = G + 0.299*Cr + 0.114*Cb  →  G = Y - 0.299*Cr - 0.114*Cb
+                const float new_Cr = blur_Cr[i];
+                const float new_Cb = blur_Cb[i];
+                const float new_G  = Y[i] - 0.299f * new_Cr - 0.114f * new_Cb;
+                dst[i][0] = new_G + new_Cr;  // R = G + Cr
+                dst[i][1] = new_G;            // G
+                dst[i][2] = new_G + new_Cb;  // B = G + Cb
+                ++corrected_count;
+            }
+        }
+    }
+
+    std::cout << "✅ Defringe: corrected " << std::dec << corrected_count
+              << " / " << N << " pixels ("
+              << std::fixed << std::setprecision(3)
+              << 100.0 * corrected_count / (double)N << "%)" << std::endl;
 
     return true;
 }

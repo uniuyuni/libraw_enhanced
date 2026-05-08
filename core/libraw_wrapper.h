@@ -130,6 +130,12 @@ public:
   enhance_micro_contrast_numpy(py::array_t<float> image, float threshold = -1.f,
                                float strength = 8.f,
                                float target_contrast = 0.06f);
+
+  py::array_t<float>
+  defringe_numpy(py::array_t<float> image,
+                 float radius           = 6.0f,
+                 float edge_threshold   = 0.1f,
+                 float chroma_threshold = 0.15f);
 #endif
 
 private:

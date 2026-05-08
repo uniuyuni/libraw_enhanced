@@ -424,4 +424,24 @@ bool Accelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
     return false;
 }
 
+//===================================================================
+// Defringe
+//===================================================================
+
+bool Accelerator::defringe(const ImageBufferFloat& rgb_input,
+                           ImageBufferFloat& rgb_output,
+                           float radius,
+                           float edge_threshold,
+                           float chroma_threshold) {
+    // CPU-only: no GPU path yet
+    std::cout << "🔧 Running defringe (CPU)" << std::endl;
+    if (pimpl_->cpu_accelerator->defringe(rgb_input, rgb_output,
+                                          radius, edge_threshold,
+                                          chroma_threshold)) {
+        return true;
+    }
+    std::cout << "❌ Defringe failed" << std::endl;
+    return false;
+}
+
 } // namespace libraw_enhanced

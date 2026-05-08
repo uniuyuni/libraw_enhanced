@@ -3527,6 +3527,47 @@ LibRawWrapper::enhance_micro_contrast_numpy(py::array_t<float> image,
   return output;
 }
 
+py::array_t<float>
+LibRawWrapper::defringe_numpy(py::array_t<float> image,
+                              float radius,
+                              float edge_threshold,
+                              float chroma_threshold) {
+  py::buffer_info buf = image.request();
+  if (buf.ndim != 3 || buf.shape[2] != 3) {
+    throw std::invalid_argument(
+        "defringe_numpy: image must be shape (H, W, 3) float32");
+  }
+
+  const size_t height   = buf.shape[0];
+  const size_t width    = buf.shape[1];
+  const size_t channels = 3;
+  const size_t N        = height * width;
+
+  // Allocate output and copy input
+  py::array_t<float> output({height, width, channels});
+  py::buffer_info out_buf = output.request();
+  std::memcpy(out_buf.ptr, buf.ptr, N * channels * sizeof(float));
+
+  // Wrap input and output as ImageBufferFloat
+  ImageBufferFloat rgb_in, rgb_out;
+  rgb_in.image    = reinterpret_cast<float(*)[3]>(buf.ptr);
+  rgb_in.width    = width;
+  rgb_in.height   = height;
+  rgb_in.channels = channels;
+
+  rgb_out.image    = reinterpret_cast<float(*)[3]>(out_buf.ptr);
+  rgb_out.width    = width;
+  rgb_out.height   = height;
+  rgb_out.channels = channels;
+
+  if (!pimpl->accelerator) {
+    throw std::runtime_error("defringe_numpy: accelerator not initialized");
+  }
+  pimpl->accelerator->defringe(rgb_in, rgb_out,
+                                radius, edge_threshold, chroma_threshold);
+  return output;
+}
+
 #endif // __arm64__
 
 // rawpy完全互換性のための処理パラメータ変換関数

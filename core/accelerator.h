@@ -263,6 +263,13 @@ public:
                               ImageBufferFloat &rgb_output, float threshold,
                               float strength, float target_contrast = 0.06);
 
+  // Defringe: edge-gated Gaussian opponent-chroma suppression (HDR-safe)
+  bool defringe(const ImageBufferFloat &rgb_input,
+                ImageBufferFloat &rgb_output,
+                float radius           = 6.0f,
+                float edge_threshold   = 0.1f,
+                float chroma_threshold = 0.15f);
+
 private:
   class Impl;
   std::unique_ptr<Impl> pimpl_;

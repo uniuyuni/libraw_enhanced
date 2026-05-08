@@ -333,6 +333,18 @@ PYBIND11_MODULE(_core, m) {
            "Enhance micro contrast on a (H,W,3) float32 numpy array. "
            "threshold<0 uses maximum/data_maximum automatically. "
            "Returns a new array.")
+      .def("defringe",
+           &LibRawWrapper::defringe_numpy, py::arg("image"),
+           py::arg("radius") = 6.0f,
+           py::arg("edge_threshold") = 0.1f,
+           py::arg("chroma_threshold") = 0.15f,
+           "Remove chromatic aberration fringe on a (H,W,3) float32 numpy array.\n"
+           "Uses edge-gated Gaussian opponent-chroma suppression (darktable defringe style).\n"
+           "Works correctly with HDR values > 1.0.\n"
+           "  radius: Gaussian blur radius in pixels (default 4.0)\n"
+           "  edge_threshold: normalized Sobel edge strength [0,1] (default 0.1)\n"
+           "  chroma_threshold: relative chroma excess to trigger correction (default 0.2)\n"
+           "Returns a new float32 array.")
 #endif
       ;
 

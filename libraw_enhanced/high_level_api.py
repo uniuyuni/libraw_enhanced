@@ -168,7 +168,13 @@ class RawImage:
                    
                    # LibRaw Enhanced extensions
                    use_gpu_acceleration: Optional[bool] = False,
-                   preprocess: bool = False) -> np.ndarray:
+                   preprocess: bool = False,
+
+                   # Defringe (chromatic aberration fringe removal)
+                   defringe: bool = False,
+                   defringe_radius: float = 6.0,
+                   defringe_edge_threshold: float = 0.1,
+                   defringe_chroma_threshold: float = 0.15) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 
@@ -232,7 +238,13 @@ class RawImage:
             metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
             use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
             preprocess: If true, stops processing before demosaicing and returns the raw/modified bayer data.
-                        
+
+            # Defringe parameters
+            defringe: If True, apply chromatic aberration fringe removal after processing.
+            defringe_radius: Gaussian blur radius for fringe detection (default 4.0).
+            defringe_edge_threshold: Normalized Sobel edge threshold [0,1] (default 0.1).
+            defringe_chroma_threshold: Relative chroma excess threshold (default 0.2).
+
         Returns:
 
             numpy.ndarray: Processed RGB image array (height, width, channels)
@@ -347,8 +359,32 @@ class RawImage:
         if hasattr(result_image, 'color_matrix'):
             self._color_matrix = np.array(result_image.color_matrix, dtype=np.float32)
         
-        # Convert to NumPy array and return
-        return result_image.to_numpy()
+        # Convert to NumPy array
+        output = result_image.to_numpy()
+
+        # Apply defringe if requested (operates on float32 before final quantization)
+        if defringe:
+            # to_numpy() above returns uint8/uint16; we need float32 for defringe.
+            # Re-fetch as float32: normalize from output_bps range to [0,1].
+            if output.dtype == np.uint16:
+                img_f32 = output.astype(np.float32) / 65535.0
+            elif output.dtype == np.uint8:
+                img_f32 = output.astype(np.float32) / 255.0
+            else:
+                img_f32 = output.astype(np.float32)
+            img_f32 = self.defringe(img_f32,
+                                    radius=defringe_radius,
+                                    edge_threshold=defringe_edge_threshold,
+                                    chroma_threshold=defringe_chroma_threshold)
+            # Convert back to original dtype
+            if output.dtype == np.uint16:
+                output = np.clip(img_f32 * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
+            elif output.dtype == np.uint8:
+                output = np.clip(img_f32 * 255.0 + 0.5, 0, 255).astype(np.uint8)
+            else:
+                output = img_f32
+
+        return output
     
     def unpack(self):
 
@@ -450,6 +486,41 @@ class RawImage:
         arr = np.ascontiguousarray(image, dtype=np.float32)
         return self._wrapper.enhance_micro_contrast(arr, threshold, strength,
                                                    target_contrast)
+
+    def defringe(self,
+                 image: np.ndarray,
+                 radius: float = 6.0,
+                 edge_threshold: float = 0.1,
+                 chroma_threshold: float = 0.15) -> np.ndarray:
+        """
+        色収差フリンジ除去（Edge-gated Gaussian opponent-chroma suppression）。
+
+        darktable の Defringe モジュールと同原理。
+        RGB 値が 1.0 を超える HDR データにも正しく動作する（閾値が輝度相対値のため）。
+
+        Algorithm:
+          1. 輝度 Y と opponent chroma Cr=R-G, Cb=B-G を計算
+          2. Y の Sobel グラジエントでエッジマップ生成（最大値で正規化）
+          3. Cr, Cb を Gaussian blur → フリンジのない「期待される色」を近似
+          4. 各エッジピクセルで excess = (|Cr-blur_Cr|+|Cb-blur_Cb|) / max(Y,0.05)
+             excess > chroma_threshold なら Cr/Cb を blur 値に置換（輝度は保持）
+
+        Args:
+            image: 入力画像 (H, W, 3) float32, 値域は 0.0〜1.0 以上でも可
+            radius: Gaussian blur 半径（ピクセル）。デフォルト 4.0
+            edge_threshold: 正規化 Sobel 閾値 [0,1]。デフォルト 0.1
+            chroma_threshold: 輝度相対クロマ超過閾値。デフォルト 0.2
+
+        Returns:
+            numpy.ndarray: フリンジ除去後の新しい (H, W, 3) float32 配列
+
+        Raises:
+            RuntimeError: RAW ファイルが読み込まれていない場合
+        """
+        if not self._is_loaded:
+            raise RuntimeError("No RAW file loaded. Call load_file() first.")
+        arr = np.ascontiguousarray(image, dtype=np.float32)
+        return self._wrapper.defringe(arr, radius, edge_threshold, chroma_threshold)
 
     def close(self):
         """リソースの解放"""
