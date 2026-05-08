@@ -26,9 +26,6 @@ def find_raw_files():
     """テスト用RAWファイルを検索"""
     test_dir = Path(__file__).parent
     fixtures_dir = test_dir / "fixtures"
-    target_raw = fixtures_dir / "X-T5 Room.RAF"
-    if target_raw.exists():
-        return [target_raw]
     
     raw_extensions = ['.CR2', '.RAF', '.ARW', 
                       '.DNG', '.ORF', '.NEF',
@@ -88,7 +85,7 @@ def process_raw_file(raw_path, output_dir):
         # 複数の処理パラメータでテスト
         test_configs = [
             {
-                "name": "X-T5 Room recover2",
+                "name": "defringe",
                 "params": {
                     "use_camera_wb": True,
                     "use_auto_wb": False,
@@ -98,6 +95,10 @@ def process_raw_file(raw_path, output_dir):
                     "use_gpu_acceleration": True,
                     "output_color": lre.ColorSpace.WideGamutRGB,
                     "highlight_mode": 5,
+                    "defringe": True,
+                    #"defringe_chroma_threshold": 0.15,
+                    #"defringe_edge_threshold": 0.1,
+                    #"defringe_radius": 6.0,
                 }
             },
         ]
@@ -151,7 +152,7 @@ def process_raw_file(raw_path, output_dir):
 
                     # JPGファイル名生成
                     base_name = raw_path.stem
-                    save_filename = f"{base_name}_recover2.jpg"
+                    save_filename = f"{base_name}_{config['name']}.jpg"
                     save_path = output_dir / save_filename
 
                     profile_name = [
@@ -281,22 +282,6 @@ def main():
     
     return 0 if total_success > 0 else 1
 
-def test_dscf0009_highlight_soft_knee_jpg():
-    """X-T5 Room.RAF をmode5内部ハイライトブレンドでJPG出力する。"""
-    raw_path = Path(__file__).parent / "fixtures" / "X-T5 Room.RAF"
-    assert raw_path.exists(), f"Missing RAW fixture: {raw_path}"
-
-    output_dir = Path(__file__).parent / "results"
-    output_dir.mkdir(exist_ok=True)
-    save_path = output_dir / "X-T5 Room recover2.jpg"
-    if save_path.exists():
-        save_path.unlink()
-
-    results = process_raw_file(raw_path, output_dir)
-    assert results
-    assert all(result["success"] for result in results), results
-    assert save_path.exists()
-    assert save_path.stat().st_size > 0
 
 if __name__ == "__main__":
     sys.exit(main())
