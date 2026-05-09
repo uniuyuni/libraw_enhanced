@@ -2188,7 +2188,7 @@ public:
     }
 
     if (params.highlight_mode > 3) {
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold + 0.1, 8.f, target_contrast);
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold + 0.3, 8.f, target_contrast);
     }
 
     // Fuji SuperCCD honeycomb sensors require an additional geometric
@@ -2275,11 +2275,13 @@ public:
     if (params.defringe) {
       std::cout << "🔧 Applying defringe (radius=" << params.defringe_radius
                 << " edge=" << params.defringe_edge_threshold
-                << " chroma=" << params.defringe_chroma_threshold << ")" << std::endl;
+                << " chroma=" << params.defringe_chroma_threshold
+                << " strength=" << params.defringe_strength << ")" << std::endl;
       accelerator->defringe(rgb_buffer, rgb_buffer,
                             params.defringe_radius,
                             params.defringe_edge_threshold,
-                            params.defringe_chroma_threshold);
+                            params.defringe_chroma_threshold,
+                            params.defringe_strength);
     }
 
     std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully"
@@ -3368,6 +3370,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.defringe_edge_threshold = p.second;
     else if (p.first == "defringe_chroma_threshold")
       params.defringe_chroma_threshold = p.second;
+    else if (p.first == "defringe_strength")
+      params.defringe_strength = p.second;
   }
 
   for (const auto &p : string_params) {
@@ -3589,7 +3593,8 @@ py::array_t<float>
 LibRawWrapper::defringe_numpy(py::array_t<float> image,
                               float radius,
                               float edge_threshold,
-                              float chroma_threshold) {
+                              float chroma_threshold,
+                              float strength) {
   py::buffer_info buf = image.request();
   if (buf.ndim != 3 || buf.shape[2] != 3) {
     throw std::invalid_argument(
@@ -3622,7 +3627,7 @@ LibRawWrapper::defringe_numpy(py::array_t<float> image,
     throw std::runtime_error("defringe_numpy: accelerator not initialized");
   }
   pimpl->accelerator->defringe(rgb_in, rgb_out,
-                                radius, edge_threshold, chroma_threshold);
+                                radius, edge_threshold, chroma_threshold, strength);
   return output;
 }
 

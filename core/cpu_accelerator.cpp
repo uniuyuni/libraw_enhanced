@@ -3292,7 +3292,8 @@ bool CPUAccelerator::defringe(
     ImageBufferFloat& rgb_output,
     float radius,
     float edge_threshold,
-    float chroma_threshold)
+    float chroma_threshold,
+    float strength)
 {
     if (!rgb_input.is_valid()) return false;
 
@@ -3418,11 +3419,14 @@ bool CPUAccelerator::defringe(
             float norm_excess = excess / luma;
 
             if (norm_excess > chroma_threshold) {
-                // Replace Cr/Cb with blurred (fringe-free) reference.
-                // Preserve luminance exactly:
-                //   Y = G + 0.299*Cr + 0.114*Cb  →  G = Y - 0.299*Cr - 0.114*Cb
-                const float new_Cr = blur_Cr[i];
-                const float new_Cb = blur_Cb[i];
+                // Replace Cr/Cb with a target pushed toward neutral gray.
+                // strength=1.0: replace with blur reference (original behavior).
+                // strength>1.0: extrapolate past the blur toward zero chroma,
+                //   compensating for residual fringe color still present in the
+                //   blur reference when fringe covers a wide area.
+                //   target = blur / strength  (strength=2 → halve residual chroma)
+                const float new_Cr = blur_Cr[i] / strength;
+                const float new_Cb = blur_Cb[i] / strength;
                 const float new_G  = Y[i] - 0.299f * new_Cr - 0.114f * new_Cb;
                 dst[i][0] = new_G + new_Cr;  // R = G + Cr
                 dst[i][1] = new_G;            // G

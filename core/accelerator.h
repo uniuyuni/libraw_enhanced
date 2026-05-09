@@ -146,6 +146,7 @@ struct ProcessingParams {
   float defringe_radius           = 6.0f;
   float defringe_edge_threshold   = 0.1f;
   float defringe_chroma_threshold = 0.15f;
+  float defringe_strength         = 1.0f;
 
   ProcessingParams() {
     // Initialize color matrix to identity
@@ -311,7 +312,8 @@ public:
                 ImageBufferFloat &rgb_output,
                 float radius           = 6.0f,
                 float edge_threshold   = 0.1f,
-                float chroma_threshold = 0.15f);
+                float chroma_threshold = 0.15f,
+                float strength         = 1.0f);
 
 private:
   class Impl;

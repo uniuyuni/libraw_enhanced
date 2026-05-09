@@ -338,12 +338,14 @@ PYBIND11_MODULE(_core, m) {
            py::arg("radius") = 6.0f,
            py::arg("edge_threshold") = 0.1f,
            py::arg("chroma_threshold") = 0.15f,
+           py::arg("strength") = 1.0f,
            "Remove chromatic aberration fringe on a (H,W,3) float32 numpy array.\n"
            "Uses edge-gated Gaussian opponent-chroma suppression (darktable defringe style).\n"
            "Works correctly with HDR values > 1.0.\n"
-           "  radius: Gaussian blur radius in pixels (default 4.0)\n"
+           "  radius: Gaussian blur radius in pixels (default 6.0)\n"
            "  edge_threshold: normalized Sobel edge strength [0,1] (default 0.1)\n"
-           "  chroma_threshold: relative chroma excess to trigger correction (default 0.2)\n"
+           "  chroma_threshold: relative chroma excess to trigger correction (default 0.15)\n"
+           "  strength: correction strength (1.0=replace with blur, >1 pushes toward neutral, default 1.0)\n"
            "Returns a new float32 array.")
 #endif
       ;

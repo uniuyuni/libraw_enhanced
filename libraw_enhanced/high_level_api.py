@@ -174,7 +174,8 @@ class RawImage:
                    defringe: bool = False,
                    defringe_radius: float = 6.0,
                    defringe_edge_threshold: float = 0.1,
-                   defringe_chroma_threshold: float = 0.15) -> np.ndarray:
+                   defringe_chroma_threshold: float = 0.15,
+                   defringe_strength: float = 1.0) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 
@@ -325,6 +326,7 @@ class RawImage:
             'defringe_radius': float(defringe_radius),
             'defringe_edge_threshold': float(defringe_edge_threshold),
             'defringe_chroma_threshold': float(defringe_chroma_threshold),
+            'defringe_strength': float(defringe_strength),
         }
                 
         # Convert parameter dict to the format expected by C++
@@ -474,7 +476,8 @@ class RawImage:
                  image: np.ndarray,
                  radius: float = 6.0,
                  edge_threshold: float = 0.1,
-                 chroma_threshold: float = 0.15) -> np.ndarray:
+                 chroma_threshold: float = 0.15,
+                 strength: float = 1.0) -> np.ndarray:
         """
         色収差フリンジ除去（Edge-gated Gaussian opponent-chroma suppression）。
 
@@ -503,7 +506,7 @@ class RawImage:
         if not self._is_loaded:
             raise RuntimeError("No RAW file loaded. Call load_file() first.")
         arr = np.ascontiguousarray(image, dtype=np.float32)
-        return self._wrapper.defringe(arr, radius, edge_threshold, chroma_threshold)
+        return self._wrapper.defringe(arr, radius, edge_threshold, chroma_threshold, strength)
 
     def close(self):
         """リソースの解放"""

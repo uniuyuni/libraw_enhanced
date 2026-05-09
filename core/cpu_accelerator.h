@@ -102,7 +102,8 @@ public:
                   ImageBufferFloat& rgb_output,
                   float radius           = 6.0f,   // Gaussian blur radius (px)
                   float edge_threshold   = 0.1f,   // Normalized Sobel threshold [0,1]
-                  float chroma_threshold = 0.15f); // Relative chroma excess threshold
+                  float chroma_threshold = 0.15f,  // Relative chroma excess threshold
+                  float strength         = 1.0f);  // Correction strength (1.0=full replace, >1 pushes toward neutral)
 
 private: 
     bool initialized_ = false;

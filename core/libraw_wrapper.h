@@ -135,7 +135,8 @@ public:
   defringe_numpy(py::array_t<float> image,
                  float radius           = 6.0f,
                  float edge_threshold   = 0.1f,
-                 float chroma_threshold = 0.15f);
+                 float chroma_threshold = 0.15f,
+                 float strength         = 1.0f);
 #endif
 
 private:
