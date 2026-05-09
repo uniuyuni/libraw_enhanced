@@ -178,38 +178,43 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, Im
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
-        
-        std::vector<float4> raw_rgbg_data(pixel_count);
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (size_t i = 0; i < pixel_count; i++) {
-            raw_rgbg_data[i] = { raw_buffer.image[i][0], raw_buffer.image[i][1], raw_buffer.image[i][2], raw_buffer.image[i][1] };
-        }
 
         const size_t AMAZE_TS_CONST = 160;
         const size_t TILE_PIXELS = AMAZE_TS_CONST * AMAZE_TS_CONST;
         const size_t TILE_PIXELS_HALF = AMAZE_TS_CONST * (AMAZE_TS_CONST);
-        
+
         const int TS_STEP = AMAZE_TS_CONST - 32;
         int tiles_x = ((int)width + 16 + TS_STEP - 1) / TS_STEP;
         int tiles_y = ((int)height + 16 + TS_STEP - 1) / TS_STEP;
         size_t total_tiles = tiles_x * tiles_y;
-        
+
         // 中間バッファを total_tiles 分のサイズで確保
         size_t total_tile_pixels = total_tiles * TILE_PIXELS;
         size_t total_tile_pixels_half = total_tiles * TILE_PIXELS_HALF;
 
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_rgbg_data.data()
-                                                            length:pixel_count * sizeof(float4)
+        // Owned Metal buffers — avoids newBufferWithBytesNoCopy page-alignment
+        // requirement.  Fill raw input directly into the Metal Shared buffer to
+        // skip an intermediate std::vector copy.
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * sizeof(float4)
+                                                            options:MTLResourceStorageModeShared];
+        if (!raw_metal_buffer) return false;
+        {
+            float4* raw_ptr = (float4*)[raw_metal_buffer contents];
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < pixel_count; i++) {
+                raw_ptr[i] = { raw_buffer.image[i][0], raw_buffer.image[i][1],
+                               raw_buffer.image[i][2], raw_buffer.image[i][1] };
+            }
+        }
+
+        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0]
+                                                            length:pixel_count * 3 * sizeof(float)
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
-        
-        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
-                                                            length:pixel_count * 3 * sizeof(float) 
-                                                            options:MTLResourceStorageModeShared 
-                                                            deallocator:nil];
-        
+        if (!rgb_metal_buffer) return false;
+
         // Basic processing buffers
         id<MTLBuffer> rgbgreen_buf   = [pimpl_->device newBufferWithLength:total_tile_pixels * sizeof(float) options:MTLResourceStorageModePrivate];
         id<MTLBuffer> delhvsqsum_buf = [pimpl_->device newBufferWithLength:total_tile_pixels * sizeof(float) options:MTLResourceStorageModePrivate];
@@ -260,11 +265,11 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, Im
             clip_pt,
             clip_pt8
         };        
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params
                                                             length:sizeof(params)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
-        
+                                                            options:MTLResourceStorageModeShared];
+        if (!params_buffer) return false;
+
         id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
 
@@ -308,7 +313,9 @@ bool GPUAccelerator::demosaic_bayer_amaze(const ImageBufferFloat& raw_buffer, Im
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
-        
+
+        // GPU wrote directly into rgb_buffer.image via newBufferWithBytesNoCopy — no memcpy needed.
+
         return true;
     }
 #else
@@ -334,28 +341,28 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer, I
     
     @autoreleasepool {
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
-        
-        // Prepare raw data
-        std::vector<float> raw_gpu_data(pixel_count);
+
+        // Owned Metal buffers — no page-alignment dependency.
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        if (!raw_metal_buffer) return false;
+        {
+            float* raw_ptr = (float*)[raw_metal_buffer contents];
 #ifdef _OPENMP
-        #pragma omp parallel for
+            #pragma omp parallel for
 #endif
-        for (size_t i = 0; i < pixel_count; ++i) {
-            size_t r = i / width, c = i % width;
-            raw_gpu_data[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
+            for (size_t i = 0; i < pixel_count; ++i) {
+                size_t r = i / width, c = i % width;
+                raw_ptr[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
+            }
         }
-        
-        // Create Metal buffers
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
-                                                            length:pixel_count * sizeof(float) 
+
+        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0]
+                                                            length:pixel_count * 3 * sizeof(float)
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
-        
-        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
-                                                            length:pixel_count * 3 * sizeof(float) 
-                                                            options:MTLResourceStorageModeShared 
-                                                            deallocator:nil];
-        
+        if (!rgb_metal_buffer) return false;
+
         // Prepare XTrans parameters
         DemosaicXTransParams params = {
             (uint32_t)width,
@@ -395,7 +402,9 @@ bool GPUAccelerator::demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer, I
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
-        
+
+        // GPU wrote directly into rgb_buffer.image via newBufferWithBytesNoCopy — no memcpy needed.
+
         return true;
     }
 #else
@@ -427,28 +436,28 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
         const auto width = raw_buffer.width, height = raw_buffer.height, pixel_count = width * height;
 
         constexpr int ts = XTRANS_3PASS_TS;
-        
-        // 生データ準備
-        std::vector<float> raw_gpu_data(pixel_count);
+
+        // Owned Metal buffers — no page-alignment dependency.
+        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithLength:pixel_count * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        if (!raw_metal_buffer) return false;
+        {
+            float* raw_ptr = (float*)[raw_metal_buffer contents];
 #ifdef _OPENMP
-        #pragma omp parallel for
+            #pragma omp parallel for
 #endif
-        for (size_t i = 0; i < pixel_count; ++i) {
-            size_t r = i / width, c = i % width;
-            raw_gpu_data[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
+            for (size_t i = 0; i < pixel_count; ++i) {
+                size_t r = i / width, c = i % width;
+                raw_ptr[i] = raw_buffer.image[i][fcol_xtrans(r, c, xtrans)];
+            }
         }
-        
-        // Metalバッファ作成
-        id<MTLBuffer> raw_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:raw_gpu_data.data() 
-                                                            length:pixel_count * sizeof(float) 
+
+        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0]
+                                                            length:pixel_count * 3 * sizeof(float)
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
-        
-        id<MTLBuffer> rgb_metal_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_buffer.image[0][0] 
-                                                            length:pixel_count * 3 * sizeof(float) 
-                                                            options:MTLResourceStorageModeShared 
-                                                            deallocator:nil];
-        
+        if (!rgb_metal_buffer) return false;
+
         // ワークスペースバッファ
         size_t tile_count_x = (width + (ts - 16) - 1) / (ts - 16);
         size_t tile_count_y = (height + (ts - 16) - 1) / (ts - 16);
@@ -468,9 +477,11 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
             { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 }
         };
         
-#ifdef _OPENMP
-        #pragma omp parallel for collapse(2)
-#endif
+        // NOTE: OMP removed intentionally.  This 3×3 loop (9 iterations) fills
+        // sgrow/sgcol with the single matching (row,col) pair.  Parallelising it
+        // would be a data race on sgrow/sgcol (multiple threads writing the same
+        // shared variables without synchronisation).  The loop is tiny so there
+        // is no performance benefit anyway.
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
                 int gint = isgreen(row, col) ? 1 : 0;
@@ -499,17 +510,19 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
             }
         }
         
-        id<MTLBuffer> allhex_buffer = [pimpl_->device newBufferWithBytesNoCopy:allhex_data
+        // Use newBufferWithBytes for all small/stack-allocated data — these are
+        // never page-aligned so newBufferWithBytesNoCopy would always return nil.
+        id<MTLBuffer> allhex_buffer = [pimpl_->device newBufferWithBytes:allhex_data
                                                             length:sizeof(allhex_data)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
-        
+                                                            options:MTLResourceStorageModeShared];
+        if (!allhex_buffer) return false;
+
         vector_uint2 sg_coords = {sgrow, sgcol};
-        id<MTLBuffer> sg_coords_buffer = [pimpl_->device newBufferWithBytesNoCopy:&sg_coords
+        id<MTLBuffer> sg_coords_buffer = [pimpl_->device newBufferWithBytes:&sg_coords
                                                             length:sizeof(sg_coords)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
-        
+                                                            options:MTLResourceStorageModeShared];
+        if (!sg_coords_buffer) return false;
+
         // XYZ_CAMマトリクス準備
         float xyz_cam[3][3];
         for (int i = 0; i < 3; i++) {
@@ -517,26 +530,27 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
                 xyz_cam[i][j] = color_matrix[i][j];
             }
         }
-        id<MTLBuffer> xyz_cam_buffer = [pimpl_->device newBufferWithBytesNoCopy:xyz_cam
+        id<MTLBuffer> xyz_cam_buffer = [pimpl_->device newBufferWithBytes:xyz_cam
                                                             length:sizeof(xyz_cam)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
-        
-        // cbrt LUT準備
+                                                            options:MTLResourceStorageModeShared];
+        if (!xyz_cam_buffer) return false;
+
+        // cbrt LUT準備 — fill owned Metal buffer directly to skip vector copy
         constexpr int table_size = 1<<16;
-        std::vector<float> cbrt_lut_vec(table_size);
+        id<MTLBuffer> cbrt_lut_buffer = [pimpl_->device newBufferWithLength:table_size * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        if (!cbrt_lut_buffer) return false;
+        {
+            float* lut_ptr = (float*)[cbrt_lut_buffer contents];
 #ifdef _OPENMP
-        #pragma omp parallel for
+            #pragma omp parallel for
 #endif
-        for (int i = 0; i < table_size; i++) {
-            double r = i / static_cast<double>(table_size - 1);
-            cbrt_lut_vec[i] = static_cast<float>(r > (216.0/24389.0) ? std::cbrt(r) : (24389.0/27.0 * r + 16.0) / 116.0);
+            for (int i = 0; i < table_size; i++) {
+                double r = i / static_cast<double>(table_size - 1);
+                lut_ptr[i] = static_cast<float>(r > (216.0/24389.0) ? std::cbrt(r) : (24389.0/27.0 * r + 16.0) / 116.0);
+            }
         }
-        id<MTLBuffer> cbrt_lut_buffer = [pimpl_->device newBufferWithBytesNoCopy:cbrt_lut_vec.data()
-                                                            length:cbrt_lut_vec.size() * sizeof(float)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
-        
+
         // XTransパラメータ準備
         DemosaicXTransParams params = {
             (uint32_t)width,
@@ -547,11 +561,11 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
             0    // use_cielab = 0 (YPbPr mode by default)
         };
         std::memcpy(params.xtrans, xtrans, sizeof(params.xtrans));
-        
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params
                                                             length:sizeof(params)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
+                                                            options:MTLResourceStorageModeShared];
+        if (!params_buffer) return false;
 
         id<MTLBuffer> tile_data_buffer = [pimpl_->device newBufferWithLength:tile_count * sizeof(XTrans3passTile)
                                                             options:MTLResourceStorageModePrivate];
@@ -585,8 +599,11 @@ bool GPUAccelerator::demosaic_xtrans_3pass(const ImageBufferFloat& raw_buffer,
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
 
-        return command_buffer.status == MTLCommandBufferStatusCompleted;
+        // GPU wrote directly into rgb_buffer.image via newBufferWithBytesNoCopy — no memcpy needed.
+
+        return true;
     }
 #else
     return false;
@@ -875,50 +892,62 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                                             float target_contrast) {
 #ifdef __OBJC__
     if (!pimpl_->initialized) return false;
-    
+
     // 遅延ローディングでパイプライン取得
     id<MTLComputePipelineState> enhance_micro_contrast_pipeline = get_pipeline("enhance_micro_contrast");
     if (!enhance_micro_contrast_pipeline) {
         std::cerr << "❌ Failed to get enhance micro contrast pipeline" << std::endl;
         return false;
     }
-    
+
     @autoreleasepool {
         size_t pixel_count = rgb_input.width * rgb_input.height;
-        
+        size_t rgb_bytes   = pixel_count * 3 * sizeof(float);
+
+        // Both buffers wrap caller-owned page-aligned memory via newBufferWithBytesNoCopy.
         id<MTLBuffer> input_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_input.image[0][0]
-                                                            length:pixel_count * 3 * sizeof(float)
+                                                            length:rgb_bytes
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
-        
+        if (!input_buffer) return false;
+
         id<MTLBuffer> I_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];        
+                                                            options:MTLResourceStorageModeShared];
+        if (!I_buffer) return false;
         vector_float3* I = (vector_float3 *)[I_buffer contents];
 
+        // Shared (not Private) so CPU can read back after GPU Gaussian blurs to
+        // compute max_local_std correctly — the Metal shader's original approach
+        // of computing a global max with unprotected writes and threadgroup_barrier
+        // was a data race (threadgroup_barrier only syncs within one threadgroup).
         id<MTLBuffer> local_mean_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
-                                                            options:MTLResourceStorageModePrivate];
+                                                            options:MTLResourceStorageModeShared];
+        if (!local_mean_buffer) return false;
 
         id<MTLBuffer> local_var_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
-                                                            options:MTLResourceStorageModePrivate];
+                                                            options:MTLResourceStorageModeShared];
+        if (!local_var_buffer) return false;
 
         id<MTLBuffer> output_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_output.image[0][0]
-                                                            length:pixel_count * 3 * sizeof(float)
+                                                            length:rgb_bytes
                                                             options:MTLResourceStorageModeShared
                                                             deallocator:nil];
-        
+        if (!output_buffer) return false;
+
+        // max_local_std will be filled in by CPU after GPU Gaussian blurs complete.
         EnhanceMicroContrastParams params = {
             static_cast<uint32_t>(rgb_input.width),
             static_cast<uint32_t>(rgb_input.height),
             threshold,
             strength,
             target_contrast,
-            0.f
+            0.f  // max_local_std placeholder; overwritten below
         };
-        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytesNoCopy:&params
+        id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params
                                                             length:sizeof(params)
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
-        
+                                                            options:MTLResourceStorageModeShared];
+        if (!params_buffer) return false;
+
         MTLTextureDescriptor *texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
                                                             width:NSUInteger(rgb_input.width)
                                                             height:NSUInteger(rgb_input.height)
@@ -935,7 +964,7 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                                                             bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
 
         MPSImageGaussianBlur *gaussianBlur = [[MPSImageGaussianBlur alloc] initWithDevice:pimpl_->device sigma:5.f / 3.7f];
-        
+
         id<MTLCommandBuffer> command_buffer;
 
         MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
@@ -961,26 +990,59 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
         for (uint32_t idx = 0; idx < pixel_count; ++idx) {
             I[idx] = I[idx] * I[idx];
         }
-        command_buffer = [pimpl_->command_queue commandBuffer];  
+        command_buffer = [pimpl_->command_queue commandBuffer];
         [gaussianBlur encodeToCommandBuffer:command_buffer sourceTexture:I_texture destinationTexture:local_var_texture];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
 
+        // ---------------------------------------------------------------
+        // CPU computes max_local_std from GPU-produced Shared buffers.
+        //
+        // Both local_mean_buffer and local_var_buffer are RGBA32Float
+        // (4 floats/pixel) written by MPS Gaussian blur.
+        // variance[i] = blur(I²)[i] - blur(I)[i]²
+        // local_std[i] = sqrt(max(variance[i], 0))
+        // max_local_std = max over all pixels of max(std.r, std.g, std.b)
+        //
+        // waitUntilCompleted above ensures the GPU writes are visible here.
+        // ---------------------------------------------------------------
+        {
+            const simd_float4* mean_ptr = (const simd_float4*)[local_mean_buffer contents];
+            const simd_float4* var_ptr  = (const simd_float4*)[local_var_buffer  contents];
+            float max_local_std = 0.f;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(max: max_local_std)
+#endif
+            for (size_t i = 0; i < pixel_count; ++i) {
+                simd_float4 v  = var_ptr[i] - mean_ptr[i] * mean_ptr[i];
+                simd_float4 clamped = simd_max(v, simd_make_float4(0.f));
+                simd_float4 s  = simd_make_float4(std::sqrt(clamped.x), std::sqrt(clamped.y),
+                                                  std::sqrt(clamped.z), 0.f);
+                float m = std::max({s.x, s.y, s.z});
+                max_local_std = std::max(max_local_std, m);
+            }
+            // Write the correct value into the Shared params_buffer that the
+            // GPU kernel will read at buffer(4).
+            ((EnhanceMicroContrastParams*)[params_buffer contents])->max_local_std = max_local_std;
+        }
+
         command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> post_encoder = [command_buffer computeCommandEncoder];
         [post_encoder setComputePipelineState:enhance_micro_contrast_pipeline];
-        [post_encoder setBuffer:input_buffer offset:0 atIndex:0];
+        [post_encoder setBuffer:input_buffer  offset:0 atIndex:0];
         [post_encoder setBuffer:local_mean_buffer offset:0 atIndex:1];
-        [post_encoder setBuffer:local_var_buffer offset:0 atIndex:2];
+        [post_encoder setBuffer:local_var_buffer  offset:0 atIndex:2];
         [post_encoder setBuffer:output_buffer offset:0 atIndex:3];
         [post_encoder setBuffer:params_buffer offset:0 atIndex:4];
         [post_encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
         [post_encoder endEncoding];
 
         [command_buffer commit];
-        [command_buffer waitUntilCompleted];        
+        [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+
+        // GPU wrote directly into rgb_output.image via newBufferWithBytesNoCopy — no memcpy needed.
 
         return true;
     }

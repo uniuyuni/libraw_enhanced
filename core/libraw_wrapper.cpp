@@ -25,6 +25,95 @@ namespace py = pybind11;
 
 namespace libraw_enhanced {
 
+// ---------------------------------------------------------------------------
+// box_filter_normalized — separable sliding-window box blur (float, planar)
+//
+// #pragma float_control(precise, on) is REQUIRED here.
+//
+// The build uses -Ofast which enables -fassociative-math, permitting the
+// compiler to reorder floating-point operations for SIMD. The sliding-window
+// accumulator (sum += / sum -=) is order-sensitive: different SIMD groupings
+// of the same sum produce slightly different results due to FP rounding. The
+// grouping depends on the data-pointer alignment at runtime; because heap
+// allocations are ASLR-randomised between process runs, std::vector<float>
+// buffers land at different alignments each run, causing different FP sums
+// and therefore different output pixels. Forcing precise FP semantics for
+// this function eliminates that run-to-run variation while leaving -Ofast in
+// effect everywhere else.
+// ---------------------------------------------------------------------------
+#pragma float_control(precise, on, push)
+static void box_filter_normalized(const std::vector<float> &src,
+                                  std::vector<float> &dst,
+                                  std::vector<float> &tmp,
+                                  size_t width, size_t height, int radius) {
+  if (src.size() != width * height || dst.size() != src.size() ||
+      tmp.size() != src.size() || width == 0 || height == 0) {
+    return;
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+  for (size_t y = 0; y < height; ++y) {
+    const size_t row = y * width;
+    float sum = 0.0f;
+    const size_t first_right = std::min(width - 1, static_cast<size_t>(radius));
+    for (size_t x = 0; x <= first_right; ++x) {
+      sum += src[row + x];
+    }
+
+    for (size_t x = 0; x < width; ++x) {
+      const size_t left = x > static_cast<size_t>(radius)
+                              ? x - static_cast<size_t>(radius)
+                              : 0;
+      const size_t right = std::min(width - 1, x + static_cast<size_t>(radius));
+      tmp[row + x] = sum / static_cast<float>(right - left + 1);
+
+      const size_t remove_x = x >= static_cast<size_t>(radius)
+                                  ? x - static_cast<size_t>(radius)
+                                  : width;
+      const size_t add_x = x + static_cast<size_t>(radius) + 1;
+      if (remove_x < width) {
+        sum -= src[row + remove_x];
+      }
+      if (add_x < width) {
+        sum += src[row + add_x];
+      }
+    }
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+  for (size_t x = 0; x < width; ++x) {
+    float sum = 0.0f;
+    const size_t first_bottom = std::min(height - 1, static_cast<size_t>(radius));
+    for (size_t y = 0; y <= first_bottom; ++y) {
+      sum += tmp[y * width + x];
+    }
+
+    for (size_t y = 0; y < height; ++y) {
+      const size_t top = y > static_cast<size_t>(radius)
+                             ? y - static_cast<size_t>(radius)
+                             : 0;
+      const size_t bottom = std::min(height - 1, y + static_cast<size_t>(radius));
+      dst[y * width + x] = sum / static_cast<float>(bottom - top + 1);
+
+      const size_t remove_y = y >= static_cast<size_t>(radius)
+                                  ? y - static_cast<size_t>(radius)
+                                  : height;
+      const size_t add_y = y + static_cast<size_t>(radius) + 1;
+      if (remove_y < height) {
+        sum -= tmp[remove_y * width + x];
+      }
+      if (add_y < height) {
+        sum += tmp[add_y * width + x];
+      }
+    }
+  }
+}
+#pragma float_control(pop)
+
 class LibRawWrapper::Impl {
 public:
   LibRaw processor;
@@ -1555,7 +1644,7 @@ public:
       float max_value = 0.f;
 
 #ifdef _OPENMP
-#pragma omp parallel for collapse(2)
+#pragma omp parallel for reduction(max: max_value)
 #endif
       for (size_t row = 0; row < rgb_buffer.height; ++row) {
         for (size_t col = 0; col < rgb_buffer.width; ++col) {
@@ -1688,10 +1777,19 @@ public:
     std::cout << "　 Before max value: " << max_val << std::endl;
 
     // 白飛び部分のピクセルを馴染ませる
+    // NOTE: 隣接ピクセルの平均値を事前に全て計算してから書き込む。
+    //       in-place で処理すると書き込み順序によって結果が変わり非決定的になるため、
+    //       必ず「元の状態」を参照した値を使うこと。
     float(*image)[3] = rgb_buffer.image;
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(white.begin(), white.end(), g);
+
+    // Step 1: 全白飛びピクセルの平均値を計算（元の画像を読み取り専用で参照）
+    struct PixelCorrection {
+      size_t idx;
+      float avg[3];
+    };
+    std::vector<PixelCorrection> corrections;
+    corrections.reserve(white.size());
+
     for (std::deque<size_t>::iterator it = white.begin(); it != white.end();
          ++it) {
       const size_t idx = *it;
@@ -1701,12 +1799,22 @@ public:
         continue;
       }
 
+      PixelCorrection pc;
+      pc.idx = idx;
       for (uint32_t c = 0; c < channels; ++c) {
-        float avg = image[idx - width - 1][c] + image[idx - width + 0][c] +
-                    image[idx - width + 1][c] + image[idx - 1][c] +
-                    image[idx + 1][c] + image[idx + width - 1][c] +
-                    image[idx + width + 0][c] + image[idx + width + 1][c];
-        image[idx][c] = avg * (1.f / 8.f);
+        pc.avg[c] = (image[idx - width - 1][c] + image[idx - width + 0][c] +
+                     image[idx - width + 1][c] + image[idx - 1][c] +
+                     image[idx + 1][c] + image[idx + width - 1][c] +
+                     image[idx + width + 0][c] + image[idx + width + 1][c]) *
+                    (1.f / 8.f);
+      }
+      corrections.push_back(pc);
+    }
+
+    // Step 2: 計算した平均値を一括書き込み（処理順序に依存しない）
+    for (const auto &pc : corrections) {
+      for (uint32_t c = 0; c < channels; ++c) {
+        image[pc.idx][c] = pc.avg[c];
       }
     }
 
@@ -1809,76 +1917,9 @@ public:
     return max_val;
   }
 
-  void box_filter_normalized(const std::vector<float> &src,
-                             std::vector<float> &dst,
-                             std::vector<float> &tmp,
-                             size_t width, size_t height, int radius) {
-    if (src.size() != width * height || dst.size() != src.size() ||
-        tmp.size() != src.size() || width == 0 || height == 0) {
-      return;
-    }
-
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-    for (size_t y = 0; y < height; ++y) {
-      const size_t row = y * width;
-      float sum = 0.0f;
-      const size_t first_right = std::min(width - 1, static_cast<size_t>(radius));
-      for (size_t x = 0; x <= first_right; ++x) {
-        sum += src[row + x];
-      }
-
-      for (size_t x = 0; x < width; ++x) {
-        const size_t left = x > static_cast<size_t>(radius)
-                                ? x - static_cast<size_t>(radius)
-                                : 0;
-        const size_t right = std::min(width - 1, x + static_cast<size_t>(radius));
-        tmp[row + x] = sum / static_cast<float>(right - left + 1);
-
-        const size_t remove_x = x >= static_cast<size_t>(radius)
-                                    ? x - static_cast<size_t>(radius)
-                                    : width;
-        const size_t add_x = x + static_cast<size_t>(radius) + 1;
-        if (remove_x < width) {
-          sum -= src[row + remove_x];
-        }
-        if (add_x < width) {
-          sum += src[row + add_x];
-        }
-      }
-    }
-
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-    for (size_t x = 0; x < width; ++x) {
-      float sum = 0.0f;
-      const size_t first_bottom = std::min(height - 1, static_cast<size_t>(radius));
-      for (size_t y = 0; y <= first_bottom; ++y) {
-        sum += tmp[y * width + x];
-      }
-
-      for (size_t y = 0; y < height; ++y) {
-        const size_t top = y > static_cast<size_t>(radius)
-                               ? y - static_cast<size_t>(radius)
-                               : 0;
-        const size_t bottom = std::min(height - 1, y + static_cast<size_t>(radius));
-        dst[y * width + x] = sum / static_cast<float>(bottom - top + 1);
-
-        const size_t remove_y = y >= static_cast<size_t>(radius)
-                                    ? y - static_cast<size_t>(radius)
-                                    : height;
-        const size_t add_y = y + static_cast<size_t>(radius) + 1;
-        if (remove_y < height) {
-          sum -= tmp[remove_y * width + x];
-        }
-        if (add_y < height) {
-          sum += tmp[add_y * width + x];
-        }
-      }
-    }
-  }
+  // box_filter_normalized is defined as a free function before the class
+  // (see below) to allow #pragma float_control(precise) — that pragma cannot
+  // appear inside a class declaration.
 
   float aces_tone_map_scalar(float x) const {
     static constexpr float a = 2.51f;
@@ -2022,15 +2063,15 @@ public:
     const uint32_t filters = imgdata.idata.filters;
     const char(&xtrans)[6][6] = imgdata.idata.xtrans;
     std::cout << "🔍 Filters value: 0x" << std::hex << filters
-              << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::endl;
+              << " (FILTERS_XTRANS=" << FILTERS_XTRANS << ")" << std::dec << std::endl;
 
     // Apply green matching for Bayer sensors (after black level, before
     // demosaic)
     apply_green_matching(raw_buffer, filters);
 
     // rgb_buffer2 is temporary buffer
-    std::vector<float> rgb_buffer2_data(rgb_buffer.width * rgb_buffer.height *
-                                        rgb_buffer.channels);
+    AlignedFloatVec rgb_buffer2_data(rgb_buffer.width * rgb_buffer.height *
+                                    rgb_buffer.channels);
     ImageBufferFloat rgb_buffer2 = {
         reinterpret_cast<float(*)[3]>(rgb_buffer2_data.data()),
         rgb_buffer.width, rgb_buffer.height, rgb_buffer.channels};
@@ -2137,19 +2178,17 @@ public:
     }
 
     // Tone mapping / highlight detail recovery
-    float target_contrast = 0.06f;
+    float target_contrast = 0.04f;
     if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
       
     } else if (params.highlight_mode > 4) {
       apply_detail_preserving_tonemap(rgb_buffer);
 
-    } else if (params.highlight_mode > 3) {
-      target_contrast *= 2.f;
     }
 
     if (params.highlight_mode > 3) {
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold, 8.f, target_contrast);
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold + 0.1, 8.f, target_contrast);
     }
 
     // Fuji SuperCCD honeycomb sensors require an additional geometric
@@ -2167,7 +2206,7 @@ public:
         if (wide_i > 1 && high_i > 1) {
           const size_t wide = static_cast<size_t>(wide_i);
           const size_t high = static_cast<size_t>(high_i);
-          std::vector<float> rotated_data(wide * high * 3, 0.0f);
+          AlignedFloatVec rotated_data(wide * high * 3, 0.0f);
           float (*rot)[3] = reinterpret_cast<float(*)[3]>(rotated_data.data());
 
           for (size_t row = 0; row < high; ++row) {
@@ -2230,6 +2269,17 @@ public:
                                     params.gamma_slope,
                                     params.output_color_space)) {
       return false;
+    }
+
+    // Defringe: run after gamma correction on the final perceptual float buffer
+    if (params.defringe) {
+      std::cout << "🔧 Applying defringe (radius=" << params.defringe_radius
+                << " edge=" << params.defringe_edge_threshold
+                << " chroma=" << params.defringe_chroma_threshold << ")" << std::endl;
+      accelerator->defringe(rgb_buffer, rgb_buffer,
+                            params.defringe_radius,
+                            params.defringe_edge_threshold,
+                            params.defringe_chroma_threshold);
     }
 
     std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully"
@@ -2962,7 +3012,7 @@ public:
 
 #ifdef __arm64__
   // Store processing results
-  std::vector<float> rgb_buffer_image;
+  AlignedFloatVec rgb_buffer_image;
   ImageBufferFloat rgb_buffer;
 #endif
 
@@ -3263,6 +3313,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.use_gpu_acceleration = p.second;
     else if (p.first == "preprocess")
       params.preprocess = p.second;
+    else if (p.first == "defringe")
+      params.defringe = p.second;
   }
 
   for (const auto &p : int_params) {
@@ -3310,6 +3362,12 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.chromatic_aberration_red = p.second;
     else if (p.first == "chromatic_aberration_blue")
       params.chromatic_aberration_blue = p.second;
+    else if (p.first == "defringe_radius")
+      params.defringe_radius = p.second;
+    else if (p.first == "defringe_edge_threshold")
+      params.defringe_edge_threshold = p.second;
+    else if (p.first == "defringe_chroma_threshold")
+      params.defringe_chroma_threshold = p.second;
   }
 
   for (const auto &p : string_params) {

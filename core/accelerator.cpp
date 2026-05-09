@@ -232,8 +232,7 @@ bool Accelerator::demosaic_xtrans_1pass(const ImageBufferFloat& raw_buffer,
                                         const char (&xtrans)[6][6],
                                         const float (&color_matrix)[3][4],
                                         float maximum_value) {
-    //if (should_use_gpu()) {
-    if (false) { // Temporarily disable GPU for testing
+    if (should_use_gpu()) {
         std::cout << "🎯 Trying GPU X-Trans 1-pass demosaic..." << std::endl;
         if (pimpl_->gpu_accelerator->demosaic_xtrans_1pass(raw_buffer, rgb_buffer, xtrans, color_matrix, maximum_value)) {
             std::cout << "✅ GPU X-Trans 1-pass demosaic completed successfully" << std::endl;

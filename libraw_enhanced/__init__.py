@@ -6,7 +6,7 @@ Apple Silicon最適化とMetal Performance Shadersを活用した
 高速RAW画像処理ライブラリ
 """
 
-__version__ = "0.11.1"
+__version__ = "0.11.2"
 __author__ = "LibRaw Enhanced Team"
 
 import warnings

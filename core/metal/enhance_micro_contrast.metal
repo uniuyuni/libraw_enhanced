@@ -20,21 +20,23 @@ kernel void preprocess_enhance_micro_contrast(
 kernel void enhance_micro_contrast(
     const device packed_float3* rgb_input [[buffer(0)]],
     const device packed_float4* local_mean [[buffer(1)]],
-    device packed_float4* local_var [[buffer(2)]],
+    const device packed_float4* local_var_blur [[buffer(2)]],  // blur(I²) — read-only
     device packed_float3* rgb_output [[buffer(3)]],
-    device EnhanceMicroContrastParams& params [[buffer(4)]],
+    constant EnhanceMicroContrastParams& params [[buffer(4)]],  // read-only; max_local_std pre-computed by CPU
     uint2 gid [[thread_position_in_grid]],
     uint2 grid_size [[threads_per_grid]]
 ) {
     const uint idx = (gid.y * params.width + gid.x);
 
-    // 局所標準偏差の計算（後半）
-    local_var[idx] = local_var[idx] - local_mean[idx] * local_mean[idx];
+    // variance = blur(I²) - blur(I)²
+    float4 local_var = local_var_blur[idx] - local_mean[idx] * local_mean[idx];
 
     // コントラストマップの正規化
-    float4 local_std = sqrt(max(local_var[idx], 0.f));
-    params.max_local_std = max(params.max_local_std, max(max(local_std.x, local_std.y), local_std.z));
-    threadgroup_barrier(mem_flags::mem_device);
+    // max_local_std is pre-computed on CPU and passed via params — no global
+    // reduction needed here (the previous approach of writing params.max_local_std
+    // from every thread was a data race; threadgroup_barrier only syncs within
+    // one threadgroup, not across the whole dispatch grid).
+    float4 local_std = sqrt(max(local_var, 0.f));
 
     float4 contrast_map = local_std / params.max_local_std;
 

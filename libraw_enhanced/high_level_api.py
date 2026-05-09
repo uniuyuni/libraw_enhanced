@@ -319,6 +319,12 @@ class RawImage:
             # LibRaw Enhanced extensions
             'use_gpu_acceleration': gpu_acceleration,
             'preprocess': preprocess,
+
+            # Defringe
+            'defringe': defringe,
+            'defringe_radius': float(defringe_radius),
+            'defringe_edge_threshold': float(defringe_edge_threshold),
+            'defringe_chroma_threshold': float(defringe_chroma_threshold),
         }
                 
         # Convert parameter dict to the format expected by C++
@@ -359,32 +365,9 @@ class RawImage:
         if hasattr(result_image, 'color_matrix'):
             self._color_matrix = np.array(result_image.color_matrix, dtype=np.float32)
         
-        # Convert to NumPy array
-        output = result_image.to_numpy()
-
-        # Apply defringe if requested (operates on float32 before final quantization)
-        if defringe:
-            # to_numpy() above returns uint8/uint16; we need float32 for defringe.
-            # Re-fetch as float32: normalize from output_bps range to [0,1].
-            if output.dtype == np.uint16:
-                img_f32 = output.astype(np.float32) / 65535.0
-            elif output.dtype == np.uint8:
-                img_f32 = output.astype(np.float32) / 255.0
-            else:
-                img_f32 = output.astype(np.float32)
-            img_f32 = self.defringe(img_f32,
-                                    radius=defringe_radius,
-                                    edge_threshold=defringe_edge_threshold,
-                                    chroma_threshold=defringe_chroma_threshold)
-            # Convert back to original dtype
-            if output.dtype == np.uint16:
-                output = np.clip(img_f32 * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
-            elif output.dtype == np.uint8:
-                output = np.clip(img_f32 * 255.0 + 0.5, 0, 255).astype(np.uint8)
-            else:
-                output = img_f32
-
-        return output
+        # Convert to NumPy array and return
+        # (defringe is applied inside the C++ pipeline before quantization)
+        return result_image.to_numpy()
     
     def unpack(self):
 

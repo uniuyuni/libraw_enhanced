@@ -7,13 +7,50 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace libraw_enhanced {
+
+// ===== PAGE-ALIGNED ALLOCATOR =====
+// Used for image buffers passed to Metal via newBufferWithBytesNoCopy, which
+// requires the pointer to be aligned to a page boundary (4096 bytes).
+// Memory is allocated with posix_memalign and released with free().
+template <typename T, std::size_t Alignment = 4096>
+struct PageAlignedAllocator {
+    using value_type = T;
+
+    PageAlignedAllocator() noexcept = default;
+    template <typename U>
+    PageAlignedAllocator(const PageAlignedAllocator<U, Alignment>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        void* ptr = nullptr;
+        if (::posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0)
+            throw std::bad_alloc();
+        return static_cast<T*>(ptr);
+    }
+
+    void deallocate(T* ptr, std::size_t) noexcept {
+        ::free(ptr);
+    }
+
+    template <typename U>
+    struct rebind { using other = PageAlignedAllocator<U, Alignment>; };
+};
+
+template <typename T, typename U, std::size_t A>
+bool operator==(const PageAlignedAllocator<T,A>&, const PageAlignedAllocator<U,A>&) noexcept { return true; }
+template <typename T, typename U, std::size_t A>
+bool operator!=(const PageAlignedAllocator<T,A>&, const PageAlignedAllocator<U,A>&) noexcept { return false; }
+
+// Convenience alias
+using AlignedFloatVec = std::vector<float, PageAlignedAllocator<float>>;
 
 // ===== COMMON DEFINITIONS =====
 // These definitions are shared across CPU, GPU, and wrapper components
@@ -103,6 +140,12 @@ struct ProcessingParams {
 
   // LibRaw Enhanced extensions
   bool preprocess = false; // Skip demosaic and return raw Bayer/X-Trans data
+
+  // Defringe (chromatic aberration fringe removal)
+  bool defringe = false;
+  float defringe_radius           = 6.0f;
+  float defringe_edge_threshold   = 0.1f;
+  float defringe_chroma_threshold = 0.15f;
 
   ProcessingParams() {
     // Initialize color matrix to identity

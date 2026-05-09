@@ -80,144 +80,121 @@ def process_raw_file(raw_path, output_dir):
     """RAWファイルを処理してJPG出力"""
     print(f"\n📸 Processing: {raw_path.name}")
     print("=" * 60)
-    
-    try:        
-        # 複数の処理パラメータでテスト
-        test_configs = [
-            {
-                "name": "defringe",
-                "params": {
-                    "use_camera_wb": True,
-                    "use_auto_wb": False,
-                    "half_size": False,
-                    "output_bps": 32,
-                    "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
-                    "use_gpu_acceleration": True,
-                    "output_color": lre.ColorSpace.WideGamutRGB,
-                    "highlight_mode": 5,
-                    "defringe": True,
-                    #"defringe_chroma_threshold": 0.15,
-                    #"defringe_edge_threshold": 0.1,
-                    #"defringe_radius": 6.0,
-                }
-            },
-        ]
-    
-        results = []
-        
-        # 各設定で個別にファイルを読み込み直してテスト
-        for config in test_configs:
-            try:
-                print(f"\n🔧 Testing {config['name']} configuration...")
-                print(f"📂 Reloading RAW file for {config['name']}...")
-                
-                # 設定ごとに新しくファイルを読み込み
-                with lre.imread(str(raw_path)) as raw_fresh:
 
-                    # 画像情報表示
+    # ----------------------------------------------------------------
+    # 処理パラメータ設定リスト
+    # ここを編集して configs を追加・変更する。
+    # 各 config は必ず独立した lre.imread() で処理されるため
+    # LibRaw の内部状態は config 間で共有されない。
+    # ----------------------------------------------------------------
+    _base_params = {
+        "use_camera_wb": True,
+        "use_auto_wb": False,
+        "half_size": False,
+        "output_bps": 32,
+        "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
+        "use_gpu_acceleration": True,
+        "output_color": lre.ColorSpace.WideGamutRGB,
+        "highlight_mode": 5,
+    }
+    test_configs = [
+        {
+            "name": "no defringe",
+            "params": {**_base_params, "defringe": False},
+        },
+        {
+            "name": "defringe",
+            "params": {**_base_params, "defringe": True, "defringe_chroma_threshold": 0.1},
+        },
+    ]
+
+    results = []
+
+    # 各 config を独立した raw オブジェクトで処理
+    # NOTE: lre.imread() を config ごとに新規オープンすること。
+    #       同一 raw オブジェクトで postprocess() を複数回呼ぶと
+    #       LibRaw の内部状態が壊れて2回目以降の結果が不正になる。
+    for config in test_configs:
+        try:
+            print(f"\n🔧 Testing: {config['name']}")
+
+            with lre.imread(str(raw_path)) as raw_fresh:
+                # 画像情報表示
+                try:
                     print(f"📏 Dimensions: {raw_fresh.sizes.width}x{raw_fresh.sizes.height}")
-                    
-                    # カメラ情報取得
-                    try:
-                        camera_info = raw_fresh.camera_info
-                        make = camera_info.get('make', 'Unknown')
-                        model = camera_info.get('model', 'Unknown')
-                        print(f"📱 Camera: {make} {model}")
-                    except Exception as e:
-                        print(f"📱 Camera: Info not available ({e})")
-                    
-                    # 色数情報
-                    try:
-                        print(f"🎨 Colors: {raw_fresh.num_colors}")
-                    except Exception as e:
-                        print(f"🎨 Colors: Not available ({e})")
+                    camera_info = raw_fresh.camera_info
+                    print(f"📱 Camera: {camera_info.get('make','?')} {camera_info.get('model','?')}")
+                    print(f"🎨 Colors: {raw_fresh.num_colors}")
+                except Exception as e:
+                    print(f"📱 Camera info: {e}")
 
-                    # 処理実行
-                    process_start = time.time()
-                    rgb = raw_fresh.postprocess(**config['params'])
-                    process_time = time.time() - process_start
-                    
-                    print(f"⚡ Processing time: {process_time:.3f}s")
-                    print(f"📊 Output shape: {rgb.shape}")
-                    print(f"📊 Output dtype: {rgb.dtype}")
-                    print(f"📈 Value range: [{np.min(rgb)}, {np.max(rgb)}]")
+                # 処理実行
+                process_start = time.time()
+                rgb = raw_fresh.postprocess(**config['params'])
+                process_time = time.time() - process_start
 
-                    rgb_compressed, compressed_pixels = compress_highlights_for_jpeg(rgb)
-                    print(f"📉 Highlight-compressed pixels: {compressed_pixels}")
-                    print(f"📈 Compressed range: [{np.min(rgb_compressed)}, {np.max(rgb_compressed)}]")
+                print(f"⚡ Processing time: {process_time:.3f}s")
+                print(f"📊 Output shape: {rgb.shape}, dtype: {rgb.dtype}")
+                print(f"📈 Value range: [{np.min(rgb)}, {np.max(rgb)}]")
 
-                    rgb_enhanced, enhanced_pixels = rgb_compressed, 0
-                    print(f"📉 Highlight microcontrast pixels: {enhanced_pixels}")
-                    print(f"📈 Enhanced range: [{np.min(rgb_enhanced)}, {np.max(rgb_enhanced)}]")
+                rgb_compressed, compressed_pixels = compress_highlights_for_jpeg(rgb)
+                print(f"📉 Highlight-compressed pixels: {compressed_pixels}")
 
-                    # JPGファイル名生成
-                    base_name = raw_path.stem
-                    save_filename = f"{base_name}_{config['name']}.jpg"
-                    save_path = output_dir / save_filename
+                rgb_enhanced, enhanced_pixels = rgb_compressed, 0
 
-                    profile_name = [
-                        "",
-                        "icc/sRGB IEC61966-2.1.icc",
-                        "icc/Adobe RGB (1998).icc",
-                        "icc/WideGamut RGB.icc",
-                        "icc/ProPhoto RGB.icc",
-                        "icc/XYZD65.icc",
-                        "icc/ACEScg.icc",
-                        "icc/Display P3.icc",
-                        "icc/ITU-R BT.2020.icc",
-                    ]
+                # JPGファイル名生成
+                base_name = raw_path.stem
+                save_filename = f"{base_name}_{config['name']}.jpg"
+                save_path = output_dir / save_filename
 
-                    rgb_clipped = np.clip(rgb_enhanced, 0.0, 1.0)
-                    clipped_pixels = int(np.count_nonzero(rgb_enhanced != rgb_clipped))
-                    print(f"📉 Clipped for JPEG: {clipped_pixels} channel values")
+                profile_name = [
+                    "",
+                    "icc/sRGB IEC61966-2.1.icc",
+                    "icc/Adobe RGB (1998).icc",
+                    "icc/WideGamut RGB.icc",
+                    "icc/ProPhoto RGB.icc",
+                    "icc/XYZD65.icc",
+                    "icc/ACEScg.icc",
+                    "icc/Display P3.icc",
+                    "icc/ITU-R BT.2020.icc",
+                ]
 
-                    # データ読み込み
-                    vips = pyvips.Image.new_from_array((rgb_clipped * 255 + 0.5).astype(np.uint8))
+                rgb_clipped = np.clip(rgb_enhanced, 0.0, 1.0)
+                clipped_pixels = int(np.count_nonzero(rgb_enhanced != rgb_clipped))
+                print(f"📉 Clipped for JPEG: {clipped_pixels} channel values")
 
-                    # iccプロファイル読み込み
-                    #with open(profile_name[config['params']['output_color']], 'rb') as f:
-                    #    icc_bytes = f.read()
-                    profile_path = profile_name[int(config['params']['output_color'])]
-                    print(f"💾 load icc: {profile_path}")
+                profile_path = profile_name[int(config['params']['output_color'])]
+                print(f"💾 ICC profile: {profile_path}")
 
-                    #vips = vips.icc_import(input_profile=profile_name[config['params']['output_color']])
+                vips = pyvips.Image.new_from_array((rgb_clipped * 255 + 0.5).astype(np.uint8))
+                vips.write_to_file(save_path, Q=95, profile=profile_path)
+                print(f"💾 Saved: {save_path}")
 
-                    # JPG保存
-                    vips.write_to_file(save_path, Q=95, profile=profile_path)
-                    #vips.write_to_file(save_path, Q=95)
-                    print(f"💾 Saved: {save_path}")
-                    """
-                    with exiftool.ExifTool() as et:
-                        # exiftoolのコマンドラインオプションと同様に、ICCプロファイルのバイナリを指定して埋め込みます
-                        et.execute("-icc_profile<={}".format(profile_name[config['params']['output_color']]), f"{save_path}")
-                    """                                     
-                    results.append({
-                        'config': config['name'],
-                        'success': True,
-                        'process_time': process_time,
-                        'output_path': save_path,
-                        'shape': rgb.shape,
-                        'value_range': [np.min(rgb), np.max(rgb)],
-                        'compressed_range': [np.min(rgb_compressed), np.max(rgb_compressed)],
-                        'enhanced_range': [np.min(rgb_enhanced), np.max(rgb_enhanced)],
-                        'highlight_compressed_pixels': compressed_pixels,
-                        'highlight_microcontrast_pixels': enhanced_pixels,
-                        'jpeg_clipped_values': clipped_pixels,
-                    })
-                
-            except Exception as e:
-                print(f"❌ Failed {config['name']}: {e}")
                 results.append({
                     'config': config['name'],
-                    'success': False,
-                    'error': str(e)
+                    'success': True,
+                    'process_time': process_time,
+                    'output_path': save_path,
+                    'shape': rgb.shape,
+                    'value_range': [np.min(rgb), np.max(rgb)],
+                    'compressed_range': [np.min(rgb_compressed), np.max(rgb_compressed)],
+                    'enhanced_range': [np.min(rgb_enhanced), np.max(rgb_enhanced)],
+                    'highlight_compressed_pixels': compressed_pixels,
+                    'highlight_microcontrast_pixels': enhanced_pixels,
+                    'jpeg_clipped_values': clipped_pixels,
                 })
-        
-        return results
-            
-    except Exception as e:
-        print(f"❌ Failed to process {raw_path.name}: {e}")
-        return []
+                
+        except Exception as e:
+            import traceback
+            print(f"❌ Failed [{config['name']}]: {e}")
+            traceback.print_exc()
+            results.append({
+                'config': config['name'],
+                'success': False,
+                'error': str(e),
+            })
+
+    return results
 
 def main():
     """メイン処理"""
