@@ -203,6 +203,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Claude Code (local worktrees / agent artifacts; do not commit)
+.claude/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
