@@ -1146,7 +1146,7 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
             shader_source.erase(pos, strlen("#include \"constants.h\""));
         }
         
-        std::string combined_source = types_header + "\n" + common_header + "\n" + constants_header + "/n" + shader_source;
+        std::string combined_source = types_header + "\n" + common_header + "\n" + constants_header + "\n" + shader_source;
         
         // 4. Metalコンパイル（最適化オプション付き）
         NSString* ns_source = [NSString stringWithUTF8String:combined_source.c_str()];

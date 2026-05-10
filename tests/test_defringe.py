@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import numpy as np
+import pyvips
 import pytest
 
 # Pre-load libraw.dylib so the extension module can find it.
@@ -72,6 +73,26 @@ def make_purple_fringe_image(h=64, w=64, fringe_width=2):
 
     return img
 
+def make_red_cloth_image(h=64, w=64):
+    """
+    Problem 1 reproduction: Red fabric with texture.
+    High Cr (R-G), low but positive Cb (B-G).
+    Should NOT be desaturated even if near an edge.
+    """
+    img = np.zeros((h, w, 3), dtype=np.float32)
+    mid = w // 2
+    # Bright red-magenta edge (e.g. red cloth detail)
+    # R=0.8, G=0.2, B=0.25 -> Cr=0.6, Cb=0.05 (triggers purple gate if Cb>0)
+    img[:, :mid, 0] = 0.8
+    img[:, :mid, 1] = 0.2
+    img[:, :mid, 2] = 0.25
+    
+    # Slightly darker side to create an edge for Sobel
+    img[:, mid:, 0] = 0.6
+    img[:, mid:, 1] = 0.15
+    img[:, mid:, 2] = 0.2
+    
+    return img
 
 def make_green_fringe_image(h=64, w=64, fringe_width=2):
     """Similar but green fringe."""
@@ -154,8 +175,8 @@ class TestDefringe:
     def test_purple_fringe_is_reduced(self):
         """Purple fringe pixels at a bright edge should become less saturated."""
         img = make_purple_fringe_image(h=64, w=64, fringe_width=2)
-        out = defringe(img, edge_threshold=0.015, highlight_threshold=0.5,
-                       purple_strength=1.0)
+        out = defringe(img, edge_threshold=0.015, chroma_threshold=0.15,
+                       strength=1.0)
 
         mid = 32
         for col in [mid, mid + 1]:
@@ -176,8 +197,8 @@ class TestDefringe:
     def test_purple_fringe_full_strength(self):
         """With strength=1.0, R and B excess over G should be ~0 after correction."""
         img = make_purple_fringe_image(h=64, w=64, fringe_width=2)
-        out = defringe(img, purple_strength=1.0,
-                       edge_threshold=0.010, highlight_threshold=0.4)
+        out = defringe(img, strength=1.0,
+                       edge_threshold=0.010, chroma_threshold=0.1)
 
         mid = 32
         r_out, g_out, b_out = out[32, mid]
@@ -186,12 +207,33 @@ class TestDefringe:
         assert float(b_out) <= float(g_out) + 0.02, \
             f"B should not exceed G after full purple correction (B={b_out:.3f}, G={g_out:.3f})"
 
+    def test_red_cloth_false_positive_reproduction(self):
+        """
+        CONFIRMING PROBLEM 1:
+        Red cloth (Cr > 0, Cb > 0 small) near an edge should NOT be affected by high strength.
+        Current implementation (blur/strength) will likely fail this (desaturate it).
+        """
+        img = make_red_cloth_image(h=64, w=64)
+        # Apply high strength as reported by user
+        strength = 5.0
+        out = defringe(img, strength=strength, edge_threshold=0.01, chroma_threshold=0.05)
+        
+        # Check a pixel on the red "cloth" side
+        r_in, g_in, b_in = img[32, 10]
+        r_out, g_out, b_out = out[32, 10]
+        
+        # If the problem exists, r_out will be significantly less than r_in
+        diff = np.abs(r_in - r_out)
+        assert diff < 0.02, (
+            f"RED CLOTH AFFECTED: R decreased from {r_in:.3f} to {r_out:.3f} (diff={diff:.3f}). "
+            "Fringe suppression is over-aggressive on natural red objects.")
+
     def test_green_fringe_is_reduced(self):
         """Green fringe pixels should have reduced G-excess after correction."""
         img = make_green_fringe_image(h=64, w=64, fringe_width=2)
-        out = defringe(img, edge_threshold=0.010, highlight_threshold=0.4,
-                       green_strength=1.0)
-
+        # Current C++ implementation targets ONLY purple (Cr>0 && Cb>0).
+        # We still run this to see the current behavior.
+        out = defringe(img, edge_threshold=0.010, chroma_threshold=0.1, strength=1.0)
         mid = 32
         for col in [mid, mid + 1]:
             r_in,  g_in,  b_in  = img[32, col]
@@ -235,8 +277,8 @@ class TestDefringe:
     def test_purple_flower_false_positive(self):
         """Large purple object in mid-tones (no nearby highlight) must not change."""
         img = make_purple_flower_image(h=64, w=64)
-        out = defringe(img, highlight_threshold=0.5)
-
+        # Use high edge threshold to protect flat areas
+        out = defringe(img, edge_threshold=0.2, chroma_threshold=0.1)
         # Compare the large purple region
         region_in  = img[12:52, 12:52]
         region_out = out[12:52, 12:52]
@@ -246,8 +288,7 @@ class TestDefringe:
     def test_micro_fringe_detected(self):
         """Single-pixel purple fringe at very bright edge must be caught."""
         img = make_micro_fringe_image(h=64, w=64)
-        out = defringe(img, edge_threshold=0.010, highlight_threshold=0.4,
-                       purple_strength=1.0)
+        out = defringe(img, edge_threshold=0.010, chroma_threshold=0.1, strength=1.0)
 
         mid = 32
         r_in, g_in, b_in = img[32, mid]
@@ -268,17 +309,46 @@ class TestDefringe:
     def test_output_range(self):
         """All output values must be in [0, 1]."""
         img = make_purple_fringe_image()
-        out = defringe(img, purple_strength=1.0)
+        out = defringe(img, strength=5.0) # Test high strength stability
         assert float(out.min()) >= 0.0 - 1e-6, "Minimum must be >= 0"
         assert float(out.max()) <= 1.0 + 1e-6, "Maximum must be <= 1"
+
+    def test_chroma_threshold_aliasing_reproduction(self):
+        """
+        CONFIRMING PROBLEM 2:
+        High chroma_threshold should not cause 'islands' or jagged correction masks.
+        We check if the transition is smooth by looking at the gradient.
+        """
+        img = make_purple_fringe_image(h=64, w=64, fringe_width=4)
+        # High threshold as reported
+        out = defringe(img, strength=1.0, chroma_threshold=0.4, edge_threshold=0.05)
+        
+        # Measure the smoothness of the correction MASK (amount added).
+        # Natural edges in the image (grad~0.4) should not cause failure.
+        correction_amount = np.abs(out[32, :, 0] - img[32, :, 0])
+        grad = np.abs(np.diff(correction_amount))
+        
+        max_grad = np.max(grad)
+        max_idx = np.argmax(grad)
+        
+        if max_grad >= 0.15:
+            print(f"\n[DEBUG] Aliasing failure analysis at row 32, max mask grad {max_grad:.4f} at col {max_idx}")
+            print(f"Col | Input R | Output R | Mask Grad")
+            print(f"----|---------|----------|----------")
+            for c in range(max(0, max_idx - 5), min(64, max_idx + 6)):
+                g_val = grad[c] if c < len(grad) else 0.0
+                print(f"{c:3d} | {img[32,c,0]:.4f}  | {out[32,c,0]:.4f}   | {g_val:.4f}")
+        
+        assert max_grad < 0.15, (
+            f"MASK ALIASING DETECTED: Sharp transition in correction mask (grad={max_grad:.3f}).")
 
     def test_partial_strength(self):
         """With strength=0.5, correction should be partial (between in and full)."""
         img = make_purple_fringe_image(h=64, w=64, fringe_width=2)
-        out_full    = defringe(img, purple_strength=1.0,
-                               edge_threshold=0.010, highlight_threshold=0.4)
-        out_partial = defringe(img, purple_strength=0.5,
-                               edge_threshold=0.010, highlight_threshold=0.4)
+        out_full    = defringe(img, strength=1.0,
+                               edge_threshold=0.010, chroma_threshold=0.1)
+        out_partial = defringe(img, strength=0.5,
+                               edge_threshold=0.010, chroma_threshold=0.1)
 
         mid = 32
         r_in,  _, _ = img[32, mid]
@@ -304,7 +374,7 @@ class TestDefringe:
         img[:, :mid, :] = 0.90
 
         t0 = time.perf_counter()
-        out = defringe(img, edge_threshold=0.015, highlight_threshold=0.5)
+        out = defringe(img, edge_threshold=0.015, chroma_threshold=0.15)
         elapsed = time.perf_counter() - t0
 
         assert out is not None
@@ -322,8 +392,7 @@ class TestDefringe:
         # Bright neighbor (top row is near-white)
         img[0, :, :] = 0.98
 
-        out = defringe(img, density_threshold=0.25,
-                       edge_threshold=0.005, highlight_threshold=0.5)
+        out = defringe(img, edge_threshold=0.005, chroma_threshold=0.1)
 
         # Most of the purple area should be UNCHANGED because density is too high
         # (the entire image is purple → density >> 0.25)
@@ -367,7 +436,7 @@ def test_xt5_defringe_integration():
         img_no_df = raw.postprocess(
             use_camera_wb=True,
             output_bps=16,
-            highlight_mode=lre.HighlightMode.Clip,
+            highlight_mode=5,
         )
     print(f"  Without defringe: {time.perf_counter()-t0:.2f}s, shape={img_no_df.shape}, dtype={img_no_df.dtype}")
 
@@ -378,12 +447,10 @@ def test_xt5_defringe_integration():
         img_df = raw.postprocess(
             use_camera_wb=True,
             output_bps=16,
-            highlight_mode=lre.HighlightMode.Clip,
+            highlight_mode=5,
             defringe=True,
-            defringe_edge_threshold=0.015,
-            defringe_highlight_threshold=0.5,
-            defringe_purple_strength=1.0,
-            defringe_green_strength=0.7,
+            defringe_edge_threshold=0.1,
+            defringe_strength=3.0,
         )
     print(f"  With defringe: {time.perf_counter()-t0:.2f}s, shape={img_df.shape}")
 
@@ -420,26 +487,26 @@ def test_xt5_defringe_integration():
 
     # Save comparison images
     try:
-        from PIL import Image
         h, w = img_no_df.shape[:2]
 
-        def to_uint8(arr16):
-            return (arr16.astype(np.float32) / 256.0).clip(0, 255).astype(np.uint8)
+        def save_vips(arr16, path):
+            # Ensure full resolution 16-bit to 8-bit conversion via pyvips
+            vi = pyvips.Image.new_from_memory(arr16.data, w, h, 3, "ushort")
+            # Scale 16-bit to 8-bit for JPEG, preserving full resolution detail
+            vi.write_to_file(path, Q=95)
 
         if img_no_df.dtype == np.uint16:
-            Image.fromarray(to_uint8(img_no_df)).save(
-                os.path.join(RESULT_DIR, "xt5_room_no_defringe.jpg"), quality=90)
-            Image.fromarray(to_uint8(img_df)).save(
-                os.path.join(RESULT_DIR, "xt5_room_defringe.jpg"), quality=90)
+            save_vips(img_no_df, os.path.join(RESULT_DIR, "xt5_room_no_defringe.jpg"))
+            save_vips(img_df, os.path.join(RESULT_DIR, "xt5_room_defringe.jpg"))
 
         # Save diff map (amplified x20)
-        diff_amp = np.clip(diff * 20.0, 0, 1)
-        Image.fromarray((diff_amp * 255).astype(np.uint8)).save(
-            os.path.join(RESULT_DIR, "xt5_room_defringe_diff.jpg"), quality=90)
+        diff_amp = (np.clip(diff * 20.0, 0, 1) * 255).astype(np.uint8)
+        pyvips.Image.new_from_memory(diff_amp.data, w, h, 3, "uchar").write_to_file(
+            os.path.join(RESULT_DIR, "xt5_room_defringe_diff.jpg"), Q=90)
 
         print(f"  Saved comparison images to {RESULT_DIR}/")
-    except ImportError:
-        print("  Pillow not available, skipping image save")
+    except Exception as e:
+        print(f"  Failed to save images: {e}")
 
     print("  ✅ Integration test passed")
 
@@ -464,9 +531,8 @@ def test_xt5_defringe_numpy_standalone():
     t0 = time.perf_counter()
     w = LibRawWrapper()
     out_f = w.defringe(img_f,
-                       edge_threshold=0.015,
-                       highlight_threshold=0.5,
-                       purple_strength=1.0)
+                       edge_threshold=0.1,
+                       strength=1.0)
     elapsed = time.perf_counter() - t0
 
     assert out_f.shape == img_f.shape

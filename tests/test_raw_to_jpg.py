@@ -94,8 +94,9 @@ def process_raw_file(raw_path, output_dir):
         "output_bps": 32,
         "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
         "use_gpu_acceleration": True,
-        "output_color": lre.ColorSpace.WideGamutRGB,
+        "output_color": lre.ColorSpace.ProPhotoRGB,
         "highlight_mode": 5,
+        #"gamma": (1.0, 1.0),
     }
     test_configs = [
         {
@@ -104,7 +105,11 @@ def process_raw_file(raw_path, output_dir):
         },
         {
             "name": "defringe",
-            "params": {**_base_params, "defringe": True, "defringe_chroma_threshold": 0.1},
+            "params": {**_base_params, "defringe": True,
+                "defringe_edge_threshold": 0.1,
+                "defringe_chroma_threshold": 0.15,
+                "defringe_strength": 3.0
+            },
         },
     ]
 
