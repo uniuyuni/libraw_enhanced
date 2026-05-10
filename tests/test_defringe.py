@@ -437,6 +437,7 @@ def test_xt5_defringe_integration():
             use_camera_wb=True,
             output_bps=16,
             highlight_mode=5,
+            gamma=(1.0, 1.0),
         )
     print(f"  Without defringe: {time.perf_counter()-t0:.2f}s, shape={img_no_df.shape}, dtype={img_no_df.dtype}")
 
@@ -448,6 +449,7 @@ def test_xt5_defringe_integration():
             use_camera_wb=True,
             output_bps=16,
             highlight_mode=5,
+            gamma=(1.0, 1.0),
             defringe=True,
             defringe_edge_threshold=0.1,
             defringe_strength=3.0,
@@ -521,6 +523,8 @@ def test_xt5_defringe_numpy_standalone():
     """
     import libraw_enhanced as lre
     from libraw_enhanced._core import LibRawWrapper
+
+    print(f"libraw_enhanced version: {lre.__version__}")
 
     with lre.imread(RAF_PATH) as raw:
         img16 = raw.postprocess(use_camera_wb=True, output_bps=16)

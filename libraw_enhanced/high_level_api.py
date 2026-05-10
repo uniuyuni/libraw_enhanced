@@ -12,10 +12,12 @@ try:
     from ._core import (
         LibRawWrapper,
         ImageInfo,
+        __version__,
     )
     _CORE_AVAILABLE = True
 except ImportError as e:
     _CORE_AVAILABLE = False
+    __version__ = "0.11.5"
     import warnings
     warnings.warn(f"Core module not available: {e}")
     
