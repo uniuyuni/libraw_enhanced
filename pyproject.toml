@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "libraw_enhanced"
-version = "0.11.5"
+dynamic = ["version"]
 description = "High-performance LibRaw Python wrapper with Metal acceleration"
 readme = "README.md"
 license = {text = "MIT"}
@@ -64,6 +64,9 @@ Documentation = "https://libraw-enhanced.readthedocs.io/"
 packages = ["libraw_enhanced"]
 include-package-data = true
 zip-safe = false
+
+[tool.setuptools.dynamic]
+version = {attr = "libraw_enhanced._version.__version__"}
 
 [tool.setuptools.package-data]
 libraw_enhanced = ["*.pyi", "py.typed"]

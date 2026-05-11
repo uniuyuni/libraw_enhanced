@@ -11,6 +11,11 @@
 #include <memory>
 #include <vector>
 #include <array>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <cstdint>
+#include <sys/stat.h>
 
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -3294,7 +3299,8 @@ bool CPUAccelerator::defringe(
     float radius,
     float edge_threshold,
     float chroma_threshold,
-    float strength)
+    float strength,
+    bool enable_green_defringe)
 {
     if (!rgb_input.is_valid()) return false;
 
@@ -3441,6 +3447,26 @@ bool CPUAccelerator::defringe(
     const float sensitivity = std::clamp(std::sqrt(std::max(strength, 1.0f)), 1.0f, 2.5f);
     const float inv_sensitivity = 1.0f / sensitivity;
     const float mask_cutoff = 0.02f * inv_sensitivity;
+    const float scene_highlight_gate = smoothstep(0.55f, 0.75f, max_guide);
+    const char* debug_dir_env = std::getenv("LIBRAW_ENHANCED_DEFRINGE_DEBUG_DIR");
+    const bool debug_defringe = debug_dir_env && debug_dir_env[0] != '\0';
+    std::vector<float> dbg_seed_edge, dbg_seed_bright, dbg_seed_hue, dbg_seed_chroma, dbg_seed_warm;
+    std::vector<float> dbg_linked, dbg_edge, dbg_hue, dbg_chroma, dbg_local, dbg_warm, dbg_mask, dbg_amount;
+    if (debug_defringe) {
+        dbg_seed_edge.assign(N, 0.f);
+        dbg_seed_bright.assign(N, 0.f);
+        dbg_seed_hue.assign(N, 0.f);
+        dbg_seed_chroma.assign(N, 0.f);
+        dbg_seed_warm.assign(N, 0.f);
+        dbg_linked.assign(N, 0.f);
+        dbg_edge.assign(N, 0.f);
+        dbg_hue.assign(N, 0.f);
+        dbg_chroma.assign(N, 0.f);
+        dbg_local.assign(N, 0.f);
+        dbg_warm.assign(N, 0.f);
+        dbg_mask.assign(N, 0.f);
+        dbg_amount.assign(N, 0.f);
+    }
 
     // A soft neighbourhood support map lets high-strength cleanup catch
     // one-sided red/blue fringe segments that are visually identifiable only
@@ -3483,25 +3509,121 @@ bool CPUAccelerator::defringe(
             const float c_bright_support = smoothstep(0.24f * inv_sensitivity,
                                                       0.52f * inv_sensitivity,
                                                       blur_guide[i]);
-            const float c_hue_support = smoothstep(0.06f * inv_sensitivity,
-                                                   0.22f * inv_sensitivity,
-                                                   min_dir_support) *
-                                        smoothstep(0.35f, 0.75f, balance_support);
             const float c_chroma_support = smoothstep(chroma_threshold * 0.45f * inv_sensitivity,
                                                       chroma_threshold * 1.60f * inv_sensitivity,
                                                       excess_support);
             const float red_strength_support = std::max(0.f, r0 - std::max(g0, b0)) /
                                                std::max(r0, 1e-4f);
             const float red_blue_balance_support = b0 / std::max(r0, 1e-4f);
+            const float blue_lift_support = std::max(0.f, b0 - g0) /
+                                            std::max(r0 - g0, 1e-4f);
+            const float red_purple_support =
+                std::max(smoothstep(0.55f, 0.78f, red_blue_balance_support),
+                         smoothstep(0.16f, 0.34f, blue_lift_support));
+            const float red_purple_hue_signal =
+                smoothstep(0.50f, 0.72f, red_blue_balance_support) *
+                smoothstep(0.24f, 0.42f, blue_lift_support);
+            const float balanced_hue_support =
+                smoothstep(0.06f * inv_sensitivity,
+                           0.22f * inv_sensitivity,
+                           min_dir_support) *
+                smoothstep(0.35f, 0.75f, balance_support);
+            const float red_purple_hue_support = is_purple_support
+                ? std::min(1.f, red_purple_hue_signal * 1.50f) *
+                  smoothstep(0.035f * inv_sensitivity,
+                             0.16f * inv_sensitivity,
+                             min_dir_support) *
+                  smoothstep(0.18f, 0.58f, balance_support)
+                : 0.f;
+            const float c_hue_support = std::max(balanced_hue_support,
+                                                 red_purple_hue_support);
             const float natural_red_support_guard =
-                1.f - smoothstep(0.22f, 0.45f, red_strength_support) *
-                      (1.f - smoothstep(0.45f, 0.70f, red_blue_balance_support));
+                1.f - smoothstep(0.08f, 0.25f, red_strength_support) *
+                      (1.f - red_purple_support);
+            const float green_support_enable = (enable_green_defringe || is_purple_support) ? 1.f : 0.f;
+            if (debug_defringe) {
+                dbg_seed_edge[i] = c_edge_support;
+                dbg_seed_bright[i] = c_bright_support;
+                dbg_seed_hue[i] = c_hue_support;
+                dbg_seed_chroma[i] = c_chroma_support;
+                dbg_seed_warm[i] = natural_red_support_guard;
+            }
             fringe_support[i] = c_edge_support * c_bright_support *
                                 c_hue_support * c_chroma_support *
-                                natural_red_support_guard;
+                                natural_red_support_guard * green_support_enable;
         }
     }
     gaussian_blur(fringe_support, blur_fringe_support);
+
+    // Experimental line-linked support: fringe tends to continue along the
+    // edge direction while fading quickly across it. This block is intentionally
+    // self-contained so it can be removed if the heuristic is too aggressive.
+    std::vector<float> line_fringe_support(N, 0.f);
+    auto sample_map = [&](const std::vector<float>& map, int x, int y) -> float {
+        x = std::max(0, std::min((int)W - 1, x));
+        y = std::max(0, std::min((int)H - 1, y));
+        return map[(size_t)y * W + (size_t)x];
+    };
+    std::vector<float> line_source(N, 0.f);
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t i = 0; i < N; i++) {
+        line_source[i] = std::max(fringe_support[i], blur_fringe_support[i] * 0.55f);
+    }
+    auto sample_fringe_support = [&](int x, int y) -> float {
+        return sample_map(line_source, x, y);
+    };
+    auto dump_debug_map = [&](const std::string& name, const std::vector<float>& map) {
+        if (!debug_defringe) return;
+        mkdir(debug_dir_env, 0755);
+        float maxv = 0.f;
+        for (float v : map) {
+            if (std::isfinite(v)) maxv = std::max(maxv, std::abs(v));
+        }
+        maxv = std::max(maxv, 1e-6f);
+        std::string path = debug_dir_env;
+        if (!path.empty() && path.back() != '/') path += '/';
+        path += name + ".pgm";
+        std::ofstream out(path, std::ios::binary);
+        out << "P5\n" << W << " " << H << "\n65535\n";
+        for (float v : map) {
+            const float n = std::clamp(std::isfinite(v) ? v / maxv : 0.f, 0.f, 1.f);
+            const uint16_t q = (uint16_t)std::lround(n * 65535.f);
+            const unsigned char hi = (unsigned char)((q >> 8) & 0xff);
+            const unsigned char lo = (unsigned char)(q & 0xff);
+            out.put((char)hi);
+            out.put((char)lo);
+        }
+    };
+    const int line_dirs[8][2] = {
+        {1, 0}, {0, 1}, {1, 1}, {1, -1},
+        {2, 1}, {1, 2}, {2, -1}, {1, -2}
+    };
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (size_t y = 0; y < H; y++) {
+        for (size_t x = 0; x < W; x++) {
+            const size_t i = y * W + x;
+            float best = 0.f;
+            for (int dir_idx = 0; dir_idx < 8; dir_idx++) {
+                const int tx = line_dirs[dir_idx][0], ty = line_dirs[dir_idx][1];
+                const int nx = -ty, ny = tx;
+                float along = 0.f;
+                const int max_step = dir_idx < 4 ? 14 : 6;
+                for (int step = 1; step <= max_step; step++) {
+                    along = std::max(along, sample_fringe_support((int)x + tx * step, (int)y + ty * step));
+                    along = std::max(along, sample_fringe_support((int)x - tx * step, (int)y - ty * step));
+                }
+                const float across = std::max(sample_map(fringe_support, (int)x + nx * 2, (int)y + ny * 2),
+                                              sample_map(fringe_support, (int)x - nx * 2, (int)y - ny * 2));
+                const float thin = 1.f - smoothstep(along * 0.45f, along * 0.95f, across);
+                best = std::max(best, along * thin);
+            }
+            line_fringe_support[i] = best;
+        }
+    }
 
     std::vector<float> solo_r_seed(N, 0.f), solo_b_seed(N, 0.f);
     std::vector<float> solo_r_mask_blur(N, 0.f), solo_b_mask_blur(N, 0.f);
@@ -3518,7 +3640,9 @@ bool CPUAccelerator::defringe(
                                  std::max(blur_guide[i], 0.05f);
             const float solo_b = std::max(0.f, src[i][2] - target_b) /
                                  std::max(blur_guide[i], 0.05f);
-            const float linked_fringe = smoothstep(0.02f, 0.12f, blur_fringe_support[i]);
+            const float linked_fringe = smoothstep(0.004f, 0.045f,
+                                                   std::max(blur_fringe_support[i],
+                                                            line_fringe_support[i] * 0.90f));
             const float c_edge_solo = smoothstep(edge_threshold * 0.35f * inv_sensitivity,
                                                  edge_threshold * 1.50f * inv_sensitivity,
                                                  blur_edge[i]) *
@@ -3572,25 +3696,49 @@ bool CPUAccelerator::defringe(
                 : std::max(1e-4f, std::max(-rg, -bg));
             const float balance = min_dir / max_dir;
 
-            const float c_edge = smoothstep(edge_threshold * 0.35f * inv_sensitivity,
-                                            edge_threshold * 1.50f * inv_sensitivity,
-                                            blur_edge[i]) *
-                                 smoothstep(0.55f * inv_sensitivity,
-                                            1.35f * inv_sensitivity,
-                                            blur_edge_raw[i]);
+            const float c_edge_core = smoothstep(edge_threshold * 0.35f * inv_sensitivity,
+                                                 edge_threshold * 1.50f * inv_sensitivity,
+                                                 blur_edge[i]) *
+                                      smoothstep(0.55f * inv_sensitivity,
+                                                 1.35f * inv_sensitivity,
+                                                 blur_edge_raw[i]);
+            const float c_edge_low = smoothstep(edge_threshold * 0.10f * inv_sensitivity,
+                                                edge_threshold * 0.80f * inv_sensitivity,
+                                                blur_edge[i]) *
+                                     smoothstep(0.20f * inv_sensitivity,
+                                                0.90f * inv_sensitivity,
+                                                blur_edge_raw[i]);
+            const float linked_fringe = smoothstep(0.004f, 0.045f,
+                                                   std::max(blur_fringe_support[i],
+                                                            line_fringe_support[i] * 0.90f));
             const float c_bright = smoothstep(0.24f * inv_sensitivity,
                                               0.52f * inv_sensitivity,
                                               blur_guide[i]);
-            const float c_hue = smoothstep(0.06f * inv_sensitivity,
-                                           0.22f * inv_sensitivity,
-                                           min_dir) *
-                                smoothstep(0.35f, 0.75f, balance);
             const float c_chroma = smoothstep(chroma_threshold * 0.45f * inv_sensitivity,
                                               chroma_threshold * 1.60f * inv_sensitivity,
                                               excess);
             const float r0 = std::max(src[i][0], 0.f);
             const float g0 = std::max(src[i][1], 0.f);
             const float b0 = std::max(src[i][2], 0.f);
+            const float red_blue_balance_hue = b0 / std::max(r0, 1e-4f);
+            const float blue_lift_hue = std::max(0.f, b0 - g0) /
+                                        std::max(r0 - g0, 1e-4f);
+            const float red_purple_hue_signal =
+                smoothstep(0.50f, 0.72f, red_blue_balance_hue) *
+                smoothstep(0.24f, 0.42f, blue_lift_hue);
+            const float balanced_hue =
+                smoothstep(0.06f * inv_sensitivity,
+                           0.22f * inv_sensitivity,
+                           min_dir) *
+                smoothstep(0.35f, 0.75f, balance);
+            const float red_purple_hue_gate = is_purple
+                ? std::min(1.f, red_purple_hue_signal * 1.50f) *
+                  smoothstep(0.035f * inv_sensitivity,
+                             0.16f * inv_sensitivity,
+                             min_dir) *
+                  smoothstep(0.18f, 0.58f, balance)
+                : 0.f;
+            const float c_hue = std::max(balanced_hue, red_purple_hue_gate);
             const float rb_avg = 0.5f * (r0 + b0);
             const float purple_abs = std::min(std::max(0.f, r0 - g0),
                                               std::max(0.f, b0 - g0)) /
@@ -3603,33 +3751,82 @@ bool CPUAccelerator::defringe(
                                            chroma_threshold * 1.20f * inv_sensitivity,
                                            abs_excess);
 
+            const float low_contrast_color = smoothstep(chroma_threshold * 1.20f * inv_sensitivity,
+                                                        chroma_threshold * 2.40f * inv_sensitivity,
+                                                        abs_excess);
+            const float c_edge = std::max(c_edge_core,
+                                          std::max(c_edge_low * linked_fringe * 1.45f,
+                                                   c_edge_low * low_contrast_color * 0.35f));
             const float ratio_mask = c_edge * c_bright * c_hue * c_chroma;
-            const float direct_mask = c_edge * c_bright * c_abs;
+            const float direct_mask = c_edge * c_bright * c_hue * c_abs;
             const bool use_direct = direct_mask > ratio_mask;
-            float mask = std::max(ratio_mask, direct_mask);
+            float mask = std::max(ratio_mask, direct_mask) * scene_highlight_gate;
             const bool correct_purple = use_direct ? abs_is_purple : is_purple;
+            float local_gate = 0.f;
             if (correct_purple) {
-                const float local_purple = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
-                                                      chroma_threshold * 0.55f * inv_sensitivity,
-                                                      purple_abs);
-                mask *= local_purple;
+                local_gate = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
+                                        chroma_threshold * 0.55f * inv_sensitivity,
+                                        purple_abs);
+                mask *= local_gate;
             } else {
-                const float local_green = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
-                                                     chroma_threshold * 0.55f * inv_sensitivity,
-                                                     green_abs);
-                mask *= local_green;
+                local_gate = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
+                                        chroma_threshold * 0.55f * inv_sensitivity,
+                                        green_abs);
+                const float green_highlight_protect =
+                    1.f - 0.85f * smoothstep(0.62f, 0.88f, blur_guide[i]);
+                const float rb_to_green = rb_avg / std::max(g0, 1e-4f);
+                const float natural_green_highlight =
+                    smoothstep(0.22f, 0.46f, rb_to_green) *
+                    smoothstep(0.42f, 0.72f, g0);
+                mask *= local_gate * 0.35f * green_highlight_protect *
+                        (1.f - 0.90f * natural_green_highlight);
+                if (!enable_green_defringe) {
+                    mask = 0.f;
+                }
+            }
+            if (debug_defringe) {
+                dbg_linked[i] = linked_fringe;
+                dbg_edge[i] = c_edge;
+                dbg_hue[i] = c_hue;
+                dbg_chroma[i] = std::max(c_chroma, c_abs);
+                dbg_local[i] = local_gate;
+                dbg_mask[i] = mask;
             }
 
             if (mask > mask_cutoff) {
                 const float g = std::max(src[i][1], 0.f);
                 const float red_strength = std::max(0.f, r0 - std::max(g0, b0)) /
                                            std::max(r0, 1e-4f);
+                const float red_blue_balance = b0 / std::max(r0, 1e-4f);
+                const float blue_lift = std::max(0.f, b0 - g0) /
+                                        std::max(r0 - g0, 1e-4f);
+                const float red_purple =
+                    std::max(smoothstep(0.55f, 0.78f, red_blue_balance),
+                             smoothstep(0.16f, 0.34f, blue_lift));
+                const float natural_warm_guard =
+                    1.f - smoothstep(0.08f, 0.25f, red_strength) *
+                          (1.f - red_purple);
+                const float line_purple_relief =
+                    smoothstep(0.012f, 0.06f, line_fringe_support[i]) *
+                    smoothstep(0.10f, 0.24f, blue_lift);
+                const float warm_protect = correct_purple
+                    ? std::max(natural_warm_guard,
+                               std::max(linked_fringe * 1.05f, line_purple_relief))
+                    : 1.f;
+                if (debug_defringe) dbg_warm[i] = warm_protect;
                 const float red_without_support =
                     smoothstep(0.22f, 0.45f, red_strength) *
                     (1.f - smoothstep(0.02f, 0.12f, blur_fringe_support[i]));
                 const float protect = correct_purple ? red_without_support : 0.f;
-                const float amount = std::clamp(mask * strength * 1.90f * (1.f - protect),
+                const float smooth_mask = smoothstep(mask_cutoff,
+                                                     mask_cutoff * 5.0f,
+                                                     mask);
+                const float threshold_soften = 1.f - 0.86f * smoothstep(0.22f, 0.40f, chroma_threshold);
+                const float amount = std::clamp(smooth_mask * strength * 1.90f *
+                                                (1.f - protect) * warm_protect *
+                                                threshold_soften,
                                                 0.f, 1.f);
+                if (debug_defringe) dbg_amount[i] = amount;
                 if (amount <= 1e-4f) continue;
                 const float target_r = std::min(g, g * std::exp(blur_log_rg[i]));
                 const float target_b = std::min(g, g * std::exp(blur_log_bg[i]));
@@ -3694,6 +3891,27 @@ bool CPUAccelerator::defringe(
                 }
             }
         }
+    }
+
+    if (debug_defringe) {
+        dump_debug_map("01_fringe_support_seed", fringe_support);
+        dump_debug_map("01a_seed_edge", dbg_seed_edge);
+        dump_debug_map("01b_seed_bright", dbg_seed_bright);
+        dump_debug_map("01c_seed_hue", dbg_seed_hue);
+        dump_debug_map("01d_seed_chroma", dbg_seed_chroma);
+        dump_debug_map("01e_seed_warm_guard", dbg_seed_warm);
+        dump_debug_map("02_fringe_support_blur", blur_fringe_support);
+        dump_debug_map("02b_line_source", line_source);
+        dump_debug_map("03_line_support", line_fringe_support);
+        dump_debug_map("04_linked_gate", dbg_linked);
+        dump_debug_map("05_edge_gate", dbg_edge);
+        dump_debug_map("06_hue_gate", dbg_hue);
+        dump_debug_map("07_chroma_gate", dbg_chroma);
+        dump_debug_map("08_local_color_gate", dbg_local);
+        dump_debug_map("09_warm_protect", dbg_warm);
+        dump_debug_map("10_final_mask", dbg_mask);
+        dump_debug_map("11_amount", dbg_amount);
+        std::cout << "🧪 Defringe debug maps: " << debug_dir_env << std::endl;
     }
 
     std::cout << "✅ Defringe: corrected " << std::dec << corrected_count

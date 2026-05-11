@@ -9,15 +9,15 @@ from typing import Optional, Union, Tuple, Any, Dict
 from pathlib import Path
 
 try:
+    from ._version import __version__
     from ._core import (
         LibRawWrapper,
         ImageInfo,
-        __version__,
     )
     _CORE_AVAILABLE = True
 except ImportError as e:
     _CORE_AVAILABLE = False
-    __version__ = "0.11.5"
+    from ._version import __version__
     import warnings
     warnings.warn(f"Core module not available: {e}")
     
@@ -174,10 +174,9 @@ class RawImage:
 
                    # Defringe (chromatic aberration fringe removal)
                    defringe: bool = False,
-                   defringe_radius: float = 6.0,
-                   defringe_edge_threshold: float = 0.1,
-                   defringe_chroma_threshold: float = 0.15,
-                   defringe_strength: float = 1.0) -> np.ndarray:
+                   defringe_radius: float = 10.0,
+                   defringe_strength: float = 10.0,
+                   defringe_green: bool = False) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 
@@ -244,10 +243,9 @@ class RawImage:
 
             # Defringe parameters
             defringe: If True, apply linear RGB chromatic aberration fringe removal before output gamma.
-            defringe_radius: Gaussian blur radius for fringe detection (default 6.0).
-            defringe_edge_threshold: Normalized Sobel edge threshold [0,1] (default 0.1).
-            defringe_chroma_threshold: Local log-ratio chroma excess threshold (default 0.15).
-            defringe_strength: Correction strength. Values above 1.0 also increase detection sensitivity.
+            defringe_radius: Gaussian blur radius for fringe detection (default 10.0).
+            defringe_strength: Correction strength and detection sensitivity (default 10.0).
+            defringe_green: Also correct green fringes. Disabled by default to protect natural green highlights.
 
         Returns:
 
@@ -327,9 +325,8 @@ class RawImage:
             # Defringe
             'defringe': defringe,
             'defringe_radius': float(defringe_radius),
-            'defringe_edge_threshold': float(defringe_edge_threshold),
-            'defringe_chroma_threshold': float(defringe_chroma_threshold),
             'defringe_strength': float(defringe_strength),
+            'defringe_green': bool(defringe_green),
         }
                 
         # Convert parameter dict to the format expected by C++
@@ -477,10 +474,9 @@ class RawImage:
 
     def defringe(self,
                  image: np.ndarray,
-                 radius: float = 6.0,
-                 edge_threshold: float = 0.1,
-                 chroma_threshold: float = 0.15,
-                 strength: float = 1.0) -> np.ndarray:
+                 radius: float = 10.0,
+                 strength: float = 10.0,
+                 defringe_green: bool = False) -> np.ndarray:
         """
         色収差フリンジ除去（linear RGB guide-green chroma-ratio suppression）。
 
@@ -492,15 +488,14 @@ class RawImage:
         Algorithm:
           1. G からエッジガイドを作り、log(R/G), log(B/G) を計算
           2. log-ratio を Gaussian blur して周辺の自然な色比を推定
-          3. 明るい高コントラスト境界上の、細くバランスした紫/緑異常だけを検出
-          4. 紫フリンジは R/B を G 由来の推定値へ、緑フリンジは G を局所推定値へ寄せる
+          3. 明るい高コントラスト境界上の、細い紫異常を検出
+          4. 紫フリンジは R/B を G 由来の推定値へ寄せる
 
         Args:
             image: 入力画像 (H, W, 3) float32 linear RGB, 値域は 0.0〜1.0 以上でも可
-            radius: Gaussian blur 半径（ピクセル）。デフォルト 6.0
-            edge_threshold: 正規化 Sobel 閾値 [0,1]。デフォルト 0.1
-            chroma_threshold: log-ratio クロマ超過閾値。デフォルト 0.15
-            strength: 補正強度。1.0 を超える値では検出感度も上がります。
+            radius: Gaussian blur 半径（ピクセル）。デフォルト 10.0
+            strength: 補正強度と検出感度。デフォルト 10.0
+            defringe_green: 緑フリンジも補正するか。自然な緑ハイライト保護のためデフォルト False。
 
         Returns:
             numpy.ndarray: フリンジ除去後の新しい (H, W, 3) float32 配列
@@ -511,7 +506,7 @@ class RawImage:
         if not self._is_loaded:
             raise RuntimeError("No RAW file loaded. Call load_file() first.")
         arr = np.ascontiguousarray(image, dtype=np.float32)
-        return self._wrapper.defringe(arr, radius, edge_threshold, chroma_threshold, strength)
+        return self._wrapper.defringe(arr, radius, strength, defringe_green)
 
     def close(self):
         """リソースの解放"""

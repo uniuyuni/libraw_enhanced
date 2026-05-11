@@ -19,6 +19,13 @@ from pybind11.setup_helpers import Pybind11Extension, build_ext
 from distutils.unixccompiler import UnixCCompiler
 
 
+def get_package_version():
+    version_ns = {}
+    version_file = Path(__file__).resolve().parent / "libraw_enhanced" / "_version.py"
+    exec(version_file.read_text(encoding="utf-8"), version_ns)
+    return version_ns["__version__"]
+
+
 def is_apple_platform():
     """Apple プラットフォームの検出"""
     return platform.system() == "Darwin"
@@ -217,6 +224,7 @@ class CustomBuildExt(build_ext):
 
 
 def create_extension():
+    package_version = get_package_version()
     """拡張モジュールの作成"""
     
     # LibRaw検出
@@ -270,7 +278,7 @@ def create_extension():
     extra_compile_args = [
         '-std=c++17',
         '-O3',
-        '-DVERSION_INFO="0.11.4"',  # エスケープ修正
+        f'-DVERSION_INFO="{package_version}"',
     ]
     
     # リンクフラグ
@@ -325,7 +333,7 @@ def create_extension():
     
     # プリプロセッサ定義
     define_macros = [
-        ('VERSION_INFO', '"0.11.4"'),  # 引用符修正
+        ('VERSION_INFO', f'"{package_version}"'),
     ]
     
     if is_apple_platform():

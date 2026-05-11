@@ -2254,14 +2254,15 @@ public:
     // output color spaces.
     if (params.defringe) {
       std::cout << "🔧 Applying linear defringe (radius=" << params.defringe_radius
-                << " edge=" << params.defringe_edge_threshold
-                << " chroma=" << params.defringe_chroma_threshold
-                << " strength=" << params.defringe_strength << ")" << std::endl;
+                << " strength=" << params.defringe_strength
+                << " green=" << (params.defringe_green ? "on" : "off")
+                << ")" << std::endl;
       accelerator->defringe(rgb_buffer, rgb_buffer,
                             params.defringe_radius,
                             params.defringe_edge_threshold,
                             params.defringe_chroma_threshold,
-                            params.defringe_strength);
+                            params.defringe_strength,
+                            params.defringe_green);
     }
 
     // Get camera-specific color transformation matrix
@@ -3319,6 +3320,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.preprocess = p.second;
     else if (p.first == "defringe")
       params.defringe = p.second;
+    else if (p.first == "defringe_green")
+      params.defringe_green = p.second;
   }
 
   for (const auto &p : int_params) {
@@ -3368,10 +3371,6 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.chromatic_aberration_blue = p.second;
     else if (p.first == "defringe_radius")
       params.defringe_radius = p.second;
-    else if (p.first == "defringe_edge_threshold")
-      params.defringe_edge_threshold = p.second;
-    else if (p.first == "defringe_chroma_threshold")
-      params.defringe_chroma_threshold = p.second;
     else if (p.first == "defringe_strength")
       params.defringe_strength = p.second;
   }
@@ -3594,9 +3593,8 @@ LibRawWrapper::enhance_micro_contrast_numpy(py::array_t<float> image,
 py::array_t<float>
 LibRawWrapper::defringe_numpy(py::array_t<float> image,
                               float radius,
-                              float edge_threshold,
-                              float chroma_threshold,
-                              float strength) {
+                              float strength,
+                              bool defringe_green) {
   py::buffer_info buf = image.request();
   if (buf.ndim != 3 || buf.shape[2] != 3) {
     throw std::invalid_argument(
@@ -3629,7 +3627,7 @@ LibRawWrapper::defringe_numpy(py::array_t<float> image,
     throw std::runtime_error("defringe_numpy: accelerator not initialized");
   }
   pimpl->accelerator->defringe(rgb_in, rgb_out,
-                                radius, edge_threshold, chroma_threshold, strength);
+                                radius, 0.1f, 0.15f, strength, defringe_green);
   return output;
 }
 

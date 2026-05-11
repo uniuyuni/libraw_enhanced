@@ -143,10 +143,11 @@ struct ProcessingParams {
 
   // Defringe (chromatic aberration fringe removal)
   bool defringe = false;
-  float defringe_radius           = 6.0f;
+  bool defringe_green = false;
+  float defringe_radius           = 10.0f;
   float defringe_edge_threshold   = 0.1f;
   float defringe_chroma_threshold = 0.15f;
-  float defringe_strength         = 1.0f;
+  float defringe_strength         = 10.0f;
 
   ProcessingParams() {
     // Initialize color matrix to identity
@@ -310,10 +311,11 @@ public:
   // Defringe: edge-gated Gaussian opponent-chroma suppression (HDR-safe)
   bool defringe(const ImageBufferFloat &rgb_input,
                 ImageBufferFloat &rgb_output,
-                float radius           = 6.0f,
+                float radius           = 10.0f,
                 float edge_threshold   = 0.1f,
                 float chroma_threshold = 0.15f,
-                float strength         = 1.0f);
+                float strength         = 10.0f,
+                bool defringe_green    = false);
 
 private:
   class Impl;

@@ -114,6 +114,10 @@ PYBIND11_MODULE(_core, m) {
       // Metal-specific settings
       .def_readwrite("use_gpu_acceleration",
                      &ProcessingParams::use_gpu_acceleration)
+      .def_readwrite("defringe", &ProcessingParams::defringe)
+      .def_readwrite("defringe_green", &ProcessingParams::defringe_green)
+      .def_readwrite("defringe_radius", &ProcessingParams::defringe_radius)
+      .def_readwrite("defringe_strength", &ProcessingParams::defringe_strength)
       .def_property(
           "color_matrix",
           [](ProcessingParams &self) -> py::array_t<float> {
@@ -335,17 +339,15 @@ PYBIND11_MODULE(_core, m) {
            "Returns a new array.")
       .def("defringe",
            &LibRawWrapper::defringe_numpy, py::arg("image"),
-           py::arg("radius") = 6.0f,
-           py::arg("edge_threshold") = 0.1f,
-           py::arg("chroma_threshold") = 0.15f,
-           py::arg("strength") = 1.0f,
+           py::arg("radius") = 10.0f,
+           py::arg("strength") = 10.0f,
+           py::arg("defringe_green") = false,
            "Remove chromatic aberration fringe on a linear (H,W,3) float32 numpy array.\n"
            "Uses guide-green local log(R/G), log(B/G) ratio suppression.\n"
            "Pipeline defringe runs before output color-space conversion and gamma.\n"
-           "  radius: Gaussian blur radius in pixels (default 6.0)\n"
-           "  edge_threshold: normalized Sobel edge strength [0,1] (default 0.1)\n"
-           "  chroma_threshold: relative chroma excess to trigger correction (default 0.15)\n"
-           "  strength: correction strength and detection sensitivity (default 1.0)\n"
+           "  radius: Gaussian blur radius in pixels (default 10.0)\n"
+           "  strength: correction strength and detection sensitivity (default 10.0)\n"
+           "  defringe_green: also correct green fringes (default false)\n"
            "Returns a new float32 array.")
 #endif
       ;

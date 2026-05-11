@@ -100,10 +100,11 @@ public:
     // Designed to run before output color-space conversion and gamma.
     bool defringe(const ImageBufferFloat& rgb_input,
                   ImageBufferFloat& rgb_output,
-                  float radius           = 6.0f,   // Gaussian blur radius (px)
+                  float radius           = 10.0f,  // Gaussian blur radius (px)
                   float edge_threshold   = 0.1f,   // Normalized Sobel threshold [0,1]
                   float chroma_threshold = 0.15f,  // Relative chroma excess threshold
-                  float strength         = 1.0f);  // Correction strength and detection sensitivity
+                  float strength         = 10.0f,  // Correction strength and detection sensitivity
+                  bool defringe_green    = false); // Also correct green fringes
 
 private: 
     bool initialized_ = false;
