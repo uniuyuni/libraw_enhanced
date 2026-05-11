@@ -2249,6 +2249,21 @@ public:
       }
     }
 
+    // Defringe in linear camera RGB before output color-space conversion and
+    // gamma. This keeps detection stable for gamma=(1,1) and for different
+    // output color spaces.
+    if (params.defringe) {
+      std::cout << "🔧 Applying linear defringe (radius=" << params.defringe_radius
+                << " edge=" << params.defringe_edge_threshold
+                << " chroma=" << params.defringe_chroma_threshold
+                << " strength=" << params.defringe_strength << ")" << std::endl;
+      accelerator->defringe(rgb_buffer, rgb_buffer,
+                            params.defringe_radius,
+                            params.defringe_edge_threshold,
+                            params.defringe_chroma_threshold,
+                            params.defringe_strength);
+    }
+
     // Get camera-specific color transformation matrix
     camera_matrix = compute_camera_transform(
         imgdata.idata.make, imgdata.idata.model, params.output_color_space);
@@ -2269,19 +2284,6 @@ public:
                                     params.gamma_slope,
                                     params.output_color_space)) {
       return false;
-    }
-
-    // Defringe: run after gamma correction on the final perceptual float buffer
-    if (params.defringe) {
-      std::cout << "🔧 Applying defringe (radius=" << params.defringe_radius
-                << " edge=" << params.defringe_edge_threshold
-                << " chroma=" << params.defringe_chroma_threshold
-                << " strength=" << params.defringe_strength << ")" << std::endl;
-      accelerator->defringe(rgb_buffer, rgb_buffer,
-                            params.defringe_radius,
-                            params.defringe_edge_threshold,
-                            params.defringe_chroma_threshold,
-                            params.defringe_strength);
     }
 
     std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully"

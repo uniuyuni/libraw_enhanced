@@ -3280,19 +3280,13 @@ inline float smoothstep(float edge0, float edge1, float x) {
 }
 
 //===================================================================
-// Defringe: Edge-gated Gaussian opponent-chroma suppression
+// Defringe: linear RGB, guide-green chroma-ratio suppression
 //
-// Algorithm (darktable defringe inspired, adapted for HDR float32):
-//   1. Compute luminance Y and opponent chroma Cr=R-G, Cb=B-G
-//   2. Sobel edge map on Y, normalized to [0,1] (scale-invariant)
-//   3. Separable Gaussian blur of Cr and Cb → reference chroma
-//   4. At each edge pixel: excess = (|Cr-blur_Cr| + |Cb-blur_Cb|) / max(Y, 0.05)
-//      If excess > chroma_threshold: replace Cr/Cb with blurred values,
-//      preserve luminance exactly (G = Y - 0.299*Cr - 0.114*Cb)
-//
-// Values > 1.0 are handled correctly because:
-//   - Sobel is normalized by its own maximum → edge_threshold scale-invariant
-//   - Chroma excess is divided by Y → relative ratio, HDR-safe
+// The detector intentionally works before output color-space conversion and
+// gamma. It compares local log(R/G) and log(B/G) ratios against a blurred
+// neighbourhood reference, so exposure/gamma changes do not redefine what a
+// fringe is. Thin magenta fringes are corrected by pulling R/B toward the
+// local guide-green prediction; thin green fringes are corrected by trimming G.
 //===================================================================
 bool CPUAccelerator::defringe(
     const ImageBufferFloat& rgb_input,
@@ -3311,18 +3305,34 @@ bool CPUAccelerator::defringe(
     float (*dst)[3]       = rgb_output.image;
 
     // ----------------------------------------------------------------
-    // Step 1: Luminance Y and opponent chroma Cr, Cb
+    // Step 1: Guide-green intensity and log chroma ratios.
     // ----------------------------------------------------------------
-    std::vector<float> Y(N), Cr(N), Cb(N);
+    float max_guide = 0.f;
+#ifdef _OPENMP
+    #pragma omp parallel for reduction(max : max_guide)
+#endif
+    for (size_t i = 0; i < N; i++) {
+        const float guide = std::max(0.f, src[i][1]);
+        if (guide > max_guide) max_guide = guide;
+    }
+    max_guide = std::max(max_guide, 1e-6f);
+    const float ratio_eps = std::max(max_guide * 1e-4f, 1e-6f);
+
+    std::vector<float> guide_linear(N), guide_signal(N), log_rg(N), log_bg(N);
 #ifdef _OPENMP
     #pragma omp parallel for
 #endif
     for (size_t i = 0; i < N; i++) {
         const float r = src[i][0], g = src[i][1], b = src[i][2];
-        Y[i]  = 0.299f * r + 0.587f * g + 0.114f * b;
-        Cr[i] = r - g;  // red-green opponent
-        Cb[i] = b - g;  // blue-green opponent
-        
+        const float gg = std::max(g, 0.f);
+
+        // Perceptual compression is used only for edge detection. The actual
+        // correction below is applied in the original linear RGB values.
+        guide_linear[i] = gg;
+        guide_signal[i] = std::sqrt(std::clamp(gg / max_guide, 0.f, 1.f));
+        log_rg[i] = std::log((std::max(r, 0.f) + ratio_eps) / (gg + ratio_eps));
+        log_bg[i] = std::log((std::max(b, 0.f) + ratio_eps) / (gg + ratio_eps));
+
         // Initialize dst with src
         dst[i][0] = r;
         dst[i][1] = g;
@@ -3330,9 +3340,10 @@ bool CPUAccelerator::defringe(
     }
 
     // ----------------------------------------------------------------
-    // Step 2: Sobel edge map on Y, normalized to [0,1]
+    // Step 2: Sobel edge map on guide signal, normalized to [0,1].
     // ----------------------------------------------------------------
     std::vector<float> edge(N, 0.f);
+    std::vector<float> edge_raw(N, 0.f);
     {
         float max_edge = 0.f;
         const size_t limit_y = (H > 1) ? H - 1 : 1;
@@ -3342,18 +3353,19 @@ bool CPUAccelerator::defringe(
 #endif
         for (size_t y = 1; y < limit_y; y++) {
             for (size_t x = 1; x < limit_x; x++) {
-                float gx = -Y[(y - 1) * W + (x - 1)] + Y[(y - 1) * W + (x + 1)] -
-                           2.f * Y[y * W + (x - 1)] + 2.f * Y[y * W + (x + 1)] -
-                           Y[(y + 1) * W + (x - 1)] + Y[(y + 1) * W + (x + 1)];
-                float gy = -Y[(y - 1) * W + (x - 1)] - 2.f * Y[(y - 1) * W + x] -
-                           Y[(y - 1) * W + (x + 1)] + Y[(y + 1) * W + (x - 1)] +
-                           2.f * Y[(y + 1) * W + x] + Y[(y + 1) * W + (x + 1)];
+                float gx = -guide_signal[(y - 1) * W + (x - 1)] + guide_signal[(y - 1) * W + (x + 1)] -
+                           2.f * guide_signal[y * W + (x - 1)] + 2.f * guide_signal[y * W + (x + 1)] -
+                           guide_signal[(y + 1) * W + (x - 1)] + guide_signal[(y + 1) * W + (x + 1)];
+                float gy = -guide_signal[(y - 1) * W + (x - 1)] - 2.f * guide_signal[(y - 1) * W + x] -
+                           guide_signal[(y - 1) * W + (x + 1)] + guide_signal[(y + 1) * W + (x - 1)] +
+                           2.f * guide_signal[(y + 1) * W + x] + guide_signal[(y + 1) * W + (x + 1)];
                 float mag = std::sqrt(gx * gx + gy * gy);
                 edge[y * W + x] = mag;
+                edge_raw[y * W + x] = mag;
                 if (mag > max_edge) max_edge = mag;
             }
         }
-        float edge_norm_factor = std::max(max_edge, 16.0f);
+        float edge_norm_factor = std::max(max_edge, 1e-6f);
         if (edge_norm_factor > 0.f) {
             float inv = 1.f / edge_norm_factor;
 #ifdef _OPENMP
@@ -3364,7 +3376,7 @@ bool CPUAccelerator::defringe(
     }
 
     // ----------------------------------------------------------------
-    // Step 3: Separable Gaussian blur of Y, Cr, Cb and edge
+    // Step 3: Separable Gaussian blur of chroma ratios and edge.
     //   sigma = radius / 3  so kernel extends to ±radius pixels
     // ----------------------------------------------------------------
     const float sigma = std::max(radius / 3.f, 0.5f);
@@ -3415,18 +3427,121 @@ bool CPUAccelerator::defringe(
         }
     };
 
-    std::vector<float> blur_Y(N), blur_Cr(N), blur_Cb(N), blur_edge(N);
-    gaussian_blur(Y, blur_Y);
-    gaussian_blur(Cr, blur_Cr);
-    gaussian_blur(Cb, blur_Cb);
+    std::vector<float> blur_guide(N), blur_log_rg(N), blur_log_bg(N), blur_edge(N), blur_edge_raw(N);
+    gaussian_blur(guide_linear, blur_guide);
+    gaussian_blur(log_rg, blur_log_rg);
+    gaussian_blur(log_bg, blur_log_bg);
     gaussian_blur(edge, blur_edge);
+    gaussian_blur(edge_raw, blur_edge_raw);
 
     // ----------------------------------------------------------------
-    // Step 4: Fringe correction
-    //   excess = (|Cr - blur_Cr| + |Cb - blur_Cb|) / max(Y, 0.05)
-    //   Relative threshold → HDR-safe (values > 1.0 handled correctly)
+    // Step 4: Correct only narrow, balanced, edge-gated ratio anomalies.
     // ----------------------------------------------------------------
     size_t corrected_count = 0;
+    const float sensitivity = std::clamp(std::sqrt(std::max(strength, 1.0f)), 1.0f, 2.5f);
+    const float inv_sensitivity = 1.0f / sensitivity;
+    const float mask_cutoff = 0.02f * inv_sensitivity;
+
+    // A soft neighbourhood support map lets high-strength cleanup catch
+    // one-sided red/blue fringe segments that are visually identifiable only
+    // because they connect to a nearby magenta/green fringe run. This keeps
+    // isolated natural red edges protected.
+    std::vector<float> fringe_support(N, 0.f), blur_fringe_support(N, 0.f);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (size_t y = 0; y < H; y++) {
+        for (size_t x = 0; x < W; x++) {
+            const size_t i = y * W + x;
+            const float rg = log_rg[i];
+            const float bg = log_bg[i];
+            const float dr = rg - blur_log_rg[i];
+            const float db = bg - blur_log_bg[i];
+            const float r0 = std::max(src[i][0], 0.f);
+            const float g0 = std::max(src[i][1], 0.f);
+            const float b0 = std::max(src[i][2], 0.f);
+
+            const float purple_excess = std::min(std::max(0.f, dr), std::max(0.f, db));
+            const float green_excess = std::min(std::max(0.f, -dr), std::max(0.f, -db));
+            const bool is_purple_support = purple_excess >= green_excess;
+            const float excess_support = is_purple_support ? purple_excess : green_excess;
+
+            const float min_dir_support = is_purple_support
+                ? std::max(0.f, std::min(rg, bg))
+                : std::max(0.f, std::min(-rg, -bg));
+            const float max_dir_support = is_purple_support
+                ? std::max(1e-4f, std::max(rg, bg))
+                : std::max(1e-4f, std::max(-rg, -bg));
+            const float balance_support = min_dir_support / max_dir_support;
+
+            const float c_edge_support = smoothstep(edge_threshold * 0.35f * inv_sensitivity,
+                                                    edge_threshold * 1.50f * inv_sensitivity,
+                                                    blur_edge[i]) *
+                                         smoothstep(0.55f * inv_sensitivity,
+                                                    1.35f * inv_sensitivity,
+                                                    blur_edge_raw[i]);
+            const float c_bright_support = smoothstep(0.24f * inv_sensitivity,
+                                                      0.52f * inv_sensitivity,
+                                                      blur_guide[i]);
+            const float c_hue_support = smoothstep(0.06f * inv_sensitivity,
+                                                   0.22f * inv_sensitivity,
+                                                   min_dir_support) *
+                                        smoothstep(0.35f, 0.75f, balance_support);
+            const float c_chroma_support = smoothstep(chroma_threshold * 0.45f * inv_sensitivity,
+                                                      chroma_threshold * 1.60f * inv_sensitivity,
+                                                      excess_support);
+            const float red_strength_support = std::max(0.f, r0 - std::max(g0, b0)) /
+                                               std::max(r0, 1e-4f);
+            const float red_blue_balance_support = b0 / std::max(r0, 1e-4f);
+            const float natural_red_support_guard =
+                1.f - smoothstep(0.22f, 0.45f, red_strength_support) *
+                      (1.f - smoothstep(0.45f, 0.70f, red_blue_balance_support));
+            fringe_support[i] = c_edge_support * c_bright_support *
+                                c_hue_support * c_chroma_support *
+                                natural_red_support_guard;
+        }
+    }
+    gaussian_blur(fringe_support, blur_fringe_support);
+
+    std::vector<float> solo_r_seed(N, 0.f), solo_b_seed(N, 0.f);
+    std::vector<float> solo_r_mask_blur(N, 0.f), solo_b_mask_blur(N, 0.f);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (size_t y = 0; y < H; y++) {
+        for (size_t x = 0; x < W; x++) {
+            const size_t i = y * W + x;
+            const float g = std::max(src[i][1], 0.f);
+            const float target_r = g * std::exp(blur_log_rg[i]);
+            const float target_b = g * std::exp(blur_log_bg[i]);
+            const float solo_r = std::max(0.f, src[i][0] - target_r) /
+                                 std::max(blur_guide[i], 0.05f);
+            const float solo_b = std::max(0.f, src[i][2] - target_b) /
+                                 std::max(blur_guide[i], 0.05f);
+            const float linked_fringe = smoothstep(0.02f, 0.12f, blur_fringe_support[i]);
+            const float c_edge_solo = smoothstep(edge_threshold * 0.35f * inv_sensitivity,
+                                                 edge_threshold * 1.50f * inv_sensitivity,
+                                                 blur_edge[i]) *
+                                      smoothstep(0.55f * inv_sensitivity,
+                                                 1.35f * inv_sensitivity,
+                                                 blur_edge_raw[i]);
+            const float c_bright_solo = smoothstep(0.24f * inv_sensitivity,
+                                                   0.52f * inv_sensitivity,
+                                                   blur_guide[i]);
+            const float solo_enable = smoothstep(1.25f, 3.0f, strength);
+            solo_r_seed[i] = solo_enable * c_edge_solo * c_bright_solo *
+                linked_fringe *
+                smoothstep(chroma_threshold * 0.22f * inv_sensitivity,
+                           chroma_threshold * 0.95f * inv_sensitivity,
+                           solo_r);
+            solo_b_seed[i] = solo_enable * c_edge_solo * c_bright_solo *
+                smoothstep(chroma_threshold * 0.22f * inv_sensitivity,
+                           chroma_threshold * 0.95f * inv_sensitivity,
+                           solo_b);
+        }
+    }
+    gaussian_blur(solo_r_seed, solo_r_mask_blur);
+    gaussian_blur(solo_b_seed, solo_b_mask_blur);
 #ifdef _OPENMP
     #pragma omp parallel for reduction(+: corrected_count) collapse(2)
 #endif
@@ -3434,64 +3549,149 @@ bool CPUAccelerator::defringe(
         for (size_t x = 0; x < W; x++) {
             const size_t i = y * W + x;
 
-            // 1. Spatially Smooth Master Mask (Purely based on blurred components)
-            // This determines WHERE and HOW MUCH to correct with zero spatial aliasing.
+            const float rg = log_rg[i];
+            const float bg = log_bg[i];
+            const float dr = rg - blur_log_rg[i];
+            const float db = bg - blur_log_bg[i];
 
-            // c_edge: Focus on high-contrast highlight boundaries. 
-            // Wide range to provide smooth spatial support.
-            float c_edge = smoothstep(edge_threshold * 0.01f, edge_threshold * 2.0f, blur_edge[i]);
+            const float purple_r = std::max(0.f, dr);
+            const float purple_b = std::max(0.f, db);
+            const float green_r = std::max(0.f, -dr);
+            const float green_b = std::max(0.f, -db);
 
-            // c_luma: Fringes appear near high-contrast edges. 
-            // Restore floor to 0.15 to allow detection in synthetic test fringes (~0.28).
-            // This fixes the purple_fringe_is_reduced failure.
-            float c_luma = smoothstep(0.15f, 0.45f, blur_Y[i]); 
-            
-            // 2. Directional Hue Confidence with Balance
-            // Logic: Pure Red (high Cr, low Cb) must be excluded.
-            // Balance = min(Cr, Cb) / max(Cr, Cb). Purple fringe has both.
-            float min_p = std::max(0.0f, std::min(blur_Cr[i], blur_Cb[i]));
-            float max_p = std::max(1e-4f, std::max(blur_Cr[i], blur_Cb[i]));
-            float min_g = std::max(0.0f, std::min(-blur_Cr[i], -blur_Cb[i]));
-            float max_g = std::max(1e-4f, std::max(-blur_Cr[i], -blur_Cb[i]));
+            const float purple_excess = std::min(purple_r, purple_b);
+            const float green_excess = std::min(green_r, green_b);
+            const bool is_purple = purple_excess >= green_excess;
+            const float excess = is_purple ? purple_excess : green_excess;
 
-            // Balance: ratio of components. Purple fringe must have both.
-            // Red fabric has very low ratio. 
-            float balance_p = min_p / max_p;
-            float balance_g = min_g / max_g;
+            const float min_dir = is_purple
+                ? std::max(0.f, std::min(rg, bg))
+                : std::max(0.f, std::min(-rg, -bg));
+            const float max_dir = is_purple
+                ? std::max(1e-4f, std::max(rg, bg))
+                : std::max(1e-4f, std::max(-rg, -bg));
+            const float balance = min_dir / max_dir;
 
-            // c_hue: require minimum component strength AND a balanced ratio.
-            // Starting at 0.02f for min_p ignores low-level color noise.
-            float c_hue_p = smoothstep(0.02f, 0.10f, min_p) * smoothstep(0.15f, 0.45f, balance_p);
-            float c_hue_g = smoothstep(0.02f, 0.10f, min_g) * smoothstep(0.15f, 0.45f, balance_g);
-            float c_hue = std::max(c_hue_p, c_hue_g);
-            
-            // 3. Spatially Smooth Decision (Blob Excess)
-            // Normalized by luma to handle HDR. Factor 4.0x compensates for blur dilution.
-            float p_blob = (min_p * 4.0f) / std::max(blur_Y[i], 0.05f);
-            float g_blob = (min_g * 4.0f) / std::max(blur_Y[i], 0.05f);
-            float blob_excess = (c_hue_p >= c_hue_g) ? p_blob : g_blob;
-            
-            // m_chroma: Use a massive transition range (0.1x to 2.0x) to ensure mask 
-            // spatial gradients stay well below 0.15 limit for aliasing tests.
-            float m_chroma = smoothstep(chroma_threshold * 0.1f, chroma_threshold * 2.0f, blob_excess);
+            const float c_edge = smoothstep(edge_threshold * 0.35f * inv_sensitivity,
+                                            edge_threshold * 1.50f * inv_sensitivity,
+                                            blur_edge[i]) *
+                                 smoothstep(0.55f * inv_sensitivity,
+                                            1.35f * inv_sensitivity,
+                                            blur_edge_raw[i]);
+            const float c_bright = smoothstep(0.24f * inv_sensitivity,
+                                              0.52f * inv_sensitivity,
+                                              blur_guide[i]);
+            const float c_hue = smoothstep(0.06f * inv_sensitivity,
+                                           0.22f * inv_sensitivity,
+                                           min_dir) *
+                                smoothstep(0.35f, 0.75f, balance);
+            const float c_chroma = smoothstep(chroma_threshold * 0.45f * inv_sensitivity,
+                                              chroma_threshold * 1.60f * inv_sensitivity,
+                                              excess);
+            const float r0 = std::max(src[i][0], 0.f);
+            const float g0 = std::max(src[i][1], 0.f);
+            const float b0 = std::max(src[i][2], 0.f);
+            const float rb_avg = 0.5f * (r0 + b0);
+            const float purple_abs = std::min(std::max(0.f, r0 - g0),
+                                              std::max(0.f, b0 - g0)) /
+                                     std::max(blur_guide[i], 0.05f);
+            const float green_abs = std::max(0.f, g0 - rb_avg) /
+                                    std::max(blur_guide[i], 0.05f);
+            const bool abs_is_purple = purple_abs >= green_abs;
+            const float abs_excess = abs_is_purple ? purple_abs : green_abs;
+            const float c_abs = smoothstep(chroma_threshold * 0.35f * inv_sensitivity,
+                                           chroma_threshold * 1.20f * inv_sensitivity,
+                                           abs_excess);
 
-            // Master Mask: spatially smooth product of all blurred gates.
-            float mask = c_edge * c_luma * c_hue * m_chroma;
+            const float ratio_mask = c_edge * c_bright * c_hue * c_chroma;
+            const float direct_mask = c_edge * c_bright * c_abs;
+            const bool use_direct = direct_mask > ratio_mask;
+            float mask = std::max(ratio_mask, direct_mask);
+            const bool correct_purple = use_direct ? abs_is_purple : is_purple;
+            if (correct_purple) {
+                const float local_purple = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
+                                                      chroma_threshold * 0.55f * inv_sensitivity,
+                                                      purple_abs);
+                mask *= local_purple;
+            } else {
+                const float local_green = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
+                                                     chroma_threshold * 0.55f * inv_sensitivity,
+                                                     green_abs);
+                mask *= local_green;
+            }
 
-            if (mask > 1e-4f) {
-                // 4. Correction Logic: Higher boost to reach full neutralization.
-                float amount = std::min(1.0f, mask * strength * 4.0f);
+            if (mask > mask_cutoff) {
+                const float g = std::max(src[i][1], 0.f);
+                const float red_strength = std::max(0.f, r0 - std::max(g0, b0)) /
+                                           std::max(r0, 1e-4f);
+                const float red_without_support =
+                    smoothstep(0.22f, 0.45f, red_strength) *
+                    (1.f - smoothstep(0.02f, 0.12f, blur_fringe_support[i]));
+                const float protect = correct_purple ? red_without_support : 0.f;
+                const float amount = std::clamp(mask * strength * 1.90f * (1.f - protect),
+                                                0.f, 1.f);
+                if (amount <= 1e-4f) continue;
+                const float target_r = std::min(g, g * std::exp(blur_log_rg[i]));
+                const float target_b = std::min(g, g * std::exp(blur_log_bg[i]));
 
-                float new_Cr = Cr[i] * (1.0f - amount);
-                float new_Cb = Cb[i] * (1.0f - amount);
-
-                // 5. Reconstruct RGB while exactly preserving original luminance Y
-                float new_G = Y[i] - 0.299f * new_Cr - 0.114f * new_Cb;
-                dst[i][0] = std::clamp(new_G + new_Cr, 0.f, src[i][0]);
-                dst[i][1] = std::max(0.f, new_G);
-                dst[i][2] = std::clamp(new_G + new_Cb, 0.f, src[i][2]);
+                if (correct_purple) {
+                    dst[i][0] = std::clamp(src[i][0] * (1.f - amount) + target_r * amount,
+                                           0.f, src[i][0]);
+                    dst[i][1] = src[i][1];
+                    dst[i][2] = std::clamp(src[i][2] * (1.f - amount) + target_b * amount,
+                                           0.f, src[i][2]);
+                } else {
+                    float target_g = src[i][1];
+                    const float rg_ref = std::exp(blur_log_rg[i]);
+                    const float bg_ref = std::exp(blur_log_bg[i]);
+                    if (rg_ref > 1e-4f && bg_ref > 1e-4f) {
+                        const float g_from_r = std::max(src[i][0], 0.f) / rg_ref;
+                        const float g_from_b = std::max(src[i][2], 0.f) / bg_ref;
+                        target_g = 0.5f * (g_from_r + g_from_b);
+                    }
+                    dst[i][0] = src[i][0];
+                    dst[i][1] = std::clamp(src[i][1] * (1.f - amount) + target_g * amount,
+                                           0.f, src[i][1]);
+                    dst[i][2] = src[i][2];
+                }
 
                 ++corrected_count;
+            }
+
+            // High-strength cleanup for one-sided red/blue lateral halos. Real
+            // lens CA is often not a balanced purple pair; one channel can be
+            // displaced more visibly than the other. Keep this disabled near
+            // default strength so natural saturated edges stay protected.
+            const float solo_enable = smoothstep(1.25f, 3.0f, strength);
+            if (solo_enable > 0.f) {
+                const float g = std::max(src[i][1], 0.f);
+                const float target_r = g * std::exp(blur_log_rg[i]);
+                const float target_b = g * std::exp(blur_log_bg[i]);
+                const float solo_r = std::max(0.f, src[i][0] - target_r) /
+                                     std::max(blur_guide[i], 0.05f);
+                const float solo_b = std::max(0.f, src[i][2] - target_b) /
+                                     std::max(blur_guide[i], 0.05f);
+                const float local_solo_r = smoothstep(chroma_threshold * 0.12f * inv_sensitivity,
+                                                      chroma_threshold * 0.65f * inv_sensitivity,
+                                                      solo_r);
+                const float local_solo_b = smoothstep(chroma_threshold * 0.12f * inv_sensitivity,
+                                                      chroma_threshold * 0.65f * inv_sensitivity,
+                                                      solo_b);
+                const float solo_r_mask = solo_r_mask_blur[i] * local_solo_r;
+                const float solo_b_mask = solo_b_mask_blur[i] * local_solo_b;
+
+                if (solo_r_mask > mask_cutoff) {
+                    const float amount = std::clamp(solo_r_mask * strength * 0.85f, 0.f, 0.85f);
+                    dst[i][0] = std::clamp(dst[i][0] * (1.f - amount) + target_r * amount,
+                                           0.f, dst[i][0]);
+                    ++corrected_count;
+                }
+                if (solo_b_mask > mask_cutoff) {
+                    const float amount = std::clamp(solo_b_mask * strength * 0.95f, 0.f, 0.90f);
+                    dst[i][2] = std::clamp(dst[i][2] * (1.f - amount) + target_b * amount,
+                                           0.f, dst[i][2]);
+                    ++corrected_count;
+                }
             }
         }
     }

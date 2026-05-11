@@ -96,14 +96,14 @@ public:
                         float strength,
                         float target_contrast);
 
-    // Defringe: edge-gated Gaussian chroma suppression
-    // Works on opponent chroma (Cr=R-G, Cb=B-G); scale-invariant for HDR float32.
+    // Defringe: linear RGB, guide-green chroma-ratio suppression.
+    // Designed to run before output color-space conversion and gamma.
     bool defringe(const ImageBufferFloat& rgb_input,
                   ImageBufferFloat& rgb_output,
                   float radius           = 6.0f,   // Gaussian blur radius (px)
                   float edge_threshold   = 0.1f,   // Normalized Sobel threshold [0,1]
                   float chroma_threshold = 0.15f,  // Relative chroma excess threshold
-                  float strength         = 1.0f);  // Correction strength (1.0=full replace, >1 pushes toward neutral)
+                  float strength         = 1.0f);  // Correction strength and detection sensitivity
 
 private: 
     bool initialized_ = false;

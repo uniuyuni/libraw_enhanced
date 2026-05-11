@@ -94,6 +94,22 @@ def make_red_cloth_image(h=64, w=64):
     
     return img
 
+def make_large_red_cloth_with_white_pattern(h=96, w=96):
+    """
+    Large bright red fabric area with a white pattern edge.
+    This is a stronger false-positive case than make_red_cloth_image because
+    the red has enough blue component to look red-purple locally.
+    """
+    img = np.zeros((h, w, 3), dtype=np.float32)
+    img[:, :, 0] = 0.82
+    img[:, :, 1] = 0.18
+    img[:, :, 2] = 0.34
+
+    # White vertical pattern stripe with hard edges.
+    x0, x1 = w // 2 - 3, w // 2 + 3
+    img[:, x0:x1, :] = 0.92
+    return img
+
 def make_green_fringe_image(h=64, w=64, fringe_width=2):
     """Similar but green fringe."""
     img = np.zeros((h, w, 3), dtype=np.float32)
@@ -227,6 +243,19 @@ class TestDefringe:
         assert diff < 0.02, (
             f"RED CLOTH AFFECTED: R decreased from {r_in:.3f} to {r_out:.3f} (diff={diff:.3f}). "
             "Fringe suppression is over-aggressive on natural red objects.")
+
+    def test_large_red_cloth_white_pattern_protected(self):
+        """Large red fabric with white pattern should remain stable at strong settings."""
+        img = make_large_red_cloth_with_white_pattern()
+        out = defringe(img, strength=5.0, edge_threshold=0.05, chroma_threshold=0.08)
+
+        # Red cloth immediately next to the white stripe is the risky area.
+        x = img.shape[1] // 2 - 4
+        region_in = img[8:-8, x-2:x+1]
+        region_out = out[8:-8, x-2:x+1]
+        max_diff = float(np.abs(region_out - region_in).max())
+        assert max_diff < 0.02, (
+            f"Large red cloth near white pattern changed too much (max_diff={max_diff:.3f})")
 
     def test_green_fringe_is_reduced(self):
         """Green fringe pixels should have reduced G-excess after correction."""
@@ -451,8 +480,9 @@ def test_xt5_defringe_integration():
             highlight_mode=5,
             gamma=(1.0, 1.0),
             defringe=True,
-            defringe_edge_threshold=0.1,
-            defringe_strength=3.0,
+            defringe_strength=5.0,
+            #defringe_edge_threshold=0.05,
+            defringe_chroma_threshold=0.15,
         )
     print(f"  With defringe: {time.perf_counter()-t0:.2f}s, shape={img_df.shape}")
 

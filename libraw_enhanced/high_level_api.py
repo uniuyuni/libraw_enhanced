@@ -243,10 +243,11 @@ class RawImage:
             preprocess: If true, stops processing before demosaicing and returns the raw/modified bayer data.
 
             # Defringe parameters
-            defringe: If True, apply chromatic aberration fringe removal after processing.
-            defringe_radius: Gaussian blur radius for fringe detection (default 4.0).
+            defringe: If True, apply linear RGB chromatic aberration fringe removal before output gamma.
+            defringe_radius: Gaussian blur radius for fringe detection (default 6.0).
             defringe_edge_threshold: Normalized Sobel edge threshold [0,1] (default 0.1).
-            defringe_chroma_threshold: Relative chroma excess threshold (default 0.2).
+            defringe_chroma_threshold: Local log-ratio chroma excess threshold (default 0.15).
+            defringe_strength: Correction strength. Values above 1.0 also increase detection sensitivity.
 
         Returns:
 
@@ -481,23 +482,25 @@ class RawImage:
                  chroma_threshold: float = 0.15,
                  strength: float = 1.0) -> np.ndarray:
         """
-        色収差フリンジ除去（Edge-gated Gaussian opponent-chroma suppression）。
+        色収差フリンジ除去（linear RGB guide-green chroma-ratio suppression）。
 
-        darktable の Defringe モジュールと同原理。
-        RGB 値が 1.0 を超える HDR データにも正しく動作する（閾値が輝度相対値のため）。
+        linear RGB 上で G チャンネルを構造ガイドとして使い、局所的な
+        log(R/G), log(B/G) の異常を抑制します。gamma や出力色空間に依存
+        しにくいよう、pipeline 内では output color-space conversion と
+        gamma correction の前に実行されます。
 
         Algorithm:
-          1. 輝度 Y と opponent chroma Cr=R-G, Cb=B-G を計算
-          2. Y の Sobel グラジエントでエッジマップ生成（最大値で正規化）
-          3. Cr, Cb を Gaussian blur → フリンジのない「期待される色」を近似
-          4. 各エッジピクセルで excess = (|Cr-blur_Cr|+|Cb-blur_Cb|) / max(Y,0.05)
-             excess > chroma_threshold なら Cr/Cb を blur 値に置換（輝度は保持）
+          1. G からエッジガイドを作り、log(R/G), log(B/G) を計算
+          2. log-ratio を Gaussian blur して周辺の自然な色比を推定
+          3. 明るい高コントラスト境界上の、細くバランスした紫/緑異常だけを検出
+          4. 紫フリンジは R/B を G 由来の推定値へ、緑フリンジは G を局所推定値へ寄せる
 
         Args:
-            image: 入力画像 (H, W, 3) float32, 値域は 0.0〜1.0 以上でも可
-            radius: Gaussian blur 半径（ピクセル）。デフォルト 4.0
+            image: 入力画像 (H, W, 3) float32 linear RGB, 値域は 0.0〜1.0 以上でも可
+            radius: Gaussian blur 半径（ピクセル）。デフォルト 6.0
             edge_threshold: 正規化 Sobel 閾値 [0,1]。デフォルト 0.1
-            chroma_threshold: 輝度相対クロマ超過閾値。デフォルト 0.2
+            chroma_threshold: log-ratio クロマ超過閾値。デフォルト 0.15
+            strength: 補正強度。1.0 を超える値では検出感度も上がります。
 
         Returns:
             numpy.ndarray: フリンジ除去後の新しい (H, W, 3) float32 配列
