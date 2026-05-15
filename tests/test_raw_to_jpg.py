@@ -105,7 +105,11 @@ def process_raw_file(raw_path, output_dir):
         },
         {
             "name": "defringe",
-            "params": {**_base_params, "defringe": True},
+            "params": {**_base_params, "defringe": True, "defringe_green": True},
+        },
+        {
+            "name": "defringe green off",
+            "params": {**_base_params, "defringe": True, "defringe_green": False},
         },
     ]
 

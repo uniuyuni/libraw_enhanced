@@ -3444,6 +3444,13 @@ bool CPUAccelerator::defringe(
     // Step 4: Correct only narrow, balanced, edge-gated ratio anomalies.
     // ----------------------------------------------------------------
     size_t corrected_count = 0;
+    // Diagnostic counters for green branch (helps tell whether green fringe is
+    // missed because the user's pixel is being routed to the purple branch,
+    // because the mask is below cut-off, or because guards crush it).
+    size_t green_classified_count    = 0;
+    size_t green_mask_above_cut      = 0;
+    size_t green_corrected_count     = 0;
+    size_t purple_classified_count   = 0;
     const float sensitivity = std::clamp(std::sqrt(std::max(strength, 1.0f)), 1.0f, 2.5f);
     const float inv_sensitivity = 1.0f / sensitivity;
     const float mask_cutoff = 0.02f * inv_sensitivity;
@@ -3452,6 +3459,13 @@ bool CPUAccelerator::defringe(
     const bool debug_defringe = debug_dir_env && debug_dir_env[0] != '\0';
     std::vector<float> dbg_seed_edge, dbg_seed_bright, dbg_seed_hue, dbg_seed_chroma, dbg_seed_warm;
     std::vector<float> dbg_linked, dbg_edge, dbg_hue, dbg_chroma, dbg_local, dbg_warm, dbg_mask, dbg_amount;
+    std::vector<float> dbg_solo_r_amount, dbg_solo_b_amount;
+    std::vector<std::array<float, 3>> dbg_input_rgb;
+    std::vector<float> dbg_delta, dbg_delta_r, dbg_delta_g, dbg_delta_b;
+    std::vector<float> dbg_red_strength, dbg_red_purple, dbg_natural_warm_guard, dbg_line_purple_relief;
+    std::vector<float> dbg_red_blue_balance, dbg_blue_lift, dbg_red_purple_balance, dbg_red_purple_lift;
+    std::vector<float> dbg_red_purple_context, dbg_contextual_red_purple;
+    std::vector<float> dbg_red_magenta_surface, dbg_warm_surface_protect, dbg_neutral_gray_edge;
     if (debug_defringe) {
         dbg_seed_edge.assign(N, 0.f);
         dbg_seed_bright.assign(N, 0.f);
@@ -3466,6 +3480,32 @@ bool CPUAccelerator::defringe(
         dbg_warm.assign(N, 0.f);
         dbg_mask.assign(N, 0.f);
         dbg_amount.assign(N, 0.f);
+        dbg_solo_r_amount.assign(N, 0.f);
+        dbg_solo_b_amount.assign(N, 0.f);
+        dbg_input_rgb.resize(N);
+        dbg_delta.assign(N, 0.f);
+        dbg_delta_r.assign(N, 0.f);
+        dbg_delta_g.assign(N, 0.f);
+        dbg_delta_b.assign(N, 0.f);
+        dbg_red_strength.assign(N, 0.f);
+        dbg_red_purple.assign(N, 0.f);
+        dbg_natural_warm_guard.assign(N, 0.f);
+        dbg_line_purple_relief.assign(N, 0.f);
+        dbg_red_blue_balance.assign(N, 0.f);
+        dbg_blue_lift.assign(N, 0.f);
+        dbg_red_purple_balance.assign(N, 0.f);
+        dbg_red_purple_lift.assign(N, 0.f);
+        dbg_red_purple_context.assign(N, 0.f);
+        dbg_contextual_red_purple.assign(N, 0.f);
+        dbg_red_magenta_surface.assign(N, 0.f);
+        dbg_warm_surface_protect.assign(N, 0.f);
+        dbg_neutral_gray_edge.assign(N, 0.f);
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (size_t i = 0; i < N; i++) {
+            dbg_input_rgb[i] = {src[i][0], src[i][1], src[i][2]};
+        }
     }
 
     // A soft neighbourhood support map lets high-strength cleanup catch
@@ -3488,7 +3528,13 @@ bool CPUAccelerator::defringe(
             const float b0 = std::max(src[i][2], 0.f);
 
             const float purple_excess = std::min(std::max(0.f, dr), std::max(0.f, db));
-            const float green_excess = std::min(std::max(0.f, -dr), std::max(0.f, -db));
+            // Green/cyan halos are not always balanced in both ratios (R/G and B/G).
+            // Use one-sided ratio deficits, but only when G is meaningfully above
+            // at least one of {R,B} to avoid misclassifying blue/purple edges.
+            const float denom_support = std::max(blur_guide[i], 0.05f);
+            const float g_over_min_support = std::max(0.f, g0 - std::min(r0, b0)) / denom_support;
+            const float green_dom_support = smoothstep(0.010f, 0.060f, g_over_min_support);
+            const float green_excess = std::max(std::max(0.f, -dr), std::max(0.f, -db)) * green_dom_support;
             const bool is_purple_support = purple_excess >= green_excess;
             const float excess_support = is_purple_support ? purple_excess : green_excess;
 
@@ -3585,6 +3631,10 @@ bool CPUAccelerator::defringe(
         std::string path = debug_dir_env;
         if (!path.empty() && path.back() != '/') path += '/';
         path += name + ".pgm";
+        {
+            std::ofstream max_out(path + ".max.txt");
+            max_out << std::setprecision(9) << maxv << "\n";
+        }
         std::ofstream out(path, std::ios::binary);
         out << "P5\n" << W << " " << H << "\n65535\n";
         for (float v : map) {
@@ -3653,8 +3703,19 @@ bool CPUAccelerator::defringe(
                                                    0.52f * inv_sensitivity,
                                                    blur_guide[i]);
             const float solo_enable = smoothstep(1.25f, 3.0f, strength);
+            const float r0 = std::max(src[i][0], 0.f);
+            const float g0 = std::max(src[i][1], 0.f);
+            const float b0 = std::max(src[i][2], 0.f);
+            const float red_strength_solo = std::max(0.f, r0 - std::max(g0, b0)) /
+                                            std::max(r0, 1e-4f);
+            // Protect saturated red edges from one-sided cleanup. This is
+            // especially important for real red objects where B can be
+            // slightly elevated by reflections/AA/demosaic, which resembles
+            // a magenta fringe in ratios but is not CA.
+            const float solo_red_guard =
+                1.f - 0.90f * smoothstep(0.12f, 0.32f, red_strength_solo);
             solo_r_seed[i] = solo_enable * c_edge_solo * c_bright_solo *
-                linked_fringe *
+                linked_fringe * solo_red_guard *
                 smoothstep(chroma_threshold * 0.22f * inv_sensitivity,
                            chroma_threshold * 0.95f * inv_sensitivity,
                            solo_r);
@@ -3667,7 +3728,7 @@ bool CPUAccelerator::defringe(
     gaussian_blur(solo_r_seed, solo_r_mask_blur);
     gaussian_blur(solo_b_seed, solo_b_mask_blur);
 #ifdef _OPENMP
-    #pragma omp parallel for reduction(+: corrected_count) collapse(2)
+    #pragma omp parallel for reduction(+: corrected_count, green_classified_count, green_mask_above_cut, green_corrected_count, purple_classified_count) collapse(2)
 #endif
     for (size_t y = 0; y < H; y++) {
         for (size_t x = 0; x < W; x++) {
@@ -3678,13 +3739,21 @@ bool CPUAccelerator::defringe(
             const float dr = rg - blur_log_rg[i];
             const float db = bg - blur_log_bg[i];
 
+            const float r0 = std::max(src[i][0], 0.f);
+            const float g0 = std::max(src[i][1], 0.f);
+            const float b0 = std::max(src[i][2], 0.f);
+            const float rb_avg_pre = 0.5f * (r0 + b0);
+
             const float purple_r = std::max(0.f, dr);
             const float purple_b = std::max(0.f, db);
             const float green_r = std::max(0.f, -dr);
             const float green_b = std::max(0.f, -db);
 
             const float purple_excess = std::min(purple_r, purple_b);
-            const float green_excess = std::min(green_r, green_b);
+            const float denom = std::max(blur_guide[i], 0.05f);
+            const float g_over_min = std::max(0.f, g0 - std::min(r0, b0)) / denom;
+            const float green_dom = smoothstep(0.010f, 0.060f, g_over_min);
+            const float green_excess = std::max(green_r, green_b) * green_dom;
             const bool is_purple = purple_excess >= green_excess;
             const float excess = is_purple ? purple_excess : green_excess;
 
@@ -3717,9 +3786,7 @@ bool CPUAccelerator::defringe(
             const float c_chroma = smoothstep(chroma_threshold * 0.45f * inv_sensitivity,
                                               chroma_threshold * 1.60f * inv_sensitivity,
                                               excess);
-            const float r0 = std::max(src[i][0], 0.f);
-            const float g0 = std::max(src[i][1], 0.f);
-            const float b0 = std::max(src[i][2], 0.f);
+            // r0/g0/b0 are computed above for green gating as well.
             const float red_blue_balance_hue = b0 / std::max(r0, 1e-4f);
             const float blue_lift_hue = std::max(0.f, b0 - g0) /
                                         std::max(r0 - g0, 1e-4f);
@@ -3738,13 +3805,29 @@ bool CPUAccelerator::defringe(
                              min_dir) *
                   smoothstep(0.18f, 0.58f, balance)
                 : 0.f;
-            const float c_hue = std::max(balanced_hue, red_purple_hue_gate);
-            const float rb_avg = 0.5f * (r0 + b0);
+            // One-sided green halo escape hatch.  Lateral green CA is often
+            // unbalanced (G≫B but G≈R, or vice versa) so balanced_hue dies
+            // because `balance` drops below 0.35.  When defringe_green is
+            // explicitly enabled and this pixel is green-dominant, allow a
+            // magnitude-only gate to substitute, so unbalanced halos still
+            // contribute to c_hue.  Gated on !is_purple so purple-classified
+            // pixels keep their original c_hue exactly (max_dir for them
+            // refers to the purple direction, not the green one).
+            const float green_unbalanced_hue = (enable_green_defringe && !is_purple)
+                ? smoothstep(0.035f * inv_sensitivity,
+                             0.16f  * inv_sensitivity,
+                             max_dir)
+                : 0.f;
+            const float c_hue = std::max(balanced_hue,
+                                         std::max(red_purple_hue_gate,
+                                                  green_unbalanced_hue));
+            const float rb_avg = rb_avg_pre;
             const float purple_abs = std::min(std::max(0.f, r0 - g0),
                                               std::max(0.f, b0 - g0)) /
                                      std::max(blur_guide[i], 0.05f);
-            const float green_abs = std::max(0.f, g0 - rb_avg) /
-                                    std::max(blur_guide[i], 0.05f);
+            const float green_abs_base = std::max(0.f, g0 - rb_avg) / std::max(blur_guide[i], 0.05f);
+            const float green_abs_alt  = std::max(0.f, g0 - std::min(r0, b0)) / std::max(blur_guide[i], 0.05f);
+            const float green_abs = std::max(green_abs_base, 0.55f * green_abs_alt);
             const bool abs_is_purple = purple_abs >= green_abs;
             const float abs_excess = abs_is_purple ? purple_abs : green_abs;
             const float c_abs = smoothstep(chroma_threshold * 0.35f * inv_sensitivity,
@@ -3754,32 +3837,175 @@ bool CPUAccelerator::defringe(
             const float low_contrast_color = smoothstep(chroma_threshold * 1.20f * inv_sensitivity,
                                                         chroma_threshold * 2.40f * inv_sensitivity,
                                                         abs_excess);
+            // Soft-edge magnitude path for unbalanced green CA fringe.
+            // Lateral green CA on out-of-focus bokeh edges has weak Sobel
+            // response, and the support map seed for unbalanced green halos
+            // also dies on balanced_hue, so linked_fringe never builds up.
+            // When defringe_green is explicitly enabled and the pixel is
+            // green-dominant, allow c_edge_low to qualify on the green-chroma
+            // magnitude alone.  Per-pixel gate on !is_purple keeps the c_edge
+            // value byte-exact for purple-classified pixels.
+            const float green_soft_edge_boost = (enable_green_defringe && !is_purple)
+                ? c_edge_low * smoothstep(0.05f * inv_sensitivity,
+                                          0.20f * inv_sensitivity,
+                                          max_dir)
+                : 0.f;
             const float c_edge = std::max(c_edge_core,
                                           std::max(c_edge_low * linked_fringe * 1.45f,
-                                                   c_edge_low * low_contrast_color * 0.35f));
+                                                   std::max(c_edge_low * low_contrast_color * 0.35f,
+                                                            green_soft_edge_boost)));
             const float ratio_mask = c_edge * c_bright * c_hue * c_chroma;
             const float direct_mask = c_edge * c_bright * c_hue * c_abs;
             const bool use_direct = direct_mask > ratio_mask;
             float mask = std::max(ratio_mask, direct_mask) * scene_highlight_gate;
             const bool correct_purple = use_direct ? abs_is_purple : is_purple;
+            if (correct_purple) ++purple_classified_count;
+            else                ++green_classified_count;
             float local_gate = 0.f;
             if (correct_purple) {
                 local_gate = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
                                         chroma_threshold * 0.55f * inv_sensitivity,
                                         purple_abs);
                 mask *= local_gate;
+                // (Removed natural_highlight_in_green guard — empirically
+                // over-fired on CA-fringed silver because the blur reference
+                // is slightly green-shifted by the green band of the fringe
+                // itself, indistinguishable from a true natural-green
+                // neighbourhood without further evidence. Wood-highlight
+                // protection is now handled exclusively in the green branch
+                // via the `not_natural_green` factor on guard_release.)
             } else {
                 local_gate = smoothstep(chroma_threshold * 0.10f * inv_sensitivity,
                                         chroma_threshold * 0.55f * inv_sensitivity,
                                         green_abs);
+                // Peak-detection fallback for thin green CA fringe.
+                //
+                // At the very peak (1-3 px) of a green fringe band, guide_signal
+                // is at a local maximum so the Sobel gradient is ~0.  This
+                // crushes c_edge_core, and the alternative paths
+                // (c_edge_low * linked_fringe and c_edge_low * low_contrast)
+                // also die because c_edge_low itself uses blur_edge which is
+                // weak at the local-max position.  Result: the algorithm
+                // corrects pixels ON THE SLOPES around the fringe but leaves
+                // the visually-objectionable peak untouched, producing a
+                // "halo around the fringe" appearance in delta maps.
+                //
+                // The chroma signal at the peak is the strongest part of the
+                // entire structure (the peak IS the chroma anomaly), so build
+                // an alternative mask path using chroma magnitude directly,
+                // BYPASSING c_edge.  Use blur_fringe_support (built from the
+                // surrounding slope pixels, which DO have non-zero seeds) as
+                // a context filter to reject isolated bright objects that
+                // happen to be green-leaning.  Per-branch placement
+                // (only inside else block) keeps purple-classified pixels
+                // byte-exact.
+                if (enable_green_defringe) {
+                    const float peak_chroma_signal =
+                        smoothstep(chroma_threshold * 0.80f * inv_sensitivity,
+                                   chroma_threshold * 2.50f * inv_sensitivity,
+                                   green_abs);
+                    const float peak_neighbourhood =
+                        smoothstep(0.005f, 0.030f, blur_fringe_support[i]);
+                    const float green_peak_mask =
+                        peak_chroma_signal * peak_neighbourhood * c_bright * c_hue;
+                    mask = std::max(mask, green_peak_mask * scene_highlight_gate);
+                }
                 const float green_highlight_protect =
                     1.f - 0.85f * smoothstep(0.62f, 0.88f, blur_guide[i]);
                 const float rb_to_green = rb_avg / std::max(g0, 1e-4f);
                 const float natural_green_highlight =
                     smoothstep(0.22f, 0.46f, rb_to_green) *
                     smoothstep(0.42f, 0.72f, g0);
-                mask *= local_gate * 0.35f * green_highlight_protect *
-                        (1.f - 0.90f * natural_green_highlight);
+                // Green-fringe correction is useful on neutral/metallic edges, but
+                // it can easily destroy natural (slightly white-ish) highlights on
+                // foliage. The existing natural-green heuristic must be *very*
+                // strict, because strength=10 amplifies even small masks.
+                //
+                // Make natural highlights almost fully immune, while allowing
+                // thick green halos (e.g. metallic edges) to be cleaned.
+                const float natural_green_suppress = 1.f - 0.99f * natural_green_highlight;
+                const float natural_green_suppress_sq =
+                    natural_green_suppress * natural_green_suppress;
+
+                const float green_halo_strength =
+                    smoothstep(chroma_threshold * 0.55f * inv_sensitivity,
+                               chroma_threshold * 1.65f * inv_sensitivity,
+                               green_abs);
+                // Boost green removal only when the halo is strong.
+                // Baseline conservatism on green correction (0.35 below) is
+                // tuned for the default opt-out case.  When the user
+                // explicitly enables defringe_green, raise both the baseline
+                // and the slope so genuine green halos at moderate strength
+                // actually get a meaningful amount of correction.
+                const float green_gain_base  = enable_green_defringe ? 0.60f : 0.35f;
+                const float green_gain_slope = enable_green_defringe ? 1.10f : 0.95f;
+                const float green_gain = green_gain_base + green_gain_slope * green_halo_strength;
+
+                // Extra foliage highlight protection: only suppress when the pixel
+                // is near-neutral AND the green halo is not strong (thin natural
+                // highlights), even if the neighbourhood is green.
+                const float min_ratio_ref = std::min(blur_log_rg[i], blur_log_bg[i]);
+                const float green_neighbour = smoothstep(0.02f, 0.10f, std::max(0.f, -min_ratio_ref));
+                const float src_max = std::max(r0, std::max(g0, b0));
+                const float src_min = std::min(r0, std::min(g0, b0));
+                const float src_chroma = src_max - src_min;
+                const float src_sat = src_chroma / std::max(src_max, 1e-4f);
+                const float whiteish = 1.f - smoothstep(0.05f, 0.13f, src_sat);
+                const float foliage_guard =
+                    green_neighbour * whiteish *
+                    smoothstep(0.35f, 0.75f, blur_guide[i]) *
+                    (1.f - green_halo_strength);
+
+                // Green-fringe guard release.
+                //
+                // The three guards above (green_highlight_protect,
+                // natural_green_suppress_sq, foliage_guard) are tuned to
+                // protect natural foliage highlights and they suppress
+                // legitimate green halos as a side effect.  Their
+                // conservatism is only justified when defringe_green is
+                // disabled (which is the default); when the user explicitly
+                // opts in we should trust the flag and ramp the guards down
+                // as strength is dialled up.  Extra evidence (a thin,
+                // edge-aligned, saturated green halo) provides additional
+                // release on top.
+                //
+                // This block is reached ONLY when correct_purple==false, so
+                // the purple-fringe path is byte-for-byte unchanged.  When
+                // enable_green_defringe is false, strength_release is zero
+                // and guard_release is zero, so the legacy behaviour for
+                // defringe_green=False is bit-exact identical to the
+                // previous implementation.
+                const float strength_release = enable_green_defringe
+                    ? smoothstep(2.0f, 6.0f, strength)
+                    : 0.f;
+                // Pure evidence-driven release with a "not natural green"
+                // gate so tinted natural green highlights (wood with
+                // moderate saturation, R≈G > B) cannot reach release.
+                // natural_green_highlight = 1 for pixels whose rb_to_green
+                // is high AND g0 is bright — exactly the highlight pattern
+                // we want to protect.  Multiplying release by
+                // (1 - natural_green_highlight) makes release scale with
+                // how "non-natural" the green excess is.
+                const float green_line_evidence =
+                    smoothstep(0.004f, 0.030f, line_fringe_support[i]) *
+                    smoothstep(0.20f,  0.55f, green_halo_strength) *
+                    smoothstep(0.05f,  0.15f, src_sat);
+                const float not_natural_green = 1.f - natural_green_highlight;
+                const float guard_release =
+                    strength_release * green_line_evidence * not_natural_green;
+
+                const float released_highlight_protect =
+                    green_highlight_protect +
+                    (1.f - green_highlight_protect) * guard_release;
+                const float released_natural_suppress =
+                    natural_green_suppress_sq +
+                    (1.f - natural_green_suppress_sq) * guard_release;
+                const float foliage_term = 1.f - 0.999f * foliage_guard;
+                const float released_foliage_term =
+                    foliage_term + (1.f - foliage_term) * guard_release;
+
+                mask *= local_gate * green_gain * released_highlight_protect *
+                        released_natural_suppress * released_foliage_term;
                 if (!enable_green_defringe) {
                     mask = 0.f;
                 }
@@ -3794,26 +4020,93 @@ bool CPUAccelerator::defringe(
             }
 
             if (mask > mask_cutoff) {
+                if (!correct_purple) ++green_mask_above_cut;
                 const float g = std::max(src[i][1], 0.f);
                 const float red_strength = std::max(0.f, r0 - std::max(g0, b0)) /
                                            std::max(r0, 1e-4f);
                 const float red_blue_balance = b0 / std::max(r0, 1e-4f);
                 const float blue_lift = std::max(0.f, b0 - g0) /
                                         std::max(r0 - g0, 1e-4f);
+                const float red_purple_balance =
+                    smoothstep(0.55f, 0.78f, red_blue_balance);
+                const float red_purple_lift =
+                    smoothstep(0.16f, 0.34f, blue_lift);
                 const float red_purple =
-                    std::max(smoothstep(0.55f, 0.78f, red_blue_balance),
-                             smoothstep(0.16f, 0.34f, blue_lift));
+                    std::max(red_purple_balance, red_purple_lift);
+                const float red_strength_guard = smoothstep(0.08f, 0.25f, red_strength);
+                float red_purple_context = 0.f;
+                float contextual_red_purple = 0.f;
+                float red_magenta_surface = 0.f;
+                if (red_purple > 0.50f || debug_defringe) {
+                    red_purple_context = linked_fringe;
+                    contextual_red_purple = red_purple * red_purple_context;
+                    if (red_purple_context < 0.20f &&
+                        red_strength_guard < 0.50f &&
+                        red_purple > 0.50f) {
+                        red_magenta_surface = smoothstep(0.02f, 0.12f, purple_abs) *
+                                              (1.f - red_purple_context);
+                    }
+                }
+                float neutral_gray_surface = 0.f;
+                if ((debug_defringe || strength > 3.f) &&
+                    red_purple_context > 0.80f &&
+                    line_fringe_support[i] > 0.012f &&
+                    red_strength_guard < 0.98f &&
+                    blue_lift > 1.10f &&
+                    red_blue_balance > 0.82f &&
+                    purple_abs > 0.015f) {
+                    const float neutral_gray_edge =
+                        smoothstep(1.10f, 1.80f, blue_lift) *
+                        smoothstep(0.82f, 1.05f, red_blue_balance) *
+                        (1.f - red_strength_guard);
+                    neutral_gray_surface =
+                        neutral_gray_edge * smoothstep(0.015f, 0.08f, purple_abs) *
+                        smoothstep(3.f, 8.f, strength);
+                }
+                const float red_object_strength =
+                    std::max(red_strength_guard, red_magenta_surface);
+                const float natural_warm_guard_base =
+                    1.f - red_object_strength *
+                          (1.f - contextual_red_purple);
+                const float natural_warm_guard_sq =
+                    natural_warm_guard_base * natural_warm_guard_base *
+                    natural_warm_guard_base * natural_warm_guard_base;
                 const float natural_warm_guard =
-                    1.f - smoothstep(0.08f, 0.25f, red_strength) *
-                          (1.f - red_purple);
+                    natural_warm_guard_sq * natural_warm_guard_sq;
                 const float line_purple_relief =
                     smoothstep(0.012f, 0.06f, line_fringe_support[i]) *
                     smoothstep(0.10f, 0.24f, blue_lift);
+                // When the subject itself is a saturated red object, we must
+                // be careful not to let a modest neighbourhood "fringe link"
+                // override the warm-color protection. Otherwise red edges and
+                // nearby neutrals can be desaturated/shift green.
+                const float red_object_guard = smoothstep(0.55f, 0.90f, red_object_strength);
+                const float linked_override = linked_fringe * 1.05f * (1.f - 0.85f * red_object_guard);
+                const float line_override   = line_purple_relief * (1.f - 0.85f * red_object_guard);
+                const bool force_warm_guard =
+                    (red_object_guard > 0.75f) && (linked_fringe < 0.65f) && (line_purple_relief < 0.45f);
                 const float warm_protect = correct_purple
-                    ? std::max(natural_warm_guard,
-                               std::max(linked_fringe * 1.05f, line_purple_relief))
+                    ? (force_warm_guard
+                           ? natural_warm_guard
+                           : std::max(natural_warm_guard,
+                                      std::max(linked_override, line_override)))
                     : 1.f;
-                if (debug_defringe) dbg_warm[i] = warm_protect;
+                if (debug_defringe) {
+                    dbg_warm[i] = warm_protect;
+                    dbg_red_strength[i] = red_strength;
+                    dbg_red_purple[i] = red_purple;
+                    dbg_natural_warm_guard[i] = natural_warm_guard;
+                    dbg_line_purple_relief[i] = line_purple_relief;
+                    dbg_red_blue_balance[i] = red_blue_balance;
+                    dbg_blue_lift[i] = blue_lift;
+                    dbg_red_purple_balance[i] = red_purple_balance;
+                    dbg_red_purple_lift[i] = red_purple_lift;
+                    dbg_red_purple_context[i] = red_purple_context;
+                    dbg_contextual_red_purple[i] = contextual_red_purple;
+                    dbg_red_magenta_surface[i] = red_magenta_surface;
+                    dbg_warm_surface_protect[i] = red_object_strength;
+                    dbg_neutral_gray_edge[i] = neutral_gray_surface;
+                }
                 const float red_without_support =
                     smoothstep(0.22f, 0.45f, red_strength) *
                     (1.f - smoothstep(0.02f, 0.12f, blur_fringe_support[i]));
@@ -3822,21 +4115,90 @@ bool CPUAccelerator::defringe(
                                                      mask_cutoff * 5.0f,
                                                      mask);
                 const float threshold_soften = 1.f - 0.86f * smoothstep(0.22f, 0.40f, chroma_threshold);
-                const float amount = std::clamp(smooth_mask * strength * 1.90f *
-                                                (1.f - protect) * warm_protect *
-                                                threshold_soften,
-                                                0.f, 1.f);
+                const float src_max = std::max(r0, std::max(g0, b0));
+                const float src_min = std::min(r0, std::min(g0, b0));
+                const float src_chroma = src_max - src_min;
+                const float src_sat = src_chroma / std::max(src_max, 1e-4f);
+                // Avoid green cast in near-neutral regions: if saturation is
+                // extremely low, a strong R/B pull-down can make G dominate.
+                //
+                // However, we must not weaken cleanup on legitimate near-white
+                // magenta fringes (e.g. curtain edges). So we only apply this
+                // dampening when the neighbourhood hints at a *warm/red object*
+                // context (red_object_strength is high).
+                //
+                // Keep the range narrow so faint-but-real fringes on
+                // near-white edges are still corrected at strength=10.
+                const float neutral_guard_base = smoothstep(0.008f, 0.030f, src_sat);
+                const float neutral_guard = 1.f - (1.f - neutral_guard_base) *
+                                                  smoothstep(0.35f, 0.80f, red_object_strength);
+                float amount = std::clamp(smooth_mask * strength * 1.90f *
+                                          (1.f - protect) * warm_protect * neutral_guard *
+                                          threshold_soften,
+                                          0.f, 1.f);
+                const float warm_edge_surface =
+                    smoothstep(0.006f, 0.035f, purple_abs) *
+                    smoothstep(0.25f, 0.65f, red_purple) *
+                    smoothstep(0.15f, 0.65f, red_purple_context) *
+                    (1.f - 0.55f * red_strength_guard) *
+                    smoothstep(3.f, 8.f, strength);
+                const float safe_surface =
+                    std::max(neutral_gray_surface, warm_edge_surface);
+                if (correct_purple && safe_surface > 1e-4f) {
+                    const float safe_amount_cap = 1.f - 0.99f * safe_surface;
+                    amount = std::min(amount, safe_amount_cap);
+                }
                 if (debug_defringe) dbg_amount[i] = amount;
                 if (amount <= 1e-4f) continue;
                 const float target_r = std::min(g, g * std::exp(blur_log_rg[i]));
                 const float target_b = std::min(g, g * std::exp(blur_log_bg[i]));
 
                 if (correct_purple) {
-                    dst[i][0] = std::clamp(src[i][0] * (1.f - amount) + target_r * amount,
-                                           0.f, src[i][0]);
-                    dst[i][1] = src[i][1];
-                    dst[i][2] = std::clamp(src[i][2] * (1.f - amount) + target_b * amount,
-                                           0.f, src[i][2]);
+                    float corrected_r = std::clamp(src[i][0] * (1.f - amount) + target_r * amount,
+                                                   0.f, src[i][0]);
+                    float corrected_g = src[i][1];
+                    float corrected_b = std::clamp(src[i][2] * (1.f - amount) + target_b * amount,
+                                                   0.f, src[i][2]);
+                    if (safe_surface > 1e-4f) {
+                        const float luma_before =
+                            0.2126f * src[i][0] + 0.7152f * src[i][1] + 0.0722f * src[i][2];
+                        const float luma_after =
+                            0.2126f * corrected_r + 0.7152f * corrected_g + 0.0722f * corrected_b;
+                        const float max_luma_drop =
+                            luma_before * 0.02f * (1.f - neutral_gray_surface);
+                        const float min_luma = std::max(0.f, luma_before - max_luma_drop);
+                        if (luma_after < min_luma) {
+                            const float lift = min_luma - luma_after;
+                            const float channel_ceil =
+                                std::max(src[i][0], std::max(src[i][1], src[i][2]));
+                            corrected_r = std::min(src[i][0], corrected_r + lift);
+                            corrected_g = std::min(channel_ceil, corrected_g + lift);
+                            corrected_b = std::min(src[i][2], corrected_b + lift);
+                        }
+                        const float src_max =
+                            std::max(src[i][0], std::max(src[i][1], src[i][2]));
+                        const float src_min =
+                            std::min(src[i][0], std::min(src[i][1], src[i][2]));
+                        const float corrected_max =
+                            std::max(corrected_r, std::max(corrected_g, corrected_b));
+                        const float corrected_min =
+                            std::min(corrected_r, std::min(corrected_g, corrected_b));
+                        const float src_chroma = src_max - src_min;
+                        const float corrected_chroma = corrected_max - corrected_min;
+                        const float min_chroma =
+                            src_chroma * (1.f - 0.12f * safe_surface);
+                        if (src_chroma > 1e-4f && corrected_chroma < min_chroma) {
+                            const float denom = std::max(src_chroma - corrected_chroma, 1e-4f);
+                            const float keep = std::clamp((src_chroma - min_chroma) / denom,
+                                                          0.f, 1.f);
+                            corrected_r = src[i][0] * (1.f - keep) + corrected_r * keep;
+                            corrected_g = src[i][1] * (1.f - keep) + corrected_g * keep;
+                            corrected_b = src[i][2] * (1.f - keep) + corrected_b * keep;
+                        }
+                    }
+                    dst[i][0] = corrected_r;
+                    dst[i][1] = corrected_g;
+                    dst[i][2] = corrected_b;
                 } else {
                     float target_g = src[i][1];
                     const float rg_ref = std::exp(blur_log_rg[i]);
@@ -3846,10 +4208,22 @@ bool CPUAccelerator::defringe(
                         const float g_from_b = std::max(src[i][2], 0.f) / bg_ref;
                         target_g = 0.5f * (g_from_r + g_from_b);
                     }
+                    // Anti-magenta hard floor.  If a purple/magenta fringe
+                    // sits in the blur neighbourhood, blur_log_rg / blur_log_bg
+                    // both become positive (R, B > G in the reference), so
+                    // target_g can fall below the pixel's own (R+B)/2, which
+                    // pulls white pixels into magenta when amount→1.  Never
+                    // push G below the local rb_avg — at worst we reach
+                    // neutral gray, never anti-green.
+                    const float rb_avg_target = 0.5f * (std::max(src[i][0], 0.f) +
+                                                        std::max(src[i][2], 0.f));
+                    target_g = std::max(target_g, rb_avg_target);
                     dst[i][0] = src[i][0];
-                    dst[i][1] = std::clamp(src[i][1] * (1.f - amount) + target_g * amount,
-                                           0.f, src[i][1]);
+                    float corrected_g = std::clamp(src[i][1] * (1.f - amount) + target_g * amount,
+                                                   0.f, src[i][1]);
+                    dst[i][1] = corrected_g;
                     dst[i][2] = src[i][2];
+                    ++green_corrected_count;
                 }
 
                 ++corrected_count;
@@ -3874,17 +4248,39 @@ bool CPUAccelerator::defringe(
                 const float local_solo_b = smoothstep(chroma_threshold * 0.12f * inv_sensitivity,
                                                       chroma_threshold * 0.65f * inv_sensitivity,
                                                       solo_b);
-                const float solo_r_mask = solo_r_mask_blur[i] * local_solo_r;
-                const float solo_b_mask = solo_b_mask_blur[i] * local_solo_b;
+                // If the pixel is green/cyan-dominant (G above at least one of
+                // {R,B}), solo red/blue suppression can easily introduce a visible
+                // green cast on neutral/metallic edges. In that case, rely on the
+                // main green-fringe path instead and keep solo disabled.
+                const float r0 = std::max(src[i][0], 0.f);
+                const float g0 = g;
+                const float b0 = std::max(src[i][2], 0.f);
+                const float g_over_min = std::max(0.f, g0 - std::min(r0, b0)) /
+                                         std::max(blur_guide[i], 0.05f);
+                const float green_dom = smoothstep(0.010f, 0.060f, g_over_min);
+                const float denom_solo = std::max(blur_guide[i], 0.05f);
+                const float purpleish =
+                    smoothstep(0.010f, 0.060f,
+                               std::max(std::max(0.f, r0 - g0),
+                                        std::max(0.f, b0 - g0)) / denom_solo);
+                // Disable solo only for truly green/cyan-dominant edges. If the
+                // pixel itself is magenta/purple-ish, allow solo so purple fringes
+                // at metallic edges (silver/black boundary) can still be cleaned.
+                const float solo_allow = 1.f - green_dom * (1.f - purpleish);
+
+                const float solo_r_mask = solo_r_mask_blur[i] * local_solo_r * solo_allow;
+                const float solo_b_mask = solo_b_mask_blur[i] * local_solo_b * solo_allow;
 
                 if (solo_r_mask > mask_cutoff) {
                     const float amount = std::clamp(solo_r_mask * strength * 0.85f, 0.f, 0.85f);
+                    if (debug_defringe) dbg_solo_r_amount[i] = amount;
                     dst[i][0] = std::clamp(dst[i][0] * (1.f - amount) + target_r * amount,
                                            0.f, dst[i][0]);
                     ++corrected_count;
                 }
                 if (solo_b_mask > mask_cutoff) {
                     const float amount = std::clamp(solo_b_mask * strength * 0.95f, 0.f, 0.90f);
+                    if (debug_defringe) dbg_solo_b_amount[i] = amount;
                     dst[i][2] = std::clamp(dst[i][2] * (1.f - amount) + target_b * amount,
                                            0.f, dst[i][2]);
                     ++corrected_count;
@@ -3894,6 +4290,15 @@ bool CPUAccelerator::defringe(
     }
 
     if (debug_defringe) {
+        for (size_t i = 0; i < N; i++) {
+            const float dr = dst[i][0] - dbg_input_rgb[i][0];
+            const float dg = dst[i][1] - dbg_input_rgb[i][1];
+            const float db = dst[i][2] - dbg_input_rgb[i][2];
+            dbg_delta_r[i] = std::abs(dr);
+            dbg_delta_g[i] = std::abs(dg);
+            dbg_delta_b[i] = std::abs(db);
+            dbg_delta[i] = std::max(dbg_delta_r[i], std::max(dbg_delta_g[i], dbg_delta_b[i]));
+        }
         dump_debug_map("01_fringe_support_seed", fringe_support);
         dump_debug_map("01a_seed_edge", dbg_seed_edge);
         dump_debug_map("01b_seed_bright", dbg_seed_bright);
@@ -3911,6 +4316,29 @@ bool CPUAccelerator::defringe(
         dump_debug_map("09_warm_protect", dbg_warm);
         dump_debug_map("10_final_mask", dbg_mask);
         dump_debug_map("11_amount", dbg_amount);
+        dump_debug_map("12_rgb_delta", dbg_delta);
+        dump_debug_map("13_rgb_delta_r", dbg_delta_r);
+        dump_debug_map("14_rgb_delta_g", dbg_delta_g);
+        dump_debug_map("15_rgb_delta_b", dbg_delta_b);
+        dump_debug_map("16_solo_r_seed", solo_r_seed);
+        dump_debug_map("17_solo_b_seed", solo_b_seed);
+        dump_debug_map("18_solo_r_mask", solo_r_mask_blur);
+        dump_debug_map("19_solo_b_mask", solo_b_mask_blur);
+        dump_debug_map("20_solo_r_amount", dbg_solo_r_amount);
+        dump_debug_map("21_solo_b_amount", dbg_solo_b_amount);
+        dump_debug_map("22_red_strength", dbg_red_strength);
+        dump_debug_map("23_red_purple", dbg_red_purple);
+        dump_debug_map("24_natural_warm_guard", dbg_natural_warm_guard);
+        dump_debug_map("25_line_purple_relief", dbg_line_purple_relief);
+        dump_debug_map("26_red_blue_balance", dbg_red_blue_balance);
+        dump_debug_map("27_blue_lift", dbg_blue_lift);
+        dump_debug_map("28_red_purple_balance", dbg_red_purple_balance);
+        dump_debug_map("29_red_purple_lift", dbg_red_purple_lift);
+        dump_debug_map("30_red_purple_context", dbg_red_purple_context);
+        dump_debug_map("31_contextual_red_purple", dbg_contextual_red_purple);
+        dump_debug_map("32_red_magenta_surface", dbg_red_magenta_surface);
+        dump_debug_map("33_warm_surface_protect", dbg_warm_surface_protect);
+        dump_debug_map("34_neutral_gray_edge", dbg_neutral_gray_edge);
         std::cout << "🧪 Defringe debug maps: " << debug_dir_env << std::endl;
     }
 
@@ -3918,6 +4346,20 @@ bool CPUAccelerator::defringe(
               << " / " << N << " pixels ("
               << std::fixed << std::setprecision(3)
               << 100.0 * corrected_count / (double)N << "%)" << std::endl;
+    std::cout << "   classification: purple=" << purple_classified_count
+              << "  green=" << green_classified_count
+              << "  (green/total="
+              << std::fixed << std::setprecision(2)
+              << 100.0 * green_classified_count / (double)N << "%)" << std::endl;
+    if (enable_green_defringe) {
+        const double green_pass_rate = green_classified_count > 0
+            ? 100.0 * green_mask_above_cut / (double)green_classified_count
+            : 0.0;
+        std::cout << "   green branch: mask_above_cut=" << green_mask_above_cut
+                  << " (" << std::fixed << std::setprecision(2) << green_pass_rate
+                  << "% of green-classified), corrected=" << green_corrected_count
+                  << std::endl;
+    }
 
     return true;
 }

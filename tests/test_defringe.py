@@ -225,11 +225,11 @@ class TestDefringe:
         """
         CONFIRMING PROBLEM 1:
         Red cloth (Cr > 0, Cb > 0 small) near an edge should NOT be affected by high strength.
-        Current implementation (blur/strength) will likely fail this (desaturate it).
+        This guards against confusing natural warm edges with magenta fringe.
         """
         img = make_red_cloth_image(h=64, w=64)
         # Apply high strength as reported by user
-        strength = 5.0
+        strength = 10.0
         out = defringe(img, strength=strength)
         
         # Check a pixel on the red "cloth" side
@@ -245,7 +245,7 @@ class TestDefringe:
     def test_large_red_cloth_white_pattern_protected(self):
         """Large red fabric with white pattern should remain stable at strong settings."""
         img = make_large_red_cloth_with_white_pattern()
-        out = defringe(img, strength=5.0)
+        out = defringe(img, strength=10.0)
 
         # Red cloth immediately next to the white stripe is the risky area.
         x = img.shape[1] // 2 - 4
@@ -334,7 +334,7 @@ class TestDefringe:
     def test_output_range(self):
         """All output values must be in [0, 1]."""
         img = make_purple_fringe_image()
-        out = defringe(img, strength=5.0) # Test high strength stability
+        out = defringe(img, strength=10.0) # Test high strength stability
         assert float(out.min()) >= 0.0 - 1e-6, "Minimum must be >= 0"
         assert float(out.max()) <= 1.0 + 1e-6, "Maximum must be <= 1"
 
