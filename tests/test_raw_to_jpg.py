@@ -109,7 +109,7 @@ def process_raw_file(raw_path, output_dir):
         },
         {
             "name": "defringe",
-            "params": {**_base_params, "defringe": True, "lateral_ca_correction": True, "axial_ca_correction": True, "defringe_green": True},
+            "params": {**_base_params, "defringe": True, "lateral_ca_correction": True, "axial_ca_correction": True, "defringe_green": True, "defringe_green_strength": 0.3},
         },
     ]
 

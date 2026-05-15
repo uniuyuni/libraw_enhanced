@@ -3863,8 +3863,10 @@ bool CPUAccelerator::defringe(
     float edge_threshold,
     float chroma_threshold,
     float strength,
-    bool enable_green_defringe)
+    bool enable_green_defringe,
+    float green_strength_scale)
 {
+    green_strength_scale = std::clamp(green_strength_scale, 0.f, 1.f);
     if (!rgb_input.is_valid()) return false;
 
     const size_t W = rgb_input.width;
@@ -4476,9 +4478,18 @@ bool CPUAccelerator::defringe(
                 const float green_highlight_protect =
                     1.f - 0.85f * smoothstep(0.62f, 0.88f, blur_guide[i]);
                 const float rb_to_green = rb_avg / std::max(g0, 1e-4f);
+                // Detect a "natural green highlight" pixel: whitish/warmish
+                // (rb_to_green not far below 1) and bright (g0 elevated).
+                // The g0 smoothstep was previously 0.42 → 0.72 which only
+                // fully fired on very bright pixels and left moderately
+                // bright wood/foliage highlights only partially protected,
+                // allowing guard_release to leak through and shave G.
+                // Lowering it to 0.30 → 0.55 catches mid-bright highlights
+                // (typical wood/leaf specular zone) without affecting
+                // genuinely dim chroma fringes.
                 const float natural_green_highlight =
                     smoothstep(0.22f, 0.46f, rb_to_green) *
-                    smoothstep(0.42f, 0.72f, g0);
+                    smoothstep(0.30f, 0.55f, g0);
                 // Green-fringe correction is useful on neutral/metallic edges, but
                 // it can easily destroy natural (slightly white-ish) highlights on
                 // foliage. The existing natural-green heuristic must be *very*
@@ -4569,6 +4580,39 @@ bool CPUAccelerator::defringe(
 
                 mask *= local_gate * green_gain * released_highlight_protect *
                         released_natural_suppress * released_foliage_term;
+
+                // Blob-vs-line hard kill for natural green highlights.
+                //
+                // Real green CA appears as a thin, edge-aligned line with
+                // substantial line_fringe_support.  Natural green
+                // highlights (wood specular, leaf gloss) are blob-shaped
+                // and only get incidental line_fringe_support contributions
+                // from nearby texture (wood grain, etc.) — those are
+                // typically 0.01–0.04.  Genuine CA line support is much
+                // higher (0.10+).  Using a high threshold for line evidence
+                // ensures the blob kill is only released by clearly line-
+                // shaped fringes, not by texture noise inside wood/foliage
+                // regions.
+                //
+                // We additionally gate on green_neighbour so the kill is
+                // anchored to "green-leaning blur neighbourhood" context.
+                // Genuine green CA on neutral/metallic edges has
+                // green_neighbour ≈ 0 → blob = 0 → no kill, mask passes.
+                const float line_kill_evidence =
+                    smoothstep(0.04f, 0.15f, line_fringe_support[i]);
+                // sqrt() makes the kill aggressive at moderate
+                // natural_green_highlight values (e.g. 0.4 → 0.63), which
+                // is what we observe in CAMERA RGB for green-tinted wood
+                // highlights — there R and B are de-amplified by inverse
+                // WB, lowering rb_to_green below ProPhoto's value.  Real
+                // green CA escapes the kill via line_kill_evidence or via
+                // a neutral neighbourhood (green_neighbour ≈ 0).
+                const float natural_blob =
+                    std::sqrt(std::max(0.f, natural_green_highlight)) *
+                    (1.f - line_kill_evidence) *
+                    green_neighbour;
+                mask *= 1.f - 0.999f * natural_blob;
+
                 if (!enable_green_defringe) {
                     mask = 0.f;
                 }
@@ -4781,9 +4825,19 @@ bool CPUAccelerator::defringe(
                     const float rb_avg_target = 0.5f * (std::max(src[i][0], 0.f) +
                                                         std::max(src[i][2], 0.f));
                     target_g = std::max(target_g, rb_avg_target);
+                    // Green branch independent strength scale.  Lets callers
+                    // dial down green correction without weakening the
+                    // (separately controlled) purple branch.  In particular
+                    // some scenes (e.g. wood-frame highlights under X-Trans
+                    // WB) have a chroma signature that LK + axial CA cannot
+                    // fully separate from genuine CA, so reducing the green
+                    // amount here is a practical safety knob.
+                    const float green_amount =
+                        std::clamp(amount * green_strength_scale, 0.f, 1.f);
                     dst[i][0] = src[i][0];
-                    float corrected_g = std::clamp(src[i][1] * (1.f - amount) + target_g * amount,
-                                                   0.f, src[i][1]);
+                    float corrected_g = std::clamp(
+                        src[i][1] * (1.f - green_amount) + target_g * green_amount,
+                        0.f, src[i][1]);
                     dst[i][1] = corrected_g;
                     dst[i][2] = src[i][2];
                     ++green_corrected_count;

@@ -433,13 +433,15 @@ bool Accelerator::defringe(const ImageBufferFloat& rgb_input,
                            float edge_threshold,
                            float chroma_threshold,
                            float strength,
-                           bool defringe_green) {
+                           bool  defringe_green,
+                           float green_strength_scale) {
     // CPU-only: no GPU path yet
     std::cout << "🔧 Running defringe (CPU)" << std::endl;
     if (pimpl_->cpu_accelerator->defringe(rgb_input, rgb_output,
                                           radius, edge_threshold,
                                           chroma_threshold, strength,
-                                          defringe_green)) {
+                                          defringe_green,
+                                          green_strength_scale)) {
         return true;
     }
     std::cout << "❌ Defringe failed" << std::endl;

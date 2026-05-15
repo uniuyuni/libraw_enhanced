@@ -148,6 +148,7 @@ struct ProcessingParams {
   float defringe_edge_threshold   = 0.1f;
   float defringe_chroma_threshold = 0.15f;
   float defringe_strength         = 10.0f;
+  float defringe_green_strength   = 0.3f;  // Green-branch amount multiplier [0,1]
 
   // Post-demosaic lateral CA channel registration (pyramidal Lucas-Kanade).
   // Default off; explicit opt-in.  Runs BEFORE defringe so the chroma
@@ -329,11 +330,12 @@ public:
   // Defringe: edge-gated Gaussian opponent-chroma suppression (HDR-safe)
   bool defringe(const ImageBufferFloat &rgb_input,
                 ImageBufferFloat &rgb_output,
-                float radius           = 10.0f,
-                float edge_threshold   = 0.1f,
-                float chroma_threshold = 0.15f,
-                float strength         = 10.0f,
-                bool defringe_green    = false);
+                float radius               = 10.0f,
+                float edge_threshold       = 0.1f,
+                float chroma_threshold     = 0.15f,
+                float strength             = 10.0f,
+                bool  defringe_green       = false,
+                float green_strength_scale = 0.3f);
 
   // Lateral CA registration (post-demosaic dense RGB).
   bool ca_register_lateral(const ImageBufferFloat &rgb_input,

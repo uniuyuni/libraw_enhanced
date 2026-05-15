@@ -177,6 +177,7 @@ class RawImage:
                    defringe_radius: float = 10.0,
                    defringe_strength: float = 10.0,
                    defringe_green: bool = False,
+                   defringe_green_strength: float = 0.3,
 
                    # Lateral CA channel registration (post-demosaic, pyramidal LK)
                    lateral_ca_correction: bool = False,
@@ -348,6 +349,7 @@ class RawImage:
             'defringe_radius': float(defringe_radius),
             'defringe_strength': float(defringe_strength),
             'defringe_green': bool(defringe_green),
+            'defringe_green_strength': float(defringe_green_strength),
 
             # Lateral CA channel registration (post-demosaic, pyramidal LK)
             'lateral_ca_correction': bool(lateral_ca_correction),

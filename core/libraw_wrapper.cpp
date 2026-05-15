@@ -1688,13 +1688,15 @@ public:
       std::cout << "🔧 Applying linear defringe (radius=" << params.defringe_radius
                 << " strength=" << params.defringe_strength
                 << " green=" << (params.defringe_green ? "on" : "off")
+                << " green_strength=" << params.defringe_green_strength
                 << ")" << std::endl;
       accelerator->defringe(rgb_buffer, rgb_buffer,
                             params.defringe_radius,
                             params.defringe_edge_threshold,
                             params.defringe_chroma_threshold,
                             params.defringe_strength,
-                            params.defringe_green);
+                            params.defringe_green,
+                            params.defringe_green_strength);
     }
 
     // Get camera-specific color transformation matrix
@@ -2817,6 +2819,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.defringe_radius = p.second;
     else if (p.first == "defringe_strength")
       params.defringe_strength = p.second;
+    else if (p.first == "defringe_green_strength")
+      params.defringe_green_strength = p.second;
     else if (p.first == "lateral_ca_max_shift")
       params.lateral_ca_max_shift = p.second;
     else if (p.first == "lateral_ca_min_confidence")
