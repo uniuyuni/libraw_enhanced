@@ -446,4 +446,36 @@ bool Accelerator::defringe(const ImageBufferFloat& rgb_input,
     return false;
 }
 
+bool Accelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
+                                      ImageBufferFloat& rgb_output,
+                                      int   cell_size,
+                                      int   max_iterations,
+                                      float max_shift,
+                                      float min_confidence,
+                                      int   pyramid_levels) {
+    std::cout << "🔧 Running lateral CA registration (CPU)" << std::endl;
+    if (pimpl_->cpu_accelerator->ca_register_lateral(rgb_input, rgb_output,
+                                                      cell_size, max_iterations,
+                                                      max_shift, min_confidence,
+                                                      pyramid_levels)) {
+        return true;
+    }
+    std::cout << "❌ Lateral CA registration failed" << std::endl;
+    return false;
+}
+
+bool Accelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
+                                    ImageBufferFloat& rgb_output,
+                                    int   radius,
+                                    float epsilon,
+                                    float strength) {
+    std::cout << "🔧 Running axial CA cleanup (CPU)" << std::endl;
+    if (pimpl_->cpu_accelerator->ca_axial_cleanup(rgb_input, rgb_output,
+                                                    radius, epsilon, strength)) {
+        return true;
+    }
+    std::cout << "❌ Axial CA cleanup failed" << std::endl;
+    return false;
+}
+
 } // namespace libraw_enhanced

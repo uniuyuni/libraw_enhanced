@@ -149,6 +149,24 @@ struct ProcessingParams {
   float defringe_chroma_threshold = 0.15f;
   float defringe_strength         = 10.0f;
 
+  // Post-demosaic lateral CA channel registration (pyramidal Lucas-Kanade).
+  // Default off; explicit opt-in.  Runs BEFORE defringe so the chroma
+  // suppression step sees properly aligned R/G/B channels.
+  bool  lateral_ca_correction       = false;
+  int   lateral_ca_cell_size        = 96;
+  int   lateral_ca_max_iterations   = 3;
+  float lateral_ca_max_shift        = 6.0f;
+  float lateral_ca_min_confidence   = 0.02f;
+  int   lateral_ca_pyramid_levels   = 3;
+
+  // Axial CA cleanup via cross-channel guided filter (post-demosaic).
+  // Default off; opt-in.  Runs AFTER lateral_ca_correction and BEFORE
+  // defringe so the chroma cleanup sees structurally-aligned channels.
+  bool  axial_ca_correction         = false;
+  int   axial_ca_radius             = 6;
+  float axial_ca_epsilon            = 1e-4f;
+  float axial_ca_strength           = 0.3f;
+
   ProcessingParams() {
     // Initialize color matrix to identity
     for (int i = 0; i < 9; i++) {
@@ -316,6 +334,22 @@ public:
                 float chroma_threshold = 0.15f,
                 float strength         = 10.0f,
                 bool defringe_green    = false);
+
+  // Lateral CA registration (post-demosaic dense RGB).
+  bool ca_register_lateral(const ImageBufferFloat &rgb_input,
+                           ImageBufferFloat &rgb_output,
+                           int   cell_size      = 96,
+                           int   max_iterations = 3,
+                           float max_shift      = 6.0f,
+                           float min_confidence = 0.02f,
+                           int   pyramid_levels = 3);
+
+  // Axial CA cleanup via cross-channel guided filter.
+  bool ca_axial_cleanup(const ImageBufferFloat &rgb_input,
+                        ImageBufferFloat &rgb_output,
+                        int   radius   = 6,
+                        float epsilon  = 1e-4f,
+                        float strength = 0.3f);
 
 private:
   class Impl;

@@ -100,16 +100,20 @@ def process_raw_file(raw_path, output_dir):
     }
     test_configs = [
         {
+            "name": "no defringe no ca",
+            "params": {**_base_params, "defringe": False, "lateral_ca_correction": False, "axial_ca_correction": False, "axial_ca_strength": 0.3},
+        },
+        {
             "name": "no defringe",
-            "params": {**_base_params, "defringe": False},
+            "params": {**_base_params, "defringe": False, "lateral_ca_correction": True, "axial_ca_correction": True, "axial_ca_strength": 0.3},
         },
         {
             "name": "defringe",
-            "params": {**_base_params, "defringe": True, "defringe_green": True},
+            "params": {**_base_params, "defringe": True, "lateral_ca_correction": True, "axial_ca_correction": True, "axial_ca_strength": 0.3, "defringe_green": True},
         },
         {
             "name": "defringe green off",
-            "params": {**_base_params, "defringe": True, "defringe_green": False},
+            "params": {**_base_params, "defringe": True, "lateral_ca_correction": True, "axial_ca_correction": True, "axial_ca_strength": 0.3, "defringe_green": False},
         },
     ]
 

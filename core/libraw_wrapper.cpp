@@ -597,558 +597,6 @@ public:
                              idata.filters);
   }
 
-  static float bilinear_sample_u16(const std::vector<ushort> &plane, size_t w,
-                                   size_t h, float y, float x) {
-    if (w < 2 || h < 2 || x < 0.0f || y < 0.0f || x >= static_cast<float>(w - 1) ||
-        y >= static_cast<float>(h - 1)) {
-      return -1.0f;
-    }
-
-    const size_t x0 = static_cast<size_t>(x);
-    const size_t y0 = static_cast<size_t>(y);
-    const float fx = x - static_cast<float>(x0);
-    const float fy = y - static_cast<float>(y0);
-
-    const size_t idx00 = y0 * w + x0;
-    const size_t idx01 = idx00 + 1;
-    const size_t idx10 = idx00 + w;
-    const size_t idx11 = idx10 + 1;
-
-    const float v00 = static_cast<float>(plane[idx00]);
-    const float v01 = static_cast<float>(plane[idx01]);
-    const float v10 = static_cast<float>(plane[idx10]);
-    const float v11 = static_cast<float>(plane[idx11]);
-
-    return (v00 * (1.0f - fx) + v01 * fx) * (1.0f - fy) +
-           (v10 * (1.0f - fx) + v11 * fx) * fy;
-  }
-
-  static inline double huber_loss(double x, double delta) {
-    const double ax = std::fabs(x);
-    if (ax <= delta) {
-      return 0.5 * ax * ax;
-    }
-    return delta * (ax - 0.5 * delta);
-  }
-
-  void build_green_guide_and_gradient(const ImageBuffer &raw_buffer,
-                                      std::vector<float> &guide,
-                                      std::vector<float> &guide_grad,
-                                      float &mean_grad, float &max_guide) {
-    const size_t size = raw_buffer.width * raw_buffer.height;
-    guide.assign(size, 0.0f);
-    guide_grad.assign(size, 0.0f);
-
-    // Build green-reference guide (G samples + local interpolation on R/B).
-    for (size_t row = 0; row < raw_buffer.height; ++row) {
-      for (size_t col = 0; col < raw_buffer.width; ++col) {
-        const uint32_t native = cfa_channel_at(row, col);
-        const size_t idx = row * raw_buffer.width + col;
-        if (native == 1 || native == 3) {
-          guide[idx] = static_cast<float>(raw_buffer.image[idx][native]);
-          continue;
-        }
-
-        double acc = 0.0;
-        double wsum = 0.0;
-        for (int dy = -2; dy <= 2; ++dy) {
-          const int yy = static_cast<int>(row) + dy;
-          if (yy < 0 || yy >= static_cast<int>(raw_buffer.height)) {
-            continue;
-          }
-          for (int dx = -2; dx <= 2; ++dx) {
-            const int xx = static_cast<int>(col) + dx;
-            if (xx < 0 || xx >= static_cast<int>(raw_buffer.width)) {
-              continue;
-            }
-            const uint32_t n = cfa_channel_at(static_cast<size_t>(yy),
-                                              static_cast<size_t>(xx));
-            if (n != 1 && n != 3) {
-              continue;
-            }
-            const int dist = std::abs(dx) + std::abs(dy);
-            const double w = 1.0 / static_cast<double>(1 + dist);
-            const size_t nidx =
-                static_cast<size_t>(yy) * raw_buffer.width + static_cast<size_t>(xx);
-            acc += static_cast<double>(raw_buffer.image[nidx][n]) * w;
-            wsum += w;
-          }
-        }
-        guide[idx] = static_cast<float>(
-            wsum > 0.0 ? (acc / wsum) : raw_buffer.image[idx][0]);
-      }
-    }
-
-    double grad_acc = 0.0;
-    size_t grad_count = 0;
-    max_guide = 0.0f;
-    for (size_t i = 0; i < size; ++i) {
-      max_guide = std::max(max_guide, guide[i]);
-    }
-
-    for (size_t row = 1; row + 1 < raw_buffer.height; ++row) {
-      for (size_t col = 1; col + 1 < raw_buffer.width; ++col) {
-        const size_t idx = row * raw_buffer.width + col;
-        const float gx = (guide[idx - raw_buffer.width + 1] +
-                          2.0f * guide[idx + 1] +
-                          guide[idx + raw_buffer.width + 1]) -
-                         (guide[idx - raw_buffer.width - 1] +
-                          2.0f * guide[idx - 1] +
-                          guide[idx + raw_buffer.width - 1]);
-        const float gy = (guide[idx + raw_buffer.width - 1] +
-                          2.0f * guide[idx + raw_buffer.width] +
-                          guide[idx + raw_buffer.width + 1]) -
-                         (guide[idx - raw_buffer.width - 1] +
-                          2.0f * guide[idx - raw_buffer.width] +
-                          guide[idx - raw_buffer.width + 1]);
-        const float g = std::sqrt(gx * gx + gy * gy);
-        guide_grad[idx] = g;
-        grad_acc += g;
-        grad_count++;
-      }
-    }
-
-    mean_grad = static_cast<float>(
-        grad_count ? (grad_acc / static_cast<double>(grad_count)) : 0.0);
-  }
-
-  float estimate_ca_scale(const ImageBuffer &raw_buffer, uint32_t target_channel,
-                          const std::vector<ushort> &channel_plane,
-                          const std::vector<float> &guide,
-                          const std::vector<float> &guide_grad,
-                          float mean_grad) {
-    if (raw_buffer.width < 16 || raw_buffer.height < 16) {
-      return 1.0f;
-    }
-
-    struct SamplePoint {
-      uint32_t row;
-      uint32_t col;
-      float weight;
-    };
-
-    std::vector<SamplePoint> samples;
-    samples.reserve(32768);
-
-    const float grad_threshold = mean_grad * 0.9f;
-    const int stride = (raw_buffer.width * raw_buffer.height > 24000000) ? 4 : 2;
-    float max_channel = 0.0f;
-    for (size_t idx = 0; idx < raw_buffer.width * raw_buffer.height; ++idx) {
-      max_channel = std::max(max_channel, static_cast<float>(channel_plane[idx]));
-    }
-
-    for (size_t row = 4; row + 4 < raw_buffer.height; row += stride) {
-      for (size_t col = 4; col + 4 < raw_buffer.width; col += stride) {
-        if (cfa_channel_at(row, col) != target_channel) {
-          continue;
-        }
-        const size_t idx = row * raw_buffer.width + col;
-        const float grad = guide_grad[idx];
-        const float v = static_cast<float>(channel_plane[idx]);
-        // Keep clipped-edge samples for CA estimation; they are critical for
-        // highlight-fringe suppression and were previously filtered out.
-        if (v < 96.0f) {
-          continue;
-        }
-        if (grad < grad_threshold && v < max_channel * 0.92f) {
-          continue;
-        }
-
-        const float weight =
-            1.0f + std::min(3.0f, grad / (mean_grad + 1e-6f));
-        samples.push_back(
-            {static_cast<uint32_t>(row), static_cast<uint32_t>(col), weight});
-      }
-    }
-
-    if (samples.size() < 256) {
-      return 1.0f;
-    }
-    if (samples.size() > 30000) {
-      const size_t step = samples.size() / 30000 + 1;
-      std::vector<SamplePoint> reduced;
-      reduced.reserve(30000);
-      for (size_t i = 0; i < samples.size(); i += step) {
-        reduced.push_back(samples[i]);
-      }
-      samples.swap(reduced);
-    }
-
-    const float center_y = static_cast<float>(raw_buffer.height) * 0.5f;
-    const float center_x = static_cast<float>(raw_buffer.width) * 0.5f;
-
-    auto evaluate = [&](float scale) {
-      double score = 0.0;
-      double weight_sum = 0.0;
-      size_t valid = 0;
-
-      for (const auto &s : samples) {
-        const float src_y =
-            (static_cast<float>(s.row) - center_y) * scale + center_y;
-        const float src_x =
-            (static_cast<float>(s.col) - center_x) * scale + center_x;
-
-        const float corrected = bilinear_sample_u16(
-            channel_plane, raw_buffer.width, raw_buffer.height, src_y, src_x);
-        if (corrected < 0.0f) {
-          continue;
-        }
-
-        const size_t idx =
-            static_cast<size_t>(s.row) * raw_buffer.width + s.col;
-        const float ref = guide[idx];
-        const float norm = std::max(64.0f, ref);
-        const double inten_err = (corrected - ref) / norm;
-
-        const float corr_xp = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y,
-                                                  src_x + 1.0f);
-        const float corr_xm = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y,
-                                                  src_x - 1.0f);
-        const float corr_yp = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y + 1.0f,
-                                                  src_x);
-        const float corr_ym = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y - 1.0f,
-                                                  src_x);
-
-        double grad_err = 0.0;
-        if (corr_xp >= 0.0f && corr_xm >= 0.0f && corr_yp >= 0.0f &&
-            corr_ym >= 0.0f) {
-          const float cgx = corr_xp - corr_xm;
-          const float cgy = corr_yp - corr_ym;
-          const float ggx = guide[idx + 1] - guide[idx - 1];
-          const float ggy = guide[idx + raw_buffer.width] -
-                            guide[idx - raw_buffer.width];
-          const float gnorm = std::max(32.0f, std::fabs(ggx) + std::fabs(ggy));
-          grad_err = (std::fabs(cgx - ggx) + std::fabs(cgy - ggy)) / gnorm;
-        }
-
-        const double robust =
-            0.55 * huber_loss(inten_err, 0.20) + 0.45 * huber_loss(grad_err, 0.15);
-        score += s.weight * robust;
-        weight_sum += s.weight;
-        valid++;
-      }
-
-      if (valid < 128 || weight_sum < 1e-6) {
-        return std::numeric_limits<double>::infinity();
-      }
-      return score / weight_sum;
-    };
-
-    float best_scale = 1.0f;
-    double best_score = std::numeric_limits<double>::infinity();
-
-    for (float scale = 0.995f; scale <= 1.00501f; scale += 0.001f) {
-      const double s = evaluate(scale);
-      if (s < best_score) {
-        best_score = s;
-        best_scale = scale;
-      }
-    }
-
-    const float fine_begin = std::max(0.992f, best_scale - 0.0012f);
-    const float fine_end = std::min(1.008f, best_scale + 0.0012f);
-    for (float scale = fine_begin; scale <= fine_end + 1e-6f;
-         scale += 0.0002f) {
-      const double s = evaluate(scale);
-      if (s < best_score) {
-        best_score = s;
-        best_scale = scale;
-      }
-    }
-
-    return std::clamp(best_scale, 0.99f, 1.01f);
-  }
-
-  float estimate_ca_scale_window(const ImageBuffer &raw_buffer,
-                                 uint32_t target_channel,
-                                 const std::vector<ushort> &channel_plane,
-                                 const std::vector<float> &guide,
-                                 const std::vector<float> &guide_grad,
-                                 float mean_grad, size_t row_begin,
-                                 size_t row_end, size_t col_begin,
-                                 size_t col_end, float center_scale) {
-    if (row_end <= row_begin + 8 || col_end <= col_begin + 8) {
-      return center_scale;
-    }
-
-    struct SamplePoint {
-      uint32_t row;
-      uint32_t col;
-      float weight;
-    };
-
-    std::vector<SamplePoint> samples;
-    samples.reserve(4096);
-    const float grad_threshold = mean_grad * 1.0f;
-    float max_channel = 0.0f;
-    for (size_t idx = 0; idx < raw_buffer.width * raw_buffer.height; ++idx) {
-      max_channel = std::max(max_channel, static_cast<float>(channel_plane[idx]));
-    }
-
-    const size_t rb = std::max<size_t>(4, row_begin);
-    const size_t re = std::min(raw_buffer.height - 4, row_end);
-    const size_t cb = std::max<size_t>(4, col_begin);
-    const size_t ce = std::min(raw_buffer.width - 4, col_end);
-    const size_t window_h = re - rb;
-    const size_t window_w = ce - cb;
-    const int stride = (window_h > 320 || window_w > 320) ? 3 : 2;
-
-    for (size_t row = rb; row < re; row += stride) {
-      for (size_t col = cb; col < ce; col += stride) {
-        if (cfa_channel_at(row, col) != target_channel) {
-          continue;
-        }
-        const size_t idx = row * raw_buffer.width + col;
-        const float grad = guide_grad[idx];
-        const float v = static_cast<float>(channel_plane[idx]);
-        // Keep clipped-edge samples for CA estimation; they are critical for
-        // highlight-fringe suppression and were previously filtered out.
-        if (v < 96.0f) {
-          continue;
-        }
-        if (grad < grad_threshold && v < max_channel * 0.92f) {
-          continue;
-        }
-        const float weight =
-            1.0f + std::min(3.0f, grad / (mean_grad + 1e-6f));
-        samples.push_back(
-            {static_cast<uint32_t>(row), static_cast<uint32_t>(col), weight});
-      }
-    }
-
-    if (samples.size() < 128) {
-      return center_scale;
-    }
-    if (samples.size() > 1200) {
-      const size_t step = samples.size() / 1200 + 1;
-      std::vector<SamplePoint> reduced;
-      reduced.reserve(1200);
-      for (size_t i = 0; i < samples.size(); i += step) {
-        reduced.push_back(samples[i]);
-      }
-      samples.swap(reduced);
-    }
-
-    const float center_y = static_cast<float>(raw_buffer.height) * 0.5f;
-    const float center_x = static_cast<float>(raw_buffer.width) * 0.5f;
-
-    auto evaluate = [&](float scale) {
-      double score = 0.0;
-      double weight_sum = 0.0;
-      size_t valid = 0;
-
-      for (const auto &s : samples) {
-        const float src_y =
-            (static_cast<float>(s.row) - center_y) * scale + center_y;
-        const float src_x =
-            (static_cast<float>(s.col) - center_x) * scale + center_x;
-        const float corrected = bilinear_sample_u16(
-            channel_plane, raw_buffer.width, raw_buffer.height, src_y, src_x);
-        if (corrected < 0.0f) {
-          continue;
-        }
-        const size_t idx =
-            static_cast<size_t>(s.row) * raw_buffer.width + s.col;
-        const float ref = guide[idx];
-        const float norm = std::max(64.0f, ref);
-        const double inten_err = (corrected - ref) / norm;
-
-        const float corr_xp = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y,
-                                                  src_x + 1.0f);
-        const float corr_xm = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y,
-                                                  src_x - 1.0f);
-        const float corr_yp = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y + 1.0f,
-                                                  src_x);
-        const float corr_ym = bilinear_sample_u16(channel_plane, raw_buffer.width,
-                                                  raw_buffer.height, src_y - 1.0f,
-                                                  src_x);
-
-        double grad_err = 0.0;
-        if (corr_xp >= 0.0f && corr_xm >= 0.0f && corr_yp >= 0.0f &&
-            corr_ym >= 0.0f) {
-          const float cgx = corr_xp - corr_xm;
-          const float cgy = corr_yp - corr_ym;
-          const float ggx = guide[idx + 1] - guide[idx - 1];
-          const float ggy = guide[idx + raw_buffer.width] -
-                            guide[idx - raw_buffer.width];
-          const float gnorm = std::max(32.0f, std::fabs(ggx) + std::fabs(ggy));
-          grad_err = (std::fabs(cgx - ggx) + std::fabs(cgy - ggy)) / gnorm;
-        }
-
-        const double robust =
-            0.55 * huber_loss(inten_err, 0.20) + 0.45 * huber_loss(grad_err, 0.15);
-        score += s.weight * robust;
-        weight_sum += s.weight;
-        valid++;
-      }
-
-      if (valid < 64 || weight_sum < 1e-6) {
-        return std::numeric_limits<double>::infinity();
-      }
-      return score / weight_sum;
-    };
-
-    float best_scale = center_scale;
-    double best_score = std::numeric_limits<double>::infinity();
-
-    const float coarse_begin = std::max(0.99f, center_scale - 0.0025f);
-    const float coarse_end = std::min(1.01f, center_scale + 0.0025f);
-    for (float scale = coarse_begin; scale <= coarse_end + 1e-6f;
-         scale += 0.0005f) {
-      const double s = evaluate(scale);
-      if (s < best_score) {
-        best_score = s;
-        best_scale = scale;
-      }
-    }
-
-    const float fine_begin = std::max(0.99f, best_scale - 0.0005f);
-    const float fine_end = std::min(1.01f, best_scale + 0.0005f);
-    for (float scale = fine_begin; scale <= fine_end + 1e-6f;
-         scale += 0.0001f) {
-      const double s = evaluate(scale);
-      if (s < best_score) {
-        best_score = s;
-        best_scale = scale;
-      }
-    }
-
-    return std::clamp(best_scale, 0.99f, 1.01f);
-  }
-
-  std::vector<float> build_ca_scale_map(
-      const ImageBuffer &raw_buffer, uint32_t target_channel,
-      const std::vector<ushort> &channel_plane, const std::vector<float> &guide,
-      const std::vector<float> &guide_grad, float mean_grad, float base_scale,
-      size_t &map_w, size_t &map_h) {
-    const double mpix = static_cast<double>(raw_buffer.width * raw_buffer.height) /
-                        1000000.0;
-    size_t tile = 160;
-    if (mpix > 16.0) {
-      tile = 192;
-    }
-    if (mpix > 28.0) {
-      tile = 256;
-    }
-
-    // Keep control-grid size bounded to avoid explosive runtime on high-res raw.
-    constexpr size_t kMaxMapNodes = 420;
-    while (true) {
-      const size_t test_w =
-          std::max<size_t>(2, (raw_buffer.width + tile - 1) / tile + 1);
-      const size_t test_h =
-          std::max<size_t>(2, (raw_buffer.height + tile - 1) / tile + 1);
-      if (test_w * test_h <= kMaxMapNodes || tile >= 512) {
-        break;
-      }
-      tile += 32;
-    }
-
-    map_w = std::max<size_t>(2, (raw_buffer.width + tile - 1) / tile + 1);
-    map_h = std::max<size_t>(2, (raw_buffer.height + tile - 1) / tile + 1);
-
-    std::vector<float> map(map_w * map_h, base_scale);
-
-    std::vector<float> grid_y(map_h, 0.0f);
-    std::vector<float> grid_x(map_w, 0.0f);
-    for (size_t gy = 0; gy < map_h; ++gy) {
-      grid_y[gy] =
-          (map_h == 1)
-              ? 0.0f
-              : (static_cast<float>(gy) / static_cast<float>(map_h - 1)) *
-                    static_cast<float>(raw_buffer.height - 1);
-    }
-    for (size_t gx = 0; gx < map_w; ++gx) {
-      grid_x[gx] =
-          (map_w == 1)
-              ? 0.0f
-              : (static_cast<float>(gx) / static_cast<float>(map_w - 1)) *
-                    static_cast<float>(raw_buffer.width - 1);
-    }
-
-#ifdef _OPENMP
-#pragma omp parallel for collapse(2)
-#endif
-    for (int gy = 0; gy < static_cast<int>(map_h); ++gy) {
-      for (int gx = 0; gx < static_cast<int>(map_w); ++gx) {
-        const float y = grid_y[static_cast<size_t>(gy)];
-        const float x = grid_x[static_cast<size_t>(gx)];
-
-        const size_t yc = static_cast<size_t>(y);
-        const size_t xc = static_cast<size_t>(x);
-        const size_t row_begin = (yc > tile) ? (yc - tile) : 0;
-        const size_t col_begin = (xc > tile) ? (xc - tile) : 0;
-        const size_t row_end = std::min(raw_buffer.height, yc + tile + 1);
-        const size_t col_end = std::min(raw_buffer.width, xc + tile + 1);
-
-        map[static_cast<size_t>(gy) * map_w + static_cast<size_t>(gx)] =
-            estimate_ca_scale_window(
-            raw_buffer, target_channel, channel_plane, guide, guide_grad,
-            mean_grad, row_begin, row_end, col_begin, col_end, base_scale);
-      }
-    }
-
-    // Quality-first smoothing (two passes) to reduce tile boundary artifacts.
-    if (map_w >= 3 && map_h >= 3) {
-      for (int pass = 0; pass < 2; ++pass) {
-        std::vector<float> smoothed = map;
-        for (size_t gy = 1; gy + 1 < map_h; ++gy) {
-          for (size_t gx = 1; gx + 1 < map_w; ++gx) {
-            float acc = 0.0f;
-            acc += map[(gy - 1) * map_w + (gx - 1)] * 1.0f;
-            acc += map[(gy - 1) * map_w + gx] * 2.0f;
-            acc += map[(gy - 1) * map_w + (gx + 1)] * 1.0f;
-            acc += map[gy * map_w + (gx - 1)] * 2.0f;
-            acc += map[gy * map_w + gx] * 4.0f;
-            acc += map[gy * map_w + (gx + 1)] * 2.0f;
-            acc += map[(gy + 1) * map_w + (gx - 1)] * 1.0f;
-            acc += map[(gy + 1) * map_w + gx] * 2.0f;
-            acc += map[(gy + 1) * map_w + (gx + 1)] * 1.0f;
-            smoothed[gy * map_w + gx] = acc * (1.0f / 16.0f);
-          }
-        }
-        map.swap(smoothed);
-      }
-    }
-
-    return map;
-  }
-
-  static float sample_scale_map(const std::vector<float> &map, size_t map_w,
-                                size_t map_h, size_t row, size_t col,
-                                size_t image_w, size_t image_h,
-                                float fallback_scale) {
-    if (map.empty() || map_w < 2 || map_h < 2 || image_w < 2 || image_h < 2) {
-      return fallback_scale;
-    }
-
-    const float gx =
-        (static_cast<float>(col) * static_cast<float>(map_w - 1)) /
-        static_cast<float>(image_w - 1);
-    const float gy =
-        (static_cast<float>(row) * static_cast<float>(map_h - 1)) /
-        static_cast<float>(image_h - 1);
-
-    const size_t x0 = std::min(map_w - 2, static_cast<size_t>(gx));
-    const size_t y0 = std::min(map_h - 2, static_cast<size_t>(gy));
-    const float fx = gx - static_cast<float>(x0);
-    const float fy = gy - static_cast<float>(y0);
-
-    const float m00 = map[y0 * map_w + x0];
-    const float m01 = map[y0 * map_w + x0 + 1];
-    const float m10 = map[(y0 + 1) * map_w + x0];
-    const float m11 = map[(y0 + 1) * map_w + x0 + 1];
-
-    return (m00 * (1.0f - fx) + m01 * fx) * (1.0f - fy) +
-           (m10 * (1.0f - fx) + m11 * fx) * fy;
-  }
 
   void scale_colors(ImageBuffer &raw_buffer, float scale_mul[4]) {
     auto &imgdata = processor.imgdata;
@@ -1415,57 +863,21 @@ public:
     // ========================================
     // 9. 倍率色収差補正（R/Bチャンネル）
     // ========================================
+    //
+    // The previous auto-estimation path for RAW-space radial CA has been
+    // retired (it suffered from a sparse-bilinear bias on CFA planes and
+    // produced visible radial artifacts on real images — e.g. sky banding
+    // and magenta→green redistribution on X-Pro2 Yokohama at scale ≈0.998).
+    //
+    // Lateral CA correction now lives in post-demosaic dense RGB via the
+    // Lucas-Kanade channel registration step
+    // (ProcessingParams::lateral_ca_correction).
+    //
+    // The legacy per-channel radial scaling loop below remains for callers
+    // that explicitly pass non-unity chromatic_aberration values.  When
+    // chromatic_aberration is left at the default (1.0, 1.0) this block is
+    // a no-op.
     size = imgdata.sizes.iheight * imgdata.sizes.iwidth;
-
-    // Auto mode: both red/blue CA scales are default (=1.0).
-    // NOTE: high-quality raw processors typically estimate TCA by minimizing
-    // R/G and B/G edge mismatch in high-gradient regions.
-    const bool auto_ca_requested =
-        std::fabs(imgdata.params.aber[0] - 1.0f) < 1e-6f &&
-        std::fabs(imgdata.params.aber[1] - 1.0f) < 1e-6f &&
-        std::fabs(imgdata.params.aber[2] - 1.0f) < 1e-6f;
-
-    std::vector<float> auto_red_map;
-    std::vector<float> auto_blue_map;
-    size_t ca_map_w = 0;
-    size_t ca_map_h = 0;
-
-    if (auto_ca_requested && raw_buffer.is_valid() && raw_buffer.width > 15 &&
-        raw_buffer.height > 15 && imgdata.idata.colors == 3) {
-      std::vector<float> guide;
-      std::vector<float> guide_grad;
-      float mean_grad = 0.0f;
-      float max_guide = 0.0f;
-      build_green_guide_and_gradient(raw_buffer, guide, guide_grad, mean_grad,
-                                     max_guide);
-
-      std::vector<ushort> red_plane(size);
-      std::vector<ushort> blue_plane(size);
-      for (size_t i = 0; i < size; ++i) {
-        red_plane[i] = raw_buffer.image[i][0];
-        blue_plane[i] = raw_buffer.image[i][2];
-      }
-
-      const float auto_red =
-          estimate_ca_scale(raw_buffer, 0, red_plane, guide, guide_grad, mean_grad);
-      const float auto_blue =
-          estimate_ca_scale(raw_buffer, 2, blue_plane, guide, guide_grad, mean_grad);
-
-      ca_map_w = 0;
-      ca_map_h = 0;
-      auto_red_map = build_ca_scale_map(raw_buffer, 0, red_plane, guide,
-                                        guide_grad, mean_grad, auto_red, ca_map_w,
-                                        ca_map_h);
-      auto_blue_map = build_ca_scale_map(raw_buffer, 2, blue_plane, guide,
-                                         guide_grad, mean_grad, auto_blue, ca_map_w,
-                                         ca_map_h);
-
-      imgdata.params.aber[0] = auto_red;
-      imgdata.params.aber[2] = auto_blue;
-      std::cout << "📷 Auto CA estimated (global): R=" << auto_red
-                << " B=" << auto_blue << ", map=" << ca_map_w << "x" << ca_map_h
-                << std::endl;
-    }
 
     if ((imgdata.params.aber[0] != 1.0f || imgdata.params.aber[2] != 1.0f) &&
         imgdata.idata.colors == 3 && raw_buffer.is_valid() &&
@@ -1474,8 +886,8 @@ public:
       const float center_x = static_cast<float>(raw_buffer.width) * 0.5f;
 
       for (c = 0; c < 4; c += 2) {
-        const float base_scale = imgdata.params.aber[c];
-        if (std::fabs(base_scale - 1.0f) < 1e-6f || base_scale <= 0.0f) {
+        const float scale = imgdata.params.aber[c];
+        if (std::fabs(scale - 1.0f) < 1e-6f || scale <= 0.0f) {
           continue;
         }
 
@@ -1484,26 +896,12 @@ public:
           channel_plane[i] = raw_buffer.image[i][c];
         }
 
-        const std::vector<float> *local_map = nullptr;
-        if (c == 0 && !auto_red_map.empty()) {
-          local_map = &auto_red_map;
-        } else if (c == 2 && !auto_blue_map.empty()) {
-          local_map = &auto_blue_map;
-        }
-
-        const bool use_local_map = (local_map != nullptr);
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
         for (int row_i = 0; row_i < static_cast<int>(raw_buffer.height); row_i++) {
           const size_t row_local = static_cast<size_t>(row_i);
           for (size_t col_local = 0; col_local < raw_buffer.width; col_local++) {
-            const float scale =
-                use_local_map
-                    ? sample_scale_map(*local_map, ca_map_w, ca_map_h, row_local,
-                                       col_local, raw_buffer.width,
-                                       raw_buffer.height, base_scale)
-                    : base_scale;
             const float src_col_f =
                 (static_cast<float>(col_local) - center_x) * scale + center_x;
             const float src_row_local =
@@ -2247,6 +1645,40 @@ public:
                     << std::endl;
         }
       }
+    }
+
+    // Lateral chromatic aberration registration in post-demosaic dense RGB.
+    // Runs BEFORE defringe so the chroma cleanup step sees properly aligned
+    // R/G/B channels.  When this step does its job, the downstream defringe
+    // has much less residual lateral fringing to mop up.
+    if (params.lateral_ca_correction) {
+      std::cout << "🔧 Applying lateral CA registration (cell="
+                << params.lateral_ca_cell_size
+                << " iter=" << params.lateral_ca_max_iterations
+                << " max_shift=" << params.lateral_ca_max_shift
+                << " pyramid=" << params.lateral_ca_pyramid_levels << ")"
+                << std::endl;
+      accelerator->ca_register_lateral(rgb_buffer, rgb_buffer,
+                                       params.lateral_ca_cell_size,
+                                       params.lateral_ca_max_iterations,
+                                       params.lateral_ca_max_shift,
+                                       params.lateral_ca_min_confidence,
+                                       params.lateral_ca_pyramid_levels);
+    }
+
+    // Axial CA cleanup (guided filter).  Runs AFTER lateral registration so
+    // R/G/B are aligned, and BEFORE defringe so chroma suppression sees
+    // halo-tightened channels.
+    if (params.axial_ca_correction) {
+      std::cout << "🔧 Applying axial CA cleanup (radius="
+                << params.axial_ca_radius
+                << " eps=" << params.axial_ca_epsilon
+                << " strength=" << params.axial_ca_strength << ")"
+                << std::endl;
+      accelerator->ca_axial_cleanup(rgb_buffer, rgb_buffer,
+                                    params.axial_ca_radius,
+                                    params.axial_ca_epsilon,
+                                    params.axial_ca_strength);
     }
 
     // Defringe in linear camera RGB before output color-space conversion and
@@ -3322,6 +2754,10 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.defringe = p.second;
     else if (p.first == "defringe_green")
       params.defringe_green = p.second;
+    else if (p.first == "lateral_ca_correction")
+      params.lateral_ca_correction = p.second;
+    else if (p.first == "axial_ca_correction")
+      params.axial_ca_correction = p.second;
   }
 
   for (const auto &p : int_params) {
@@ -3346,6 +2782,14 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.user_black = p.second;
     else if (p.first == "user_sat")
       params.user_sat = p.second;
+    else if (p.first == "lateral_ca_cell_size")
+      params.lateral_ca_cell_size = p.second;
+    else if (p.first == "lateral_ca_max_iterations")
+      params.lateral_ca_max_iterations = p.second;
+    else if (p.first == "lateral_ca_pyramid_levels")
+      params.lateral_ca_pyramid_levels = p.second;
+    else if (p.first == "axial_ca_radius")
+      params.axial_ca_radius = p.second;
   }
 
   for (const auto &p : float_params) {
@@ -3373,6 +2817,14 @@ ProcessedImageData LibRawWrapper::process_with_dict(
       params.defringe_radius = p.second;
     else if (p.first == "defringe_strength")
       params.defringe_strength = p.second;
+    else if (p.first == "lateral_ca_max_shift")
+      params.lateral_ca_max_shift = p.second;
+    else if (p.first == "lateral_ca_min_confidence")
+      params.lateral_ca_min_confidence = p.second;
+    else if (p.first == "axial_ca_epsilon")
+      params.axial_ca_epsilon = p.second;
+    else if (p.first == "axial_ca_strength")
+      params.axial_ca_strength = p.second;
   }
 
   for (const auto &p : string_params) {

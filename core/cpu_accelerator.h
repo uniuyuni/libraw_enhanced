@@ -106,6 +106,68 @@ public:
                   float strength         = 10.0f,  // Correction strength and detection sensitivity
                   bool defringe_green    = false); // Also correct green fringes
 
+    // Lateral chromatic aberration registration (post-demosaic dense RGB).
+    //
+    // Estimates per-cell sub-pixel shifts of R and B channels relative to G
+    // using pyramidal Lucas-Kanade optical flow on the green channel as a
+    // reference structure.  Each cell produces (dx, dy) shifts which are
+    // smoothed across the image and applied via per-pixel bilinear
+    // resampling.  Designed to run AFTER demosaic (dense R/G/B) and BEFORE
+    // defringe / color-matrix / gamma, so chroma cleanup sees properly
+    // registered channels.
+    //
+    //   cell_size      : LK estimation cell footprint in pixels at full
+    //                    resolution (default 96).  Smaller → more spatial
+    //                    detail but noisier estimates.
+    //   max_iterations : LK iteration count per pyramid level (default 3).
+    //   max_shift      : Hard cap on per-axis shift magnitude in pixels at
+    //                    the finest level (clamp + safety; default 6.0).
+    //   min_confidence : Cells whose gradient structure tensor minimum
+    //                    eigenvalue is below this fraction of the image
+    //                    maximum are treated as untrustworthy and fall back
+    //                    to zero shift before smoothing (default 0.02).
+    //   pyramid_levels : Number of resolution levels used by the pyramidal
+    //                    LK.  N=1 reduces to a single-level estimate.  N=3
+    //                    (default) handles shifts up to ~24 px at the
+    //                    original resolution.
+    //
+    // Returns false on input failure.  In-place safe (output may alias input).
+    bool ca_register_lateral(const ImageBufferFloat& rgb_input,
+                             ImageBufferFloat& rgb_output,
+                             int   cell_size      = 96,
+                             int   max_iterations = 3,
+                             float max_shift      = 6.0f,
+                             float min_confidence = 0.02f,
+                             int   pyramid_levels = 3);
+
+    // Cross-channel guided filter for axial chromatic aberration removal.
+    //
+    // Axial (longitudinal) CA shows up as colored halos around bright/dark
+    // points or thin edges where one chroma channel is defocused relative
+    // to the green channel.  A geometric shift cannot fix this — instead we
+    // apply the guided-image filter of He et al. (2010) to R (and B) using
+    // G as the structural guide.  Within a local window of radius r the
+    // filter constrains the output to a linear model
+    //
+    //     R_out(p)  ≈  a · G(p) + b           (per-window a, b)
+    //
+    // which retains R's correct local hue (because a and b can adapt to it)
+    // while forcing R's high-frequency structure to follow G.  This is
+    // exactly the behaviour needed to tighten defocused chroma halos.
+    //
+    // The `strength` parameter blends the filtered output with the input
+    // (0 = no change, 1 = fully filtered).  The `radius` controls how far
+    // halos can extend — larger → catches wider halos but smooths chroma
+    // more aggressively.
+    //
+    // Designed to run AFTER lateral CA registration (so we work on
+    // already-aligned channels) and BEFORE defringe.  In-place safe.
+    bool ca_axial_cleanup(const ImageBufferFloat& rgb_input,
+                          ImageBufferFloat& rgb_output,
+                          int   radius   = 6,
+                          float epsilon  = 1e-4f,
+                          float strength = 0.3f);
+
 private: 
     bool initialized_ = false;
     std::string device_name_ = "Apple Silicon CPU";

@@ -176,7 +176,21 @@ class RawImage:
                    defringe: bool = False,
                    defringe_radius: float = 10.0,
                    defringe_strength: float = 10.0,
-                   defringe_green: bool = False) -> np.ndarray:
+                   defringe_green: bool = False,
+
+                   # Lateral CA channel registration (post-demosaic, pyramidal LK)
+                   lateral_ca_correction: bool = False,
+                   lateral_ca_cell_size: int = 96,
+                   lateral_ca_max_iterations: int = 3,
+                   lateral_ca_max_shift: float = 6.0,
+                   lateral_ca_min_confidence: float = 0.02,
+                   lateral_ca_pyramid_levels: int = 3,
+
+                   # Axial CA cleanup via cross-channel guided filter
+                   axial_ca_correction: bool = False,
+                   axial_ca_radius: int = 6,
+                   axial_ca_epsilon: float = 1e-4,
+                   axial_ca_strength: float = 0.3) -> np.ndarray:
         """
         RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
 
@@ -226,8 +240,15 @@ class RawImage:
             gamma: Gamma curve (power, slope) tuple
             no_auto_scale: Disable automatic scaling
             
-            # Color correction (NEW - rawpy compatible)
-            chromatic_aberration: Chromatic aberration correction (red, blue scales)
+            # Color correction (rawpy compatible; legacy RAW-space radial scaling)
+            chromatic_aberration: Tuple of (red_scale, blue_scale) applied as
+                a radial scale to the R and B CFA planes before demosaic.
+                Defaults to (1.0, 1.0) → no correction.  Prefer
+                `lateral_ca_correction=True` (post-demosaic LK registration)
+                for new code; this legacy path is kept only for backwards
+                compatibility with callers that hand-tuned values.  The
+                previous auto-estimation mode has been retired (it produced
+                radial artifacts on real-world images).
             
             # User adjustments
             user_black: Custom black level (-1=auto)
@@ -327,6 +348,20 @@ class RawImage:
             'defringe_radius': float(defringe_radius),
             'defringe_strength': float(defringe_strength),
             'defringe_green': bool(defringe_green),
+
+            # Lateral CA channel registration (post-demosaic, pyramidal LK)
+            'lateral_ca_correction': bool(lateral_ca_correction),
+            'lateral_ca_cell_size': int(lateral_ca_cell_size),
+            'lateral_ca_max_iterations': int(lateral_ca_max_iterations),
+            'lateral_ca_max_shift': float(lateral_ca_max_shift),
+            'lateral_ca_min_confidence': float(lateral_ca_min_confidence),
+            'lateral_ca_pyramid_levels': int(lateral_ca_pyramid_levels),
+
+            # Axial CA cleanup via cross-channel guided filter
+            'axial_ca_correction': bool(axial_ca_correction),
+            'axial_ca_radius': int(axial_ca_radius),
+            'axial_ca_epsilon': float(axial_ca_epsilon),
+            'axial_ca_strength': float(axial_ca_strength),
         }
                 
         # Convert parameter dict to the format expected by C++

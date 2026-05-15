@@ -3282,6 +3282,569 @@ inline float smoothstep(float edge0, float edge1, float x) {
     float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
+
+// Bilinear sample (with edge clamp) of a single channel of a planar buffer.
+inline float bilinear_sample_plane(const float* plane, size_t W, size_t H,
+                                    float x, float y) {
+    if (x < 0.f) x = 0.f;
+    if (y < 0.f) y = 0.f;
+    if (x > static_cast<float>(W - 1)) x = static_cast<float>(W - 1);
+    if (y > static_cast<float>(H - 1)) y = static_cast<float>(H - 1);
+    const size_t x0 = static_cast<size_t>(x);
+    const size_t y0 = static_cast<size_t>(y);
+    const size_t x1 = std::min(x0 + 1, W - 1);
+    const size_t y1 = std::min(y0 + 1, H - 1);
+    const float fx = x - static_cast<float>(x0);
+    const float fy = y - static_cast<float>(y0);
+    const float v00 = plane[y0 * W + x0];
+    const float v01 = plane[y0 * W + x1];
+    const float v10 = plane[y1 * W + x0];
+    const float v11 = plane[y1 * W + x1];
+    return (v00 * (1.f - fx) + v01 * fx) * (1.f - fy) +
+           (v10 * (1.f - fx) + v11 * fx) * fy;
+}
+}
+
+//===================================================================
+// Lateral chromatic aberration registration (post-demosaic dense RGB)
+//
+// Pyramidal Lucas-Kanade between the green channel (reference) and the
+// red/blue channels.  At each level a per-cell 2x2 normal-equation step
+// refines an accumulated sub-pixel shift.  Going coarse → fine allows the
+// linearisation to remain valid even for large lateral CA (up to roughly
+// max_shift × 2^(pyramid_levels − 1) in original pixels).
+//
+// LK update per cell:
+//   minimise   Σ_pix ( target(p + d) − G(p) )²
+//   linearise: target(p + d) ≈ target(p) + ∇G(p) · d   (inverse-compositional
+//              variant: G's gradient is stable across iterations)
+//   normal eq: [Σ Gx², Σ Gx Gy; Σ Gx Gy, Σ Gy²] · d = -[Σ Gx ε; Σ Gy ε]
+//   ε = target(p + d_accum) − G(p)
+//===================================================================
+
+namespace {
+
+// 2x2 box-filter downsample of a single-channel plane.
+static void downsample_2x_box(const std::vector<float>& in, size_t W, size_t H,
+                              std::vector<float>& out, size_t& W2, size_t& H2) {
+    W2 = W / 2;
+    H2 = H / 2;
+    out.assign(W2 * H2, 0.f);
+    for (size_t y = 0; y < H2; y++) {
+        const size_t y0 = 2 * y;
+        const size_t y1 = std::min(y0 + 1, H - 1);
+        for (size_t x = 0; x < W2; x++) {
+            const size_t x0 = 2 * x;
+            const size_t x1 = std::min(x0 + 1, W - 1);
+            out[y * W2 + x] = 0.25f * (in[y0 * W + x0] + in[y0 * W + x1] +
+                                       in[y1 * W + x0] + in[y1 * W + x1]);
+        }
+    }
+}
+
+// Per-cell LK estimation at a single resolution level.  dx_map / dy_map
+// are BOTH inputs (initial shift hint) and outputs (refined shift).  Each
+// LK iteration warps the target plane by the current accumulator and
+// solves the 2x2 normal equation using G's gradient as the design matrix.
+static void lk_estimate_level(const std::vector<float>& G_plane,
+                               const std::vector<float>& target_plane,
+                               size_t W, size_t H,
+                               size_t map_w, size_t map_h,
+                               int max_iterations,
+                               float max_shift,
+                               std::vector<float>& dx_map,
+                               std::vector<float>& dy_map,
+                               std::vector<float>& conf_map) {
+    const float cell_w_f = static_cast<float>(W) / static_cast<float>(map_w);
+    const float cell_h_f = static_cast<float>(H) / static_cast<float>(map_h);
+
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int cy = 0; cy < static_cast<int>(map_h); cy++) {
+        for (int cx = 0; cx < static_cast<int>(map_w); cx++) {
+            const size_t cell_idx = static_cast<size_t>(cy) * map_w + cx;
+            const size_t x0 = static_cast<size_t>(cx * cell_w_f);
+            const size_t y0 = static_cast<size_t>(cy * cell_h_f);
+            size_t x1 = static_cast<size_t>((cx + 1) * cell_w_f);
+            size_t y1 = static_cast<size_t>((cy + 1) * cell_h_f);
+            x1 = std::min(x1, W);
+            y1 = std::min(y1, H);
+            if (x1 <= x0 + 4 || y1 <= y0 + 4) continue;
+
+            float accum_dx = dx_map[cell_idx];
+            float accum_dy = dy_map[cell_idx];
+            float min_eig_final = 0.f;
+
+            for (int iter = 0; iter < max_iterations; iter++) {
+                double A00 = 0.0, A01 = 0.0, A11 = 0.0;
+                double bx = 0.0, by = 0.0;
+                size_t valid = 0;
+
+                for (size_t y = y0 + 1; y + 1 < y1; y++) {
+                    for (size_t x = x0 + 1; x + 1 < x1; x++) {
+                        const float gx = G_plane[y * W + (x + 1)] -
+                                         G_plane[y * W + (x - 1)];
+                        const float gy = G_plane[(y + 1) * W + x] -
+                                         G_plane[(y - 1) * W + x];
+                        const float t_warp = bilinear_sample_plane(
+                            target_plane.data(), W, H,
+                            static_cast<float>(x) + accum_dx,
+                            static_cast<float>(y) + accum_dy);
+                        const float g_ref = G_plane[y * W + x];
+                        const float err = t_warp - g_ref;
+
+                        A00 += static_cast<double>(gx) * gx;
+                        A01 += static_cast<double>(gx) * gy;
+                        A11 += static_cast<double>(gy) * gy;
+                        bx  -= static_cast<double>(gx) * err;
+                        by  -= static_cast<double>(gy) * err;
+                        valid++;
+                    }
+                }
+                if (valid < 32) break;
+
+                const double det = A00 * A11 - A01 * A01;
+                const double trace = A00 + A11;
+                const double disc = std::max(0.0, trace * trace - 4.0 * det);
+                const double sq = std::sqrt(disc);
+                min_eig_final = static_cast<float>(0.5 * (trace - sq));
+                if (det <= 1e-12) break;
+                const double inv = 1.0 / det;
+                const double step_x = inv * (A11 * bx - A01 * by);
+                const double step_y = inv * (-A01 * bx + A00 * by);
+                accum_dx += static_cast<float>(step_x);
+                accum_dy += static_cast<float>(step_y);
+                if (accum_dx >  max_shift) accum_dx =  max_shift;
+                if (accum_dx < -max_shift) accum_dx = -max_shift;
+                if (accum_dy >  max_shift) accum_dy =  max_shift;
+                if (accum_dy < -max_shift) accum_dy = -max_shift;
+                if (std::fabs(step_x) < 0.005 && std::fabs(step_y) < 0.005) break;
+            }
+
+            dx_map[cell_idx] = accum_dx;
+            dy_map[cell_idx] = accum_dy;
+            conf_map[cell_idx] = std::max(0.f, min_eig_final);
+        }
+    }
+}
+
+// 3x3 box-smooth a per-cell map (single pass).
+static void smooth_3x3_cells(std::vector<float>& m, size_t map_w, size_t map_h) {
+    std::vector<float> out(m.size(), 0.f);
+    for (int cy = 0; cy < static_cast<int>(map_h); cy++) {
+        for (int cx = 0; cx < static_cast<int>(map_w); cx++) {
+            float acc = 0.f; int n = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    const int yy = cy + dy, xx = cx + dx;
+                    if (yy < 0 || yy >= static_cast<int>(map_h) ||
+                        xx < 0 || xx >= static_cast<int>(map_w)) continue;
+                    acc += m[yy * map_w + xx];
+                    n++;
+                }
+            }
+            out[cy * map_w + cx] = n > 0 ? acc / n : 0.f;
+        }
+    }
+    m.swap(out);
+}
+
+} // namespace
+
+bool CPUAccelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
+                                         ImageBufferFloat& rgb_output,
+                                         int   cell_size,
+                                         int   max_iterations,
+                                         float max_shift,
+                                         float min_confidence,
+                                         int   pyramid_levels) {
+    if (!rgb_input.is_valid()) return false;
+    if (cell_size < 16) cell_size = 16;
+    if (max_iterations < 1) max_iterations = 1;
+    if (pyramid_levels < 1) pyramid_levels = 1;
+
+    const size_t W0 = rgb_input.width;
+    const size_t H0 = rgb_input.height;
+    const size_t N0 = W0 * H0;
+    const float (*src)[3] = rgb_input.image;
+    float (*dst)[3]       = rgb_output.image;
+
+    // Extract planar R, G, B at full resolution.
+    std::vector<float> R0(N0), G0(N0), B0(N0);
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t i = 0; i < N0; i++) {
+        R0[i] = src[i][0];
+        G0[i] = src[i][1];
+        B0[i] = src[i][2];
+    }
+
+    // Clamp pyramid depth so the coarsest level still has usable cells.
+    int effective_levels = pyramid_levels;
+    while (effective_levels > 1 &&
+           ((W0 >> (effective_levels - 1)) < 32 ||
+            (H0 >> (effective_levels - 1)) < 32)) {
+        effective_levels--;
+    }
+
+    // Build pyramid (level 0 = full resolution).
+    std::vector<std::vector<float>> R_lvl(effective_levels);
+    std::vector<std::vector<float>> G_lvl(effective_levels);
+    std::vector<std::vector<float>> B_lvl(effective_levels);
+    std::vector<size_t> W_lvl(effective_levels), H_lvl(effective_levels);
+    R_lvl[0] = R0; G_lvl[0] = G0; B_lvl[0] = B0;
+    W_lvl[0] = W0; H_lvl[0] = H0;
+    for (int L = 1; L < effective_levels; L++) {
+        downsample_2x_box(R_lvl[L - 1], W_lvl[L - 1], H_lvl[L - 1],
+                          R_lvl[L], W_lvl[L], H_lvl[L]);
+        downsample_2x_box(G_lvl[L - 1], W_lvl[L - 1], H_lvl[L - 1],
+                          G_lvl[L], W_lvl[L], H_lvl[L]);
+        downsample_2x_box(B_lvl[L - 1], W_lvl[L - 1], H_lvl[L - 1],
+                          B_lvl[L], W_lvl[L], H_lvl[L]);
+    }
+
+    // Cell grid anchored at full resolution; same cell count at every
+    // level (cells just cover fewer coarse pixels at higher levels).
+    const size_t map_w = std::max<size_t>(2, (W0 + cell_size - 1) / cell_size);
+    const size_t map_h = std::max<size_t>(2, (H0 + cell_size - 1) / cell_size);
+    const size_t Ncells = map_w * map_h;
+
+    std::vector<float> dx_r(Ncells, 0.f), dy_r(Ncells, 0.f), conf_r(Ncells, 0.f);
+    std::vector<float> dx_b(Ncells, 0.f), dy_b(Ncells, 0.f), conf_b(Ncells, 0.f);
+
+    // Pyramid LK: shifts are stored in level-0 pixel units; at each level
+    // we scale them to that level's coordinates, run LK, then scale back.
+    for (int L = effective_levels - 1; L >= 0; L--) {
+        const float scale_down = 1.f / static_cast<float>(1 << L);
+        for (size_t i = 0; i < Ncells; i++) {
+            dx_r[i] *= scale_down; dy_r[i] *= scale_down;
+            dx_b[i] *= scale_down; dy_b[i] *= scale_down;
+        }
+        // At coarser levels the linearisation is more forgiving; allow a
+        // bit of headroom around the running accumulator.
+        const float level_max_shift = max_shift * scale_down +
+                                       static_cast<float>(1 << L) * 0.5f;
+        lk_estimate_level(G_lvl[L], R_lvl[L], W_lvl[L], H_lvl[L],
+                          map_w, map_h, max_iterations, level_max_shift,
+                          dx_r, dy_r, conf_r);
+        lk_estimate_level(G_lvl[L], B_lvl[L], W_lvl[L], H_lvl[L],
+                          map_w, map_h, max_iterations, level_max_shift,
+                          dx_b, dy_b, conf_b);
+        const float scale_up = static_cast<float>(1 << L);
+        for (size_t i = 0; i < Ncells; i++) {
+            dx_r[i] *= scale_up; dy_r[i] *= scale_up;
+            dx_b[i] *= scale_up; dy_b[i] *= scale_up;
+        }
+    }
+
+    // Confidence gate (relative to strongest cell at finest level).
+    auto zero_lowconf = [&](std::vector<float>& dxm,
+                             std::vector<float>& dym,
+                             const std::vector<float>& cmap) {
+        float maxc = 0.f;
+        for (float c : cmap) maxc = std::max(maxc, c);
+        if (maxc <= 0.f) return;
+        const float thr = maxc * min_confidence;
+        for (size_t i = 0; i < dxm.size(); i++) {
+            if (cmap[i] < thr) { dxm[i] = 0.f; dym[i] = 0.f; }
+        }
+    };
+    zero_lowconf(dx_r, dy_r, conf_r);
+    zero_lowconf(dx_b, dy_b, conf_b);
+
+    smooth_3x3_cells(dx_r, map_w, map_h);
+    smooth_3x3_cells(dy_r, map_w, map_h);
+    smooth_3x3_cells(dx_b, map_w, map_h);
+    smooth_3x3_cells(dy_b, map_w, map_h);
+
+    // Diagnostic summary.
+    auto rng = [](const std::vector<float>& m) {
+        float mn = 1e9f, mx = -1e9f;
+        for (float v : m) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        return std::array<float, 2>{mn, mx};
+    };
+    auto rxr = rng(dx_r); auto ryr = rng(dy_r);
+    auto rxb = rng(dx_b); auto ryb = rng(dy_b);
+    std::cout << "📷 CA-LK pyramid=" << effective_levels
+              << " map " << map_w << "x" << map_h
+              << " R dx[" << rxr[0] << "," << rxr[1] << "] dy[" << ryr[0]
+              << "," << ryr[1] << "]"
+              << " B dx[" << rxb[0] << "," << rxb[1] << "] dy[" << ryb[0]
+              << "," << ryb[1] << "]" << std::endl;
+
+    // Apply per-pixel shifts to R and B (G untouched).
+    const float clamp_shift = max_shift * static_cast<float>(1 << (effective_levels - 1));
+    auto sample_shift = [&](const std::vector<float>& dxm,
+                             const std::vector<float>& dym,
+                             float px, float py,
+                             float& out_dx, float& out_dy) {
+        const float gx_f = (px / static_cast<float>(cell_size)) - 0.5f;
+        const float gy_f = (py / static_cast<float>(cell_size)) - 0.5f;
+        int gx0 = static_cast<int>(std::floor(gx_f));
+        int gy0 = static_cast<int>(std::floor(gy_f));
+        if (gx0 < 0) gx0 = 0;
+        if (gy0 < 0) gy0 = 0;
+        if (gx0 >= static_cast<int>(map_w) - 1) gx0 = static_cast<int>(map_w) - 2;
+        if (gy0 >= static_cast<int>(map_h) - 1) gy0 = static_cast<int>(map_h) - 2;
+        if (gx0 < 0) gx0 = 0;
+        if (gy0 < 0) gy0 = 0;
+        const float fx = std::clamp(gx_f - gx0, 0.f, 1.f);
+        const float fy = std::clamp(gy_f - gy0, 0.f, 1.f);
+        const int gx1 = std::min(gx0 + 1, static_cast<int>(map_w) - 1);
+        const int gy1 = std::min(gy0 + 1, static_cast<int>(map_h) - 1);
+        auto S = [&](const std::vector<float>& m, int xi, int yi) {
+            return m[static_cast<size_t>(yi) * map_w + xi];
+        };
+        const float dx = (S(dxm, gx0, gy0) * (1.f - fx) + S(dxm, gx1, gy0) * fx) * (1.f - fy)
+                       + (S(dxm, gx0, gy1) * (1.f - fx) + S(dxm, gx1, gy1) * fx) * fy;
+        const float dy = (S(dym, gx0, gy0) * (1.f - fx) + S(dym, gx1, gy0) * fx) * (1.f - fy)
+                       + (S(dym, gx0, gy1) * (1.f - fx) + S(dym, gx1, gy1) * fx) * fy;
+        out_dx = std::clamp(dx, -clamp_shift, clamp_shift);
+        out_dy = std::clamp(dy, -clamp_shift, clamp_shift);
+    };
+
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int y = 0; y < static_cast<int>(H0); y++) {
+        for (int x = 0; x < static_cast<int>(W0); x++) {
+            const size_t i = static_cast<size_t>(y) * W0 + x;
+            float drx, dry, dbx, dby;
+            sample_shift(dx_r, dy_r, static_cast<float>(x),
+                         static_cast<float>(y), drx, dry);
+            sample_shift(dx_b, dy_b, static_cast<float>(x),
+                         static_cast<float>(y), dbx, dby);
+            const float r_new = bilinear_sample_plane(
+                R0.data(), W0, H0,
+                static_cast<float>(x) + drx, static_cast<float>(y) + dry);
+            const float b_new = bilinear_sample_plane(
+                B0.data(), W0, H0,
+                static_cast<float>(x) + dbx, static_cast<float>(y) + dby);
+            dst[i][0] = r_new;
+            dst[i][1] = G0[i];
+            dst[i][2] = b_new;
+        }
+    }
+
+    return true;
+}
+
+//===================================================================
+// Axial chromatic aberration cleanup via cross-channel guided filter
+// (He et al. 2010).  Within a window of radius r the output is
+// constrained to a linear model
+//     q(p) = a_k · G(p) + b_k         for all p in window_k
+// with a_k, b_k closed-form least squares.  Overlapping windows are
+// averaged via box-filter of a and b.  Using summed-area tables every
+// box-filter is O(N) total.  This forces R and B to follow G's
+// high-frequency structure while still allowing per-window hue (a, b),
+// which is exactly what's needed to tighten defocused chroma halos.
+//===================================================================
+
+namespace {
+
+static void build_sat(const float* plane, size_t W, size_t H,
+                      std::vector<double>& sat) {
+    const size_t SW = W + 1;
+    const size_t SH = H + 1;
+    sat.assign(SW * SH, 0.0);
+    for (size_t y = 0; y < H; y++) {
+        double row_sum = 0.0;
+        for (size_t x = 0; x < W; x++) {
+            row_sum += static_cast<double>(plane[y * W + x]);
+            sat[(y + 1) * SW + (x + 1)] = sat[y * SW + (x + 1)] + row_sum;
+        }
+    }
+}
+
+static inline double box_mean(const std::vector<double>& sat,
+                              size_t W, size_t H, int x, int y, int r) {
+    const int xl = std::max(0, x - r);
+    const int yl = std::max(0, y - r);
+    const int xr = std::min(static_cast<int>(W) - 1, x + r);
+    const int yb = std::min(static_cast<int>(H) - 1, y + r);
+    const size_t SW = W + 1;
+    const double s = sat[(yb + 1) * SW + (xr + 1)]
+                   - sat[(yl)     * SW + (xr + 1)]
+                   - sat[(yb + 1) * SW + (xl)]
+                   + sat[(yl)     * SW + (xl)];
+    const int area = (xr - xl + 1) * (yb - yl + 1);
+    return area > 0 ? s / static_cast<double>(area) : 0.0;
+}
+
+// One-channel guided filter: q = a · I + b, with I as the guide, p as the
+// input.  `out` may alias `p`.
+static void guided_filter_one(const float* I, const float* p, float* out,
+                               size_t W, size_t H, int radius, float epsilon) {
+    const size_t N = W * H;
+    std::vector<float> Ip(N), II(N);
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t i = 0; i < N; i++) {
+        Ip[i] = I[i] * p[i];
+        II[i] = I[i] * I[i];
+    }
+    std::vector<double> sat_I, sat_p, sat_Ip, sat_II;
+    build_sat(I,         W, H, sat_I);
+    build_sat(p,         W, H, sat_p);
+    build_sat(Ip.data(), W, H, sat_Ip);
+    build_sat(II.data(), W, H, sat_II);
+
+    std::vector<float> a_plane(N), b_plane(N);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int y = 0; y < static_cast<int>(H); y++) {
+        for (int x = 0; x < static_cast<int>(W); x++) {
+            const double mI  = box_mean(sat_I,  W, H, x, y, radius);
+            const double mp  = box_mean(sat_p,  W, H, x, y, radius);
+            const double mIp = box_mean(sat_Ip, W, H, x, y, radius);
+            const double mII = box_mean(sat_II, W, H, x, y, radius);
+            const double var_I  = mII - mI * mI;
+            const double cov_Ip = mIp - mI * mp;
+            const double a = cov_Ip / (var_I + static_cast<double>(epsilon));
+            const double b = mp - a * mI;
+            a_plane[static_cast<size_t>(y) * W + x] = static_cast<float>(a);
+            b_plane[static_cast<size_t>(y) * W + x] = static_cast<float>(b);
+        }
+    }
+
+    std::vector<double> sat_a, sat_b;
+    build_sat(a_plane.data(), W, H, sat_a);
+    build_sat(b_plane.data(), W, H, sat_b);
+
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int y = 0; y < static_cast<int>(H); y++) {
+        for (int x = 0; x < static_cast<int>(W); x++) {
+            const double ma = box_mean(sat_a, W, H, x, y, radius);
+            const double mb = box_mean(sat_b, W, H, x, y, radius);
+            const size_t idx = static_cast<size_t>(y) * W + x;
+            out[idx] = static_cast<float>(ma * I[idx] + mb);
+        }
+    }
+}
+
+} // namespace
+
+bool CPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
+                                       ImageBufferFloat& rgb_output,
+                                       int   radius,
+                                       float epsilon,
+                                       float strength) {
+    if (!rgb_input.is_valid()) return false;
+    if (radius < 1) radius = 1;
+    strength = std::clamp(strength, 0.f, 1.f);
+
+    const size_t W = rgb_input.width;
+    const size_t H = rgb_input.height;
+    const size_t N = W * H;
+    const float (*src)[3] = rgb_input.image;
+    float (*dst)[3]       = rgb_output.image;
+
+    // Internally normalise the linear RGB by max(G) so the guided-filter
+    // epsilon retains the same meaning regardless of the absolute pixel
+    // scale (raw linear values can be in [0, ~30000] after WB).  Without
+    // this normalisation epsilon=1e-4 is many orders of magnitude smaller
+    // than var_I, providing no regularisation in flat / dark regions —
+    // the consequence is that R and B follow G's noise rather than being
+    // smoothed back toward their local means, which surfaces as a slight
+    // green cast in shadow areas.
+    std::vector<float> R(N), G(N), B(N);
+    float max_g = 1e-6f;
+#ifdef _OPENMP
+    #pragma omp parallel for reduction(max : max_g)
+#endif
+    for (size_t i = 0; i < N; i++) {
+        const float g = src[i][1];
+        if (g > max_g) max_g = g;
+    }
+    // Use a slightly relaxed reference so a single saturated pixel does
+    // not dominate the normalisation.
+    const float norm_ref = std::max(max_g, 1e-6f);
+    const float inv_norm = 1.f / norm_ref;
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t i = 0; i < N; i++) {
+        R[i] = src[i][0] * inv_norm;
+        G[i] = src[i][1] * inv_norm;
+        B[i] = src[i][2] * inv_norm;
+    }
+
+    std::vector<float> R_filt(N), B_filt(N);
+    guided_filter_one(G.data(), R.data(), R_filt.data(), W, H, radius, epsilon);
+    guided_filter_one(G.data(), B.data(), B_filt.data(), W, H, radius, epsilon);
+
+    // Edge-proximity weight on G.  In flat / dark regions the filter has
+    // no axial-CA to correct but the box-filter averaging still introduces
+    // a tiny constant chroma bias that the output gamma curve later
+    // amplifies into visible colour casts.  Restricting the filter's
+    // influence to a neighbourhood of high-contrast edges removes that
+    // problem at the source while keeping fringe correction at edges.
+    //
+    // Pipeline per pixel:
+    //   1. Sobel magnitude on (normalised) G                      → eraw
+    //   2. Box-filter eraw with the same radius as the guided     → esmooth
+    //      filter so the gate matches its spatial reach
+    //   3. Per-pixel weight w = smoothstep(0.01, 0.06, esmooth)
+    //   4. Effective filter mix factor = strength × w
+    std::vector<float> eraw(N, 0.f);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int y = 1; y < static_cast<int>(H) - 1; y++) {
+        for (int x = 1; x < static_cast<int>(W) - 1; x++) {
+            const size_t i = static_cast<size_t>(y) * W + x;
+            const float gx = G[i + 1] - G[i - 1];
+            const float gy = G[i + W] - G[i - W];
+            eraw[i] = std::sqrt(gx * gx + gy * gy);
+        }
+    }
+    std::vector<double> sat_e;
+    build_sat(eraw.data(), W, H, sat_e);
+    std::vector<float> ew(N, 0.f);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
+    for (int y = 0; y < static_cast<int>(H); y++) {
+        for (int x = 0; x < static_cast<int>(W); x++) {
+            const double m = box_mean(sat_e, W, H, x, y, radius);
+            // smoothstep(0.01, 0.06, m):
+            //   below 0.01  → 0  (true flat: no filter)
+            //   above 0.06  → 1  (real edge: full filter)
+            const float t = std::clamp((static_cast<float>(m) - 0.01f) / 0.05f, 0.f, 1.f);
+            ew[y * W + x] = t * t * (3.f - 2.f * t);
+        }
+    }
+
+    // Blend filtered toward original by `strength × edge_weight`, then
+    // de-normalise.
+    double w_sum = 0.0;
+#ifdef _OPENMP
+    #pragma omp parallel for reduction(+: w_sum)
+#endif
+    for (size_t i = 0; i < N; i++) {
+        const float w = strength * ew[i];
+        const float r_out = R[i] * (1.f - w) + R_filt[i] * w;
+        const float b_out = B[i] * (1.f - w) + B_filt[i] * w;
+        dst[i][0] = r_out * norm_ref;
+        dst[i][1] = src[i][1];                    // G untouched (pass-through)
+        dst[i][2] = b_out * norm_ref;
+        w_sum += ew[i];
+    }
+    const double mean_w = w_sum / static_cast<double>(N);
+
+    std::cout << "📷 CA axial cleanup applied (radius=" << radius
+              << " eps=" << epsilon << " strength=" << strength
+              << " mean_edge_weight=" << mean_w
+              << " norm=" << norm_ref << ")" << std::endl;
+
+    return true;
 }
 
 //===================================================================
