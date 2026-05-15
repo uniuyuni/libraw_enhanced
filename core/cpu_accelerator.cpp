@@ -3676,22 +3676,28 @@ static inline double box_mean(const std::vector<double>& sat,
 
 // One-channel guided filter: q = a · I + b, with I as the guide, p as the
 // input.  `out` may alias `p`.
-static void guided_filter_one(const float* I, const float* p, float* out,
-                               size_t W, size_t H, int radius, float epsilon) {
+// Guided filter applying step that accepts a pre-built SAT of the guide
+// I and of I·I.  This is the inner loop of the standard guided filter
+// (He et al. 2010); the caller is responsible for building sat_I and
+// sat_II once and re-using them for every channel filtered with the
+// same guide.
+static void guided_filter_with_shared_guide(const float* I, const float* p,
+                                             float* out,
+                                             size_t W, size_t H,
+                                             int radius, float epsilon,
+                                             const std::vector<double>& sat_I,
+                                             const std::vector<double>& sat_II) {
     const size_t N = W * H;
-    std::vector<float> Ip(N), II(N);
+    std::vector<float> Ip(N);
 #ifdef _OPENMP
     #pragma omp parallel for
 #endif
     for (size_t i = 0; i < N; i++) {
         Ip[i] = I[i] * p[i];
-        II[i] = I[i] * I[i];
     }
-    std::vector<double> sat_I, sat_p, sat_Ip, sat_II;
-    build_sat(I,         W, H, sat_I);
+    std::vector<double> sat_p, sat_Ip;
     build_sat(p,         W, H, sat_p);
     build_sat(Ip.data(), W, H, sat_Ip);
-    build_sat(II.data(), W, H, sat_II);
 
     std::vector<float> a_plane(N), b_plane(N);
 #ifdef _OPENMP
@@ -3727,6 +3733,24 @@ static void guided_filter_one(const float* I, const float* p, float* out,
             out[idx] = static_cast<float>(ma * I[idx] + mb);
         }
     }
+}
+
+// Convenience wrapper for one-shot use (builds sat_I and sat_II inline).
+static void guided_filter_one(const float* I, const float* p, float* out,
+                               size_t W, size_t H, int radius, float epsilon) {
+    const size_t N = W * H;
+    std::vector<float> II(N);
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t i = 0; i < N; i++) {
+        II[i] = I[i] * I[i];
+    }
+    std::vector<double> sat_I, sat_II;
+    build_sat(I,         W, H, sat_I);
+    build_sat(II.data(), W, H, sat_II);
+    guided_filter_with_shared_guide(I, p, out, W, H, radius, epsilon,
+                                    sat_I, sat_II);
 }
 
 } // namespace
@@ -3777,8 +3801,23 @@ bool CPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
     }
 
     std::vector<float> R_filt(N), B_filt(N);
-    guided_filter_one(G.data(), R.data(), R_filt.data(), W, H, radius, epsilon);
-    guided_filter_one(G.data(), B.data(), B_filt.data(), W, H, radius, epsilon);
+    // Build G's SAT and G·G's SAT once and share between the R and B
+    // guided-filter invocations.  Halves the SAT build work compared to
+    // two independent guided_filter_one calls.
+    std::vector<float> II(N);
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (size_t i = 0; i < N; i++) {
+        II[i] = G[i] * G[i];
+    }
+    std::vector<double> sat_I, sat_II;
+    build_sat(G.data(),  W, H, sat_I);
+    build_sat(II.data(), W, H, sat_II);
+    guided_filter_with_shared_guide(G.data(), R.data(), R_filt.data(),
+                                    W, H, radius, epsilon, sat_I, sat_II);
+    guided_filter_with_shared_guide(G.data(), B.data(), B_filt.data(),
+                                    W, H, radius, epsilon, sat_I, sat_II);
 
     // Edge-proximity weight on G.  In flat / dark regions the filter has
     // no axial-CA to correct but the box-filter averaging still introduces
@@ -3964,10 +4003,12 @@ bool CPUAccelerator::defringe(
         for (auto& v : kernel) v /= ksum;
     }
 
-    // Separable 2-pass Gaussian blur
+    // Separable 2-pass Gaussian blur.  The transient horizontal-pass
+    // buffer is shared across all gaussian_blur calls in this function
+    // so we don't pay 8 × image-sized malloc/free at full resolution.
+    std::vector<float> gaussian_tmp(N, 0.f);
     auto gaussian_blur = [&](const std::vector<float>& in,
                               std::vector<float>& out) {
-        std::vector<float> tmp(N, 0.f);
         // Horizontal pass
 #ifdef _OPENMP
         #pragma omp parallel for collapse(2)
@@ -3979,7 +4020,7 @@ bool CPUAccelerator::defringe(
                     int xx = std::max(0, std::min((int)W - 1, (int)x + k));
                     acc += kernel[k + ks] * in[y * W + xx];
                 }
-                tmp[y * W + x] = acc;
+                gaussian_tmp[y * W + x] = acc;
             }
         }
         // Vertical pass
@@ -3991,7 +4032,7 @@ bool CPUAccelerator::defringe(
                 float acc = 0.f;
                 for (int k = -ks; k <= ks; k++) {
                     int yy = std::max(0, std::min((int)H - 1, (int)y + k));
-                    acc += kernel[k + ks] * tmp[yy * W + x];
+                    acc += kernel[k + ks] * gaussian_tmp[yy * W + x];
                 }
                 out[y * W + x] = acc;
             }
