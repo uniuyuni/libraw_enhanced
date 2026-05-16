@@ -90,6 +90,16 @@ public:
                           float epsilon,
                           float strength);
 
+    // Defringe via MPSImageGaussianBlur + custom Metal kernels.
+    bool defringe(const ImageBufferFloat& rgb_input,
+                  ImageBufferFloat& rgb_output,
+                  float radius,
+                  float edge_threshold,
+                  float chroma_threshold,
+                  float strength,
+                  bool  defringe_green,
+                  float green_strength_scale);
+
 private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;

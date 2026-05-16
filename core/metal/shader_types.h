@@ -126,4 +126,21 @@ typedef struct {
     float    edge_hi;      // smoothstep upper bound
 } AxialCaBlendParams;
 
+// Defringe: shared shape/control parameters used by every defringe kernel.
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float    edge_threshold;
+    float    chroma_threshold;
+    float    strength;
+    float    green_strength_scale;
+    float    sensitivity;          // = clamp(sqrt(max(strength, 1)), 1, 2.5)
+    float    inv_sensitivity;
+    float    mask_cutoff;          // 0.02 / sensitivity
+    float    max_guide;            // populated by the CPU pre-pass (max(G))
+    float    scene_highlight_gate; // smoothstep(0.55, 0.75, max_guide)
+    uint32_t enable_green_defringe; // 0/1
+    float    ratio_eps;            // log() numerical regularisation
+} DefringeParams;
+
 #endif /* shader_types_h */

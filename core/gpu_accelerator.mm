@@ -1371,6 +1371,384 @@ bool GPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
 }
 
 //===================================================================
+// Defringe — GPU port of CPUAccelerator::defringe via MPS Gaussian
+// blurs and custom Metal kernels.  Mirrors the multi-stage CPU
+// pipeline (setup → Sobel → normalise → 5× Gaussian → fringe_support →
+// Gaussian → line linkage → solo seeds → 2× Gaussian → main
+// correction → solo cleanup) one-to-one.
+//===================================================================
+bool GPUAccelerator::defringe(const ImageBufferFloat& rgb_input,
+                               ImageBufferFloat& rgb_output,
+                               float radius,
+                               float edge_threshold,
+                               float chroma_threshold,
+                               float strength,
+                               bool  defringe_green,
+                               float green_strength_scale) {
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    if (!rgb_input.is_valid()) return false;
+    if (radius < 1.f) radius = 1.f;
+    green_strength_scale = std::clamp(green_strength_scale, 0.f, 1.f);
+
+    const NSUInteger W = rgb_input.width;
+    const NSUInteger H = rgb_input.height;
+    const size_t N = static_cast<size_t>(W) * static_cast<size_t>(H);
+
+    // ---------------------------------------------------------------
+    // CPU pre-pass: max(G) for guide_signal normalisation, and the
+    // sensitivity-driven scalar constants used by every kernel.
+    // ---------------------------------------------------------------
+    float max_guide = 1e-6f;
+    {
+        const float (*src)[3] = rgb_input.image;
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(max : max_guide)
+#endif
+        for (size_t i = 0; i < N; i++) {
+            const float g = std::max(src[i][1], 0.f);
+            if (g > max_guide) max_guide = g;
+        }
+    }
+    max_guide = std::max(max_guide, 1e-6f);
+    const float sensitivity     = std::clamp(std::sqrt(std::max(strength, 1.f)),
+                                             1.f, 2.5f);
+    const float inv_sensitivity = 1.f / sensitivity;
+    const float mask_cutoff     = 0.02f * inv_sensitivity;
+    const float scene_highlight_gate = ({
+        const float lo = 0.55f, hi = 0.75f;
+        const float t = std::clamp((max_guide - lo) / (hi - lo), 0.f, 1.f);
+        t * t * (3.f - 2.f * t);
+    });
+    const float ratio_eps = std::max(max_guide * 1e-4f, 1e-6f);
+
+    DefringeParams params;
+    params.width                 = static_cast<uint32_t>(W);
+    params.height                = static_cast<uint32_t>(H);
+    params.edge_threshold        = edge_threshold;
+    params.chroma_threshold      = chroma_threshold;
+    params.strength              = strength;
+    params.green_strength_scale  = green_strength_scale;
+    params.sensitivity           = sensitivity;
+    params.inv_sensitivity       = inv_sensitivity;
+    params.mask_cutoff           = mask_cutoff;
+    params.max_guide             = max_guide;
+    params.scene_highlight_gate  = scene_highlight_gate;
+    params.enable_green_defringe = defringe_green ? 1u : 0u;
+    params.ratio_eps             = ratio_eps;
+
+    // ---------------------------------------------------------------
+    // Pipelines.
+    // ---------------------------------------------------------------
+    id<MTLComputePipelineState> p_setup        = get_pipeline("defringe", "defringe_setup");
+    id<MTLComputePipelineState> p_sobel        = get_pipeline("defringe", "defringe_sobel");
+    id<MTLComputePipelineState> p_edge_norm    = get_pipeline("defringe", "defringe_edge_normalize");
+    id<MTLComputePipelineState> p_support_seed = get_pipeline("defringe", "defringe_support_seed");
+    id<MTLComputePipelineState> p_line_link    = get_pipeline("defringe", "defringe_line_link");
+    id<MTLComputePipelineState> p_solo_seed    = get_pipeline("defringe", "defringe_solo_seed");
+    id<MTLComputePipelineState> p_main         = get_pipeline("defringe", "defringe_main");
+    id<MTLComputePipelineState> p_solo         = get_pipeline("defringe", "defringe_solo");
+    if (!p_setup || !p_sobel || !p_edge_norm || !p_support_seed ||
+        !p_line_link || !p_solo_seed || !p_main || !p_solo) {
+        std::cerr << "❌ defringe pipeline(s) missing" << std::endl;
+        return false;
+    }
+
+    @autoreleasepool {
+        id<MTLDevice> device = pimpl_->device;
+        id<MTLCommandQueue> queue = pimpl_->command_queue;
+
+        // Plane texture factory (one R32Float texture-backed Shared buffer).
+        const size_t plane_bytes = N * sizeof(float);
+        NSMutableArray* plane_buffers = [NSMutableArray array];
+        auto make_plane = [&]() -> id<MTLTexture> {
+            id<MTLBuffer> buf = [device newBufferWithLength:plane_bytes
+                                                    options:MTLResourceStorageModeShared];
+            if (!buf) return nil;
+            [plane_buffers addObject:buf];
+            MTLTextureDescriptor* d = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                              width:W height:H mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            return [buf newTextureWithDescriptor:d
+                                            offset:0
+                                       bytesPerRow:W * sizeof(float)];
+        };
+
+        // Allocate every plane up front for simplicity (memory pool will
+        // handle reuse internally).
+        id<MTLTexture> tx_R          = make_plane();
+        id<MTLTexture> tx_G          = make_plane();
+        id<MTLTexture> tx_B          = make_plane();
+        id<MTLTexture> tx_guide_lin  = make_plane();
+        id<MTLTexture> tx_guide_sig  = make_plane();
+        id<MTLTexture> tx_log_rg     = make_plane();
+        id<MTLTexture> tx_log_bg     = make_plane();
+        id<MTLTexture> tx_edge       = make_plane();
+        id<MTLTexture> tx_edge_raw   = make_plane();
+        id<MTLTexture> tx_edge_norm  = make_plane();
+        id<MTLTexture> tx_b_guide    = make_plane();
+        id<MTLTexture> tx_b_log_rg   = make_plane();
+        id<MTLTexture> tx_b_log_bg   = make_plane();
+        id<MTLTexture> tx_b_edge     = make_plane();
+        id<MTLTexture> tx_b_edge_raw = make_plane();
+        id<MTLTexture> tx_fringe     = make_plane();
+        id<MTLTexture> tx_b_fringe   = make_plane();
+        id<MTLTexture> tx_line       = make_plane();
+        id<MTLTexture> tx_solo_r     = make_plane();
+        id<MTLTexture> tx_solo_b     = make_plane();
+        id<MTLTexture> tx_b_solo_r   = make_plane();
+        id<MTLTexture> tx_b_solo_b   = make_plane();
+
+        // Source / intermediate / destination as RGBA32Float textures
+        // over 4-channel staging buffers (Metal has no RGB32Float pixel
+        // format; same pattern as enhance_micro_contrast and axial_ca).
+        id<MTLBuffer> buf_src4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_mid4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_dst4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        if (!buf_src4 || !buf_mid4 || !buf_dst4) return false;
+        {
+            vector_float3* d = (vector_float3*)[buf_src4 contents];
+            const float (*src)[3] = rgb_input.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N; i++) {
+                d[i] = {src[i][0], src[i][1], src[i][2]};
+            }
+        }
+        MTLTextureDescriptor* texDesc4 = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                          width:W height:H mipmapped:NO];
+        texDesc4.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        const NSUInteger bpr4 = W * 4 * sizeof(float);
+        id<MTLTexture> tx_src = [buf_src4 newTextureWithDescriptor:texDesc4 offset:0 bytesPerRow:bpr4];
+        id<MTLTexture> tx_mid = [buf_mid4 newTextureWithDescriptor:texDesc4 offset:0 bytesPerRow:bpr4];
+        id<MTLTexture> tx_dst = [buf_dst4 newTextureWithDescriptor:texDesc4 offset:0 bytesPerRow:bpr4];
+
+        // MPS instances.
+        const float sigma = std::max(radius / 3.f, 0.5f);
+        MPSImageGaussianBlur* gauss = [[MPSImageGaussianBlur alloc] initWithDevice:device sigma:sigma];
+
+        const MTLSize threadgroup = MTLSizeMake(16, 16, 1);
+        const MTLSize grid        = MTLSizeMake(W, H, 1);
+        const vector_uint2 dims2  = { static_cast<uint32_t>(W),
+                                       static_cast<uint32_t>(H) };
+
+        // =================================================================
+        // Phase 1: setup + Sobel.  Submitted as one command buffer; the
+        // CPU reads the Shared-storage edge_raw buffer after completion
+        // to compute max(edge), avoiding the alignment headaches of an
+        // MPSImageStatisticsMinAndMax destination texture (which would
+        // need a 16-byte-aligned 2x1 row stride).
+        // =================================================================
+        id<MTLCommandBuffer> cb1 = [queue commandBuffer];
+        {
+            id<MTLComputeCommandEncoder> e = [cb1 computeCommandEncoder];
+            [e setComputePipelineState:p_setup];
+            [e setTexture:tx_src        atIndex:0];
+            [e setTexture:tx_R          atIndex:1];
+            [e setTexture:tx_G          atIndex:2];
+            [e setTexture:tx_B          atIndex:3];
+            [e setTexture:tx_guide_lin  atIndex:4];
+            [e setTexture:tx_guide_sig  atIndex:5];
+            [e setTexture:tx_log_rg     atIndex:6];
+            [e setTexture:tx_log_bg     atIndex:7];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> e = [cb1 computeCommandEncoder];
+            [e setComputePipelineState:p_sobel];
+            [e setTexture:tx_guide_sig atIndex:0];
+            [e setTexture:tx_edge      atIndex:1];
+            [e setTexture:tx_edge_raw  atIndex:2];
+            [e setBytes:&dims2 length:sizeof(dims2) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+        [cb1 commit];
+        [cb1 waitUntilCompleted];
+        if (cb1.status != MTLCommandBufferStatusCompleted) {
+            std::cerr << "❌ defringe phase 1 GPU command buffer failed" << std::endl;
+            return false;
+        }
+        // CPU max-reduce over edge_raw (Shared-storage buffer is directly
+        // readable; OpenMP reduction handles the 40M float pass quickly).
+        float max_edge = 1e-6f;
+        {
+            const float* er =
+                (const float*)[[plane_buffers objectAtIndex:8] contents]; // tx_edge_raw backing
+#ifdef _OPENMP
+            #pragma omp parallel for reduction(max : max_edge)
+#endif
+            for (size_t i = 0; i < N; i++) {
+                if (er[i] > max_edge) max_edge = er[i];
+            }
+        }
+
+        // =================================================================
+        // Phase 2: edge normalise + 5 reference Gaussian blurs +
+        // fringe_support seed + its Gaussian + line linkage + solo
+        // seeds + their Gaussians + main correction + solo cleanup.
+        // All in one command buffer.
+        // =================================================================
+        id<MTLCommandBuffer> cb2 = [queue commandBuffer];
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:p_edge_norm];
+            [e setTexture:tx_edge      atIndex:0];
+            [e setTexture:tx_edge_norm atIndex:1];
+            [e setBytes:&dims2    length:sizeof(dims2)    atIndex:0];
+            [e setBytes:&max_edge length:sizeof(max_edge) atIndex:1];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+        // Five reference Gaussian blurs.
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_guide_lin destinationTexture:tx_b_guide];
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_log_rg    destinationTexture:tx_b_log_rg];
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_log_bg    destinationTexture:tx_b_log_bg];
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_edge_norm destinationTexture:tx_b_edge];
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_edge_raw  destinationTexture:tx_b_edge_raw];
+
+        // fringe_support seed.
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:p_support_seed];
+            [e setTexture:tx_R           atIndex:0];
+            [e setTexture:tx_G           atIndex:1];
+            [e setTexture:tx_B           atIndex:2];
+            [e setTexture:tx_log_rg      atIndex:3];
+            [e setTexture:tx_log_bg      atIndex:4];
+            [e setTexture:tx_b_guide     atIndex:5];
+            [e setTexture:tx_b_log_rg    atIndex:6];
+            [e setTexture:tx_b_log_bg    atIndex:7];
+            [e setTexture:tx_b_edge      atIndex:8];
+            [e setTexture:tx_b_edge_raw  atIndex:9];
+            [e setTexture:tx_fringe      atIndex:10];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_fringe destinationTexture:tx_b_fringe];
+
+        // line_fringe_support.
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:p_line_link];
+            [e setTexture:tx_fringe   atIndex:0];
+            [e setTexture:tx_b_fringe atIndex:1];
+            [e setTexture:tx_line     atIndex:2];
+            [e setBytes:&dims2 length:sizeof(dims2) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        // solo seeds (R, B).
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:p_solo_seed];
+            [e setTexture:tx_R           atIndex:0];
+            [e setTexture:tx_G           atIndex:1];
+            [e setTexture:tx_B           atIndex:2];
+            [e setTexture:tx_b_guide     atIndex:3];
+            [e setTexture:tx_b_log_rg    atIndex:4];
+            [e setTexture:tx_b_log_bg    atIndex:5];
+            [e setTexture:tx_b_edge      atIndex:6];
+            [e setTexture:tx_b_edge_raw  atIndex:7];
+            [e setTexture:tx_b_fringe    atIndex:8];
+            [e setTexture:tx_line        atIndex:9];
+            [e setTexture:tx_solo_r      atIndex:10];
+            [e setTexture:tx_solo_b      atIndex:11];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_solo_r destinationTexture:tx_b_solo_r];
+        [gauss encodeToCommandBuffer:cb2 sourceTexture:tx_solo_b destinationTexture:tx_b_solo_b];
+
+        // Main correction kernel → writes to tx_mid (intermediate).
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:p_main];
+            [e setTexture:tx_src         atIndex:0];
+            [e setTexture:tx_R           atIndex:1];
+            [e setTexture:tx_G           atIndex:2];
+            [e setTexture:tx_B           atIndex:3];
+            [e setTexture:tx_log_rg      atIndex:4];
+            [e setTexture:tx_log_bg      atIndex:5];
+            [e setTexture:tx_b_guide     atIndex:6];
+            [e setTexture:tx_b_log_rg    atIndex:7];
+            [e setTexture:tx_b_log_bg    atIndex:8];
+            [e setTexture:tx_b_edge      atIndex:9];
+            [e setTexture:tx_b_edge_raw  atIndex:10];
+            [e setTexture:tx_b_fringe    atIndex:11];
+            [e setTexture:tx_line        atIndex:12];
+            [e setTexture:tx_mid         atIndex:13];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        // Solo cleanup: reads tx_mid + solo masks, writes tx_dst.
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:p_solo];
+            [e setTexture:tx_src        atIndex:0];
+            [e setTexture:tx_mid        atIndex:1];
+            [e setTexture:tx_G          atIndex:2];
+            [e setTexture:tx_b_log_rg   atIndex:3];
+            [e setTexture:tx_b_log_bg   atIndex:4];
+            [e setTexture:tx_b_guide    atIndex:5];
+            [e setTexture:tx_b_solo_r   atIndex:6];
+            [e setTexture:tx_b_solo_b   atIndex:7];
+            [e setTexture:tx_dst        atIndex:8];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        [cb2 commit];
+        [cb2 waitUntilCompleted];
+        if (cb2.status != MTLCommandBufferStatusCompleted) {
+            std::cerr << "❌ defringe phase 2 GPU command buffer failed" << std::endl;
+            return false;
+        }
+
+        // Copy 4-channel result back to caller's 3-channel buffer.
+        {
+            const vector_float3* srcv = (const vector_float3*)[buf_dst4 contents];
+            float (*dst)[3] = rgb_output.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N; i++) {
+                dst[i][0] = srcv[i].x;
+                dst[i][1] = srcv[i].y;
+                dst[i][2] = srcv[i].z;
+            }
+        }
+        std::cout << "✅ [GPU] defringe (radius=" << radius
+                  << " strength=" << strength
+                  << " green=" << (defringe_green ? "on" : "off")
+                  << " green_strength=" << green_strength_scale
+                  << " max_edge=" << max_edge
+                  << " max_guide=" << max_guide << ")" << std::endl;
+        return true;
+    }
+#else
+    (void)rgb_input; (void)rgb_output; (void)radius;
+    (void)edge_threshold; (void)chroma_threshold;
+    (void)strength; (void)defringe_green; (void)green_strength_scale;
+    return false;
+#endif
+}
+
+//===================================================================
 // 遅延ロード + キャッシュ方式の新しいシェーダー管理
 //===================================================================
 
@@ -1433,6 +1811,14 @@ id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shad
 // ファイルキャッシュ機能削除済み - メモリキャッシュのみ使用
 id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shader_name) {
     @autoreleasepool {
+        // ライブラリレベルのキャッシュ：同じ .metal ファイルを複数の
+        // カーネル取得時に毎回再コンパイルしないようにする。
+        static std::unordered_map<std::string, id<MTLLibrary>> library_cache;
+        auto lit = library_cache.find(shader_name);
+        if (lit != library_cache.end() && lit->second != nil) {
+            return lit->second;
+        }
+
         // 1. シェーダーファイル読み込み
         std::string shader_source = load_shader_file(shader_name + ".metal");
         if (shader_source.empty()) {
@@ -1502,7 +1888,8 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
         
         // Note: ファイルキャッシュは未実装、メモリキャッシュのみ使用
         std::cout << "[DEBUG] Shader compiled (memory cache only): " << shader_name << std::endl;
-        
+
+        library_cache[shader_name] = library;
         return library;
     }
 }
