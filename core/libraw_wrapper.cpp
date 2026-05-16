@@ -2,6 +2,7 @@
 #include "metal/constants.h"
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -1487,11 +1488,28 @@ public:
     std::cout << "📷 WB: " << effective_wb[0] << ", " << effective_wb[1] << ", "
               << effective_wb[2] << ", " << effective_wb[3] << std::endl;
 
+    // ===========================================================
+    // Per-stage timing instrumentation.  Prints "[T] <stage> N ms"
+    // for every major step so we can pinpoint where wall-clock
+    // time is going (e.g. CA on/off comparisons).
+    // ===========================================================
+    using _clk = std::chrono::steady_clock;
+    auto _t_total0 = _clk::now();
+    auto _t_stage = _t_total0;
+    auto _stage = [&](const char* name) {
+        auto now = _clk::now();
+        double ms = std::chrono::duration<double, std::milli>(now - _t_stage).count();
+        _t_stage = now;
+        std::cout << "[T] " << name << " " << std::fixed
+                  << std::setprecision(1) << ms << " ms" << std::endl;
+    };
+
     // Determine CFA type and apply appropriate WB processing
     if (!accelerator->apply_white_balance(raw_buffer, rgb_buffer2, effective_wb,
                                           filters, xtrans)) {
       return false;
     }
+    _stage("apply_white_balance");
 
     libraw_decoder_info_t di;
     processor.get_decoder_info(&di);
@@ -1509,11 +1527,14 @@ public:
       maximum_result.maximum = imgdata.params.user_sat;
     }
 
+    _stage("adjust_maximum");
+
     // Apply pre-interpolation processing
     if (!accelerator->pre_interpolate(rgb_buffer2, filters, xtrans,
                                       params.half_size)) {
       return false;
     }
+    _stage("pre_interpolate");
 
     // Get camera-specific color transformation matrix
     ColorTransformMatrix camera_matrix = compute_camera_transform(
@@ -1567,26 +1588,32 @@ public:
       std::cerr << "❌ Demosaic processing failed" << std::endl;
       return false;
     }
+    _stage("demosaic");
 
     float threshold = maximum_result.maximum / maximum_result.data_maximum;
 
     // Highlight recovery
     if (params.highlight_mode > 2) {
       recover_highlights(rgb_buffer, threshold); // * 0.75f);
+      _stage("highlight_recovery");
     }
 
     // Tone mapping / highlight detail recovery
     float target_contrast = 0.04f;
     if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
-      
+      _stage("tone_mapping");
     } else if (params.highlight_mode > 4) {
-      apply_detail_preserving_tonemap(rgb_buffer);
-
+      if (!accelerator->apply_detail_preserving_tonemap_gpu(rgb_buffer,
+                                                            rgb_buffer)) {
+        apply_detail_preserving_tonemap(rgb_buffer);
+      }
+      _stage("detail_preserving_tonemap");
     }
 
     if (params.highlight_mode > 3) {
       accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold + 0.3, 8.f, target_contrast);
+      _stage("enhance_micro_contrast");
     }
 
     // Fuji SuperCCD honeycomb sensors require an additional geometric
@@ -1664,6 +1691,7 @@ public:
                                        params.lateral_ca_max_shift,
                                        params.lateral_ca_min_confidence,
                                        params.lateral_ca_pyramid_levels);
+      _stage("ca_register_lateral");
     }
 
     // Axial CA cleanup (guided filter).  Runs AFTER lateral registration so
@@ -1679,6 +1707,7 @@ public:
                                     params.axial_ca_radius,
                                     params.axial_ca_epsilon,
                                     params.axial_ca_strength);
+      _stage("ca_axial_cleanup");
     }
 
     // Defringe in linear camera RGB before output color-space conversion and
@@ -1697,6 +1726,7 @@ public:
                             params.defringe_strength,
                             params.defringe_green,
                             params.defringe_green_strength);
+      _stage("defringe");
     }
 
     // Get camera-specific color transformation matrix
@@ -1713,6 +1743,7 @@ public:
                                           camera_matrix.transform)) {
       return false;
     }
+    _stage("convert_color_space");
 
     // Gamma correction with color space awareness
     if (!accelerator->gamma_correct(rgb_buffer, rgb_buffer, params.gamma_power,
@@ -1720,7 +1751,14 @@ public:
                                     params.output_color_space)) {
       return false;
     }
+    _stage("gamma_correct");
 
+    {
+      double total_ms = std::chrono::duration<double, std::milli>(
+          _clk::now() - _t_total0).count();
+      std::cout << "[T] === PIPELINE TOTAL " << std::fixed
+                << std::setprecision(1) << total_ms << " ms ===" << std::endl;
+    }
     std::cout << "✅ Unified RAW→RGB processing pipeline completed successfully"
               << std::endl;
     return true;

@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <chrono>
+#include <iomanip>
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -1047,6 +1049,190 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
         return true;
     }
 #else
+    return false;
+#endif
+}
+
+//===================================================================
+// Detail-preserving tone map (GPU port of
+// LibRawWrapper::apply_detail_preserving_tonemap).  Implements the
+// same 5-stage pipeline: setup → 2× box → ab → 2× box → apply.  MPS
+// handles every box-filter pass; per-pixel work is in custom kernels.
+//===================================================================
+bool GPUAccelerator::apply_detail_preserving_tonemap(const ImageBufferFloat& rgb_input,
+                                                      ImageBufferFloat& rgb_output) {
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    if (!rgb_input.is_valid()) return false;
+    const size_t W = rgb_input.width;
+    const size_t H = rgb_input.height;
+    const size_t N = W * H;
+    if (N == 0) return false;
+
+    constexpr int   radius = 12;
+    constexpr float eps    = 0.0025f;
+    constexpr float edge0  = 0.55f;
+    constexpr float edge1  = 0.90f;
+
+    id<MTLComputePipelineState> p_setup = get_pipeline("detail_tonemap",
+                                                       "detail_tonemap_setup");
+    id<MTLComputePipelineState> p_ab    = get_pipeline("detail_tonemap",
+                                                       "detail_tonemap_ab");
+    id<MTLComputePipelineState> p_apply = get_pipeline("detail_tonemap",
+                                                       "detail_tonemap_apply");
+    if (!p_setup || !p_ab || !p_apply) {
+        std::cerr << "❌ detail_tonemap pipeline(s) missing" << std::endl;
+        return false;
+    }
+
+    @autoreleasepool {
+        id<MTLDevice>       device = pimpl_->device;
+        id<MTLCommandQueue> queue  = pimpl_->command_queue;
+
+        // R32Float plane factory.
+        const size_t plane_bytes = N * sizeof(float);
+        NSMutableArray* plane_buffers = [NSMutableArray array];
+        auto make_plane = [&]() -> id<MTLTexture> {
+            id<MTLBuffer> buf = [device newBufferWithLength:plane_bytes
+                                                    options:MTLResourceStorageModeShared];
+            if (!buf) return nil;
+            [plane_buffers addObject:buf];
+            MTLTextureDescriptor* d = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                              width:W height:H mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            return [buf newTextureWithDescriptor:d offset:0
+                                      bytesPerRow:W * sizeof(float)];
+        };
+
+        id<MTLTexture> tx_guide   = make_plane();
+        id<MTLTexture> tx_work    = make_plane();   // guide² then mean_sq
+        id<MTLTexture> tx_mean    = make_plane();
+        id<MTLTexture> tx_mean_sq = make_plane();
+        id<MTLTexture> tx_a       = make_plane();
+        id<MTLTexture> tx_b       = make_plane();
+        id<MTLTexture> tx_a_smooth = make_plane();
+        id<MTLTexture> tx_b_smooth = make_plane();
+        if (!tx_guide || !tx_work || !tx_mean || !tx_mean_sq ||
+            !tx_a || !tx_b || !tx_a_smooth || !tx_b_smooth) return false;
+
+        // RGBA staging buffers (in-place I/O when rgb_input == rgb_output;
+        // we need a separate dst buffer regardless since the apply kernel
+        // reads from src).
+        id<MTLBuffer> buf_src4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_dst4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        if (!buf_src4 || !buf_dst4) return false;
+        {
+            vector_float3* dstv = (vector_float3*)[buf_src4 contents];
+            const float (*src)[3] = rgb_input.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N; i++) {
+                dstv[i] = {src[i][0], src[i][1], src[i][2]};
+            }
+        }
+        MTLTextureDescriptor* d4 = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                          width:W height:H mipmapped:NO];
+        d4.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        const NSUInteger bpr4 = W * 4 * sizeof(float);
+        id<MTLTexture> tx_src = [buf_src4 newTextureWithDescriptor:d4 offset:0
+                                                        bytesPerRow:bpr4];
+        id<MTLTexture> tx_dst = [buf_dst4 newTextureWithDescriptor:d4 offset:0
+                                                        bytesPerRow:bpr4];
+        if (!tx_src || !tx_dst) return false;
+
+        DetailTonemapParams params;
+        params.width  = (uint32_t)W;
+        params.height = (uint32_t)H;
+        params.eps    = eps;
+        params.edge0  = edge0;
+        params.edge1  = edge1;
+
+        // MPS box filter — kernel size = 2·radius + 1 (must be odd).
+        const NSUInteger ksize = 2 * radius + 1;
+        MPSImageBox* box = [[MPSImageBox alloc] initWithDevice:device
+                                                   kernelWidth:ksize
+                                                  kernelHeight:ksize];
+
+        const MTLSize threadgroup = MTLSizeMake(16, 16, 1);
+        const MTLSize grid        = MTLSizeMake(W, H, 1);
+
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+
+        // Stage 1: setup.
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_setup];
+            [e setTexture:tx_src   atIndex:0];
+            [e setTexture:tx_guide atIndex:1];
+            [e setTexture:tx_work  atIndex:2];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        // Stage 2: box filters on guide and work.
+        [box encodeToCommandBuffer:cb sourceTexture:tx_guide destinationTexture:tx_mean];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_work  destinationTexture:tx_mean_sq];
+
+        // Stage 3: regression a, b.
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_ab];
+            [e setTexture:tx_mean    atIndex:0];
+            [e setTexture:tx_mean_sq atIndex:1];
+            [e setTexture:tx_a       atIndex:2];
+            [e setTexture:tx_b       atIndex:3];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        // Stage 4: box filters on a, b.
+        [box encodeToCommandBuffer:cb sourceTexture:tx_a destinationTexture:tx_a_smooth];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_b destinationTexture:tx_b_smooth];
+
+        // Stage 5: ACES tone-mapped gain application.
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_apply];
+            [e setTexture:tx_src      atIndex:0];
+            [e setTexture:tx_guide    atIndex:1];
+            [e setTexture:tx_a_smooth atIndex:2];
+            [e setTexture:tx_b_smooth atIndex:3];
+            [e setTexture:tx_dst      atIndex:4];
+            [e setBytes:&params length:sizeof(params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        // Copy 4-channel staging back to 3-channel output.
+        {
+            const vector_float3* dv = (const vector_float3*)[buf_dst4 contents];
+            float (*dst)[3] = rgb_output.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N; i++) {
+                dst[i][0] = dv[i].x;
+                dst[i][1] = dv[i].y;
+                dst[i][2] = dv[i].z;
+            }
+        }
+
+        std::cout << "✅ [GPU] detail-preserving tone map (radius=" << radius
+                  << " eps=" << eps << ")" << std::endl;
+        return true;
+    }
+#else
+    (void)rgb_input; (void)rgb_output;
     return false;
 #endif
 }
@@ -2138,8 +2324,11 @@ id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shad
         
         // 4. パイプライン作成
         NSError* error = nil;
+        const auto t_pipe0 = std::chrono::steady_clock::now();
         id<MTLComputePipelineState> pipeline = [pimpl_->device newComputePipelineStateWithFunction:function error:&error];
-        
+        const double pipe_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_pipe0).count();
+
         if (!pipeline || error) {
             std::cerr << "[ERROR] Failed to create pipeline for: " << shader_name;
             if (error) {
@@ -2148,10 +2337,13 @@ id<MTLComputePipelineState> GPUAccelerator::get_pipeline(const std::string& shad
             std::cerr << std::endl;
             return nil;
         }
-        
+
         // 5. キャッシュに保存
         pipeline_cache[func_name] = pipeline;
-        std::cout << "[DEBUG] Pipeline compiled and cached: " << shader_name << std::endl;
+        std::cout << "[DEBUG] Pipeline compiled and cached: " << shader_name
+                  << "::" << func_name
+                  << " (link " << std::fixed << std::setprecision(1)
+                  << pipe_ms << " ms)" << std::endl;
         
         return pipeline;
     }
@@ -2224,8 +2416,11 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
         options.preprocessorMacros = preprocessorMacros;
         
         NSError* error = nil;
+        const auto t_compile0 = std::chrono::steady_clock::now();
         id<MTLLibrary> library = [pimpl_->device newLibraryWithSource:ns_source options:options error:&error];
-        
+        const double compile_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_compile0).count();
+
         if (error || !library) {
             std::cerr << "[ERROR] Failed to compile shader: " << shader_name;
             if (error) {
@@ -2234,9 +2429,11 @@ id<MTLLibrary> GPUAccelerator::compile_and_cache_shader(const std::string& shade
             std::cerr << std::endl;
             return nil;
         }
-        
+
         // Note: ファイルキャッシュは未実装、メモリキャッシュのみ使用
-        std::cout << "[DEBUG] Shader compiled (memory cache only): " << shader_name << std::endl;
+        std::cout << "[DEBUG] Shader compiled (memory cache only): " << shader_name
+                  << " (newLibraryWithSource " << std::fixed << std::setprecision(1)
+                  << compile_ms << " ms)" << std::endl;
 
         library_cache[shader_name] = library;
         return library;

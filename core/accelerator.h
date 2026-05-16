@@ -322,6 +322,13 @@ public:
   bool tone_mapping(const ImageBufferFloat &rgb_input,
                     ImageBufferFloat &rgb_output, float after_scale);
 
+  // Detail-preserving tone map (GPU path only).  Returns true on
+  // success; returns false when GPU is unavailable so the caller can
+  // run its own CPU implementation.  The CPU implementation stays in
+  // LibRawWrapper for now.
+  bool apply_detail_preserving_tonemap_gpu(const ImageBufferFloat &rgb_input,
+                                           ImageBufferFloat &rgb_output);
+
   // Enhance Micro Contrast
   bool enhance_micro_contrast(const ImageBufferFloat &rgb_input,
                               ImageBufferFloat &rgb_output, float threshold,

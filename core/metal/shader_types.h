@@ -126,6 +126,15 @@ typedef struct {
     float    edge_hi;      // smoothstep upper bound
 } AxialCaBlendParams;
 
+// Detail-preserving tone-map: per-pixel kernel parameters.
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float    eps;        // guided-filter regularisation
+    float    edge0;      // smoothstep lower bound (gate on `base`)
+    float    edge1;      // smoothstep upper bound
+} DetailTonemapParams;
+
 // Lateral-CA: per-level Lucas-Kanade estimation kernel parameters.
 typedef struct {
     uint32_t W;             // current level plane dimensions

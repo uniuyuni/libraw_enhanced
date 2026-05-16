@@ -458,6 +458,18 @@ bool Accelerator::defringe(const ImageBufferFloat& rgb_input,
     return false;
 }
 
+bool Accelerator::apply_detail_preserving_tonemap_gpu(
+    const ImageBufferFloat& rgb_input, ImageBufferFloat& rgb_output) {
+    if (!should_use_gpu()) return false;
+    std::cout << "🎯 Trying GPU detail-preserving tone map..." << std::endl;
+    if (pimpl_->gpu_accelerator->apply_detail_preserving_tonemap(rgb_input,
+                                                                  rgb_output)) {
+        return true;
+    }
+    std::cout << "⚠️  GPU detail tonemap failed, caller will use CPU" << std::endl;
+    return false;
+}
+
 bool Accelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
                                       ImageBufferFloat& rgb_output,
                                       int   cell_size,

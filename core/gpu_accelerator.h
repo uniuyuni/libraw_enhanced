@@ -83,6 +83,10 @@ public:
                             float strength,
                             float target_contrast);
 
+    // Detail-preserving tone map (guided-filter + ACES gain).
+    bool apply_detail_preserving_tonemap(const ImageBufferFloat& rgb_input,
+                                          ImageBufferFloat& rgb_output);
+
     // Lateral-CA registration via pyramidal Lucas-Kanade on planar R/G/B.
     bool ca_register_lateral(const ImageBufferFloat& rgb_input,
                              ImageBufferFloat&       rgb_output,
