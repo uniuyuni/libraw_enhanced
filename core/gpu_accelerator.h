@@ -83,6 +83,13 @@ public:
                             float strength,
                             float target_contrast);
 
+    // Axial-CA cleanup via MPSImageBox + cross-channel guided filter.
+    bool ca_axial_cleanup(const ImageBufferFloat& rgb_input,
+                          ImageBufferFloat& rgb_output,
+                          int   radius,
+                          float epsilon,
+                          float strength);
+
 private:
     class Impl;
     std::unique_ptr<Impl> pimpl_;

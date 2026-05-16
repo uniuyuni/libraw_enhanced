@@ -101,4 +101,29 @@ typedef struct {
     float max_local_std; // metalが書き込むワーク 0.f 初期化
 } EnhanceMicroContrastParams;
 
+// Axial-CA: image preparation (normalise by max(G), split planes, compute G²,
+// R·G, B·G in one pass).
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float    inv_norm;     // 1.0 / max(G)
+} AxialCaPrepareParams;
+
+// Axial-CA: per-pixel (a, b) regression coefficients from box-mean inputs.
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float    epsilon;
+} AxialCaAbParams;
+
+// Axial-CA: final blend of original and filtered R/B by edge-gated strength.
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float    strength;
+    float    norm_ref;     // = max(G); used to de-normalise the working planes
+    float    edge_lo;      // smoothstep lower bound on smoothed |grad G|
+    float    edge_hi;      // smoothstep upper bound
+} AxialCaBlendParams;
+
 #endif /* shader_types_h */

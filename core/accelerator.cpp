@@ -471,6 +471,15 @@ bool Accelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
                                     int   radius,
                                     float epsilon,
                                     float strength) {
+    if (should_use_gpu()) {
+        std::cout << "🎯 Trying GPU axial CA cleanup..." << std::endl;
+        if (pimpl_->gpu_accelerator->ca_axial_cleanup(rgb_input, rgb_output,
+                                                      radius, epsilon, strength)) {
+            std::cout << "✅ GPU axial CA cleanup completed" << std::endl;
+            return true;
+        }
+        std::cout << "⚠️  GPU axial CA failed, falling back to CPU" << std::endl;
+    }
     std::cout << "🔧 Running axial CA cleanup (CPU)" << std::endl;
     if (pimpl_->cpu_accelerator->ca_axial_cleanup(rgb_input, rgb_output,
                                                     radius, epsilon, strength)) {

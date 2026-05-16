@@ -1052,6 +1052,325 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
 }
 
 //===================================================================
+// Axial chromatic-aberration cleanup (cross-channel guided filter on
+// R, B with G as guide, edge-gated to bright high-gradient regions).
+//
+// MPS handles:
+//   * MPSImageBox            — every box-filter pass (8 calls)
+//   * MPSImageSobel          — single-pass gradient magnitude on G
+// Custom Metal kernels handle the algorithm-specific element-wise work
+// (plane prep, (a, b) regression, apply, blend).
+//===================================================================
+bool GPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
+                                       ImageBufferFloat& rgb_output,
+                                       int   radius,
+                                       float epsilon,
+                                       float strength) {
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    if (!rgb_input.is_valid()) return false;
+    if (radius < 1) radius = 1;
+    strength = std::clamp(strength, 0.f, 1.f);
+
+    const NSUInteger W = rgb_input.width;
+    const NSUInteger H = rgb_input.height;
+    const size_t N      = static_cast<size_t>(W) * static_cast<size_t>(H);
+    const size_t rgb_bytes = N * 3 * sizeof(float);
+
+    // ---------------------------------------------------------------
+    // CPU pre-pass: compute max(G) for normalisation.  Letting the
+    // GPU do this would require a CPU↔GPU sync that wipes out the
+    // savings of running on the GPU at all.
+    // ---------------------------------------------------------------
+    float max_g = 1e-6f;
+    {
+        const float (*src)[3] = rgb_input.image;
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(max : max_g)
+#endif
+        for (size_t i = 0; i < N; i++) {
+            const float g = src[i][1];
+            if (g > max_g) max_g = g;
+        }
+    }
+    const float norm_ref = std::max(max_g, 1e-6f);
+    const float inv_norm = 1.f / norm_ref;
+
+    // ---------------------------------------------------------------
+    // Pipelines (cached lazily).
+    // ---------------------------------------------------------------
+    id<MTLComputePipelineState> p_prepare    = get_pipeline("axial_ca", "axial_ca_prepare");
+    id<MTLComputePipelineState> p_compute_ab = get_pipeline("axial_ca", "axial_ca_compute_ab");
+    id<MTLComputePipelineState> p_apply      = get_pipeline("axial_ca", "axial_ca_apply");
+    id<MTLComputePipelineState> p_blend      = get_pipeline("axial_ca", "axial_ca_blend");
+    id<MTLComputePipelineState> p_grad_g     = get_pipeline("axial_ca", "axial_ca_grad_g");
+    if (!p_prepare || !p_compute_ab || !p_apply || !p_blend || !p_grad_g) {
+        std::cerr << "❌ axial_ca pipeline(s) missing" << std::endl;
+        return false;
+    }
+
+    @autoreleasepool {
+        id<MTLDevice> device = pimpl_->device;
+        id<MTLCommandQueue> queue = pimpl_->command_queue;
+
+        // Helper: allocate an R32Float texture-backed buffer big enough
+        // for the image.  We use one Shared MTLBuffer per plane so we
+        // can wrap it as an R32Float MTLTexture without copies.
+        const size_t plane_bytes = N * sizeof(float);
+
+        // Storage for plane buffers — we keep them in an NSMutableArray so
+        // they stay live throughout the GPU work (texture-backing buffers
+        // can otherwise be released as locals).
+        NSMutableArray* plane_buffers = [NSMutableArray array];
+        auto make_plane_texture = [&](void) -> id<MTLTexture> {
+            id<MTLBuffer> buf = [device newBufferWithLength:plane_bytes
+                                                    options:MTLResourceStorageModeShared];
+            if (!buf) return nil;
+            [plane_buffers addObject:buf];
+            MTLTextureDescriptor* d = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                              width:W height:H mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            return [buf newTextureWithDescriptor:d
+                                            offset:0
+                                       bytesPerRow:W * sizeof(float)];
+        };
+
+        // Plane textures.
+        id<MTLTexture> tx_R   = make_plane_texture();
+        id<MTLTexture> tx_G   = make_plane_texture();
+        id<MTLTexture> tx_B   = make_plane_texture();
+        id<MTLTexture> tx_GG  = make_plane_texture();
+        id<MTLTexture> tx_RG  = make_plane_texture();
+        id<MTLTexture> tx_BG  = make_plane_texture();
+        id<MTLTexture> tx_mR  = make_plane_texture();
+        id<MTLTexture> tx_mG  = make_plane_texture();
+        id<MTLTexture> tx_mB  = make_plane_texture();
+        id<MTLTexture> tx_mGG = make_plane_texture();
+        id<MTLTexture> tx_mRG = make_plane_texture();
+        id<MTLTexture> tx_mBG = make_plane_texture();
+        id<MTLTexture> tx_aR  = make_plane_texture();
+        id<MTLTexture> tx_bR  = make_plane_texture();
+        id<MTLTexture> tx_aB  = make_plane_texture();
+        id<MTLTexture> tx_bB  = make_plane_texture();
+        id<MTLTexture> tx_maR = make_plane_texture();
+        id<MTLTexture> tx_mbR = make_plane_texture();
+        id<MTLTexture> tx_maB = make_plane_texture();
+        id<MTLTexture> tx_mbB = make_plane_texture();
+        id<MTLTexture> tx_Rfilt        = make_plane_texture();
+        id<MTLTexture> tx_Bfilt        = make_plane_texture();
+        id<MTLTexture> tx_grad         = make_plane_texture();
+        id<MTLTexture> tx_grad_smooth  = make_plane_texture();
+
+        // Source + destination as RGBA32Float textures over the caller-owned
+        // page-aligned RGB float[3] buffers.  Note: ImageBufferFloat stores
+        // 3 floats per pixel back-to-back, so we wrap as an interleaved
+        // RGB32Float buffer.  Apple Metal doesn't have RGB32Float — but we
+        // store/load via vector_float4 with the .a channel ignored, which
+        // requires the buffer to have 4 floats per pixel.  Our existing
+        // ImageBufferFloat is 3 floats/pixel.
+        //
+        // Easiest path: copy to a 4-channel staging buffer for GPU work and
+        // back at the end.  This is what enhance_micro_contrast already
+        // does internally.
+        id<MTLBuffer> buf_src4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        if (!buf_src4) return false;
+        {
+            vector_float3* dstv = (vector_float3*)[buf_src4 contents];
+            const float (*src)[3] = rgb_input.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N; i++) {
+                dstv[i] = {src[i][0], src[i][1], src[i][2]};
+            }
+        }
+        id<MTLBuffer> buf_dst4 = [device newBufferWithLength:N * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        if (!buf_dst4) return false;
+        MTLTextureDescriptor* texDesc4 = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                          width:W height:H mipmapped:NO];
+        texDesc4.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> tx_src = [buf_src4 newTextureWithDescriptor:texDesc4
+                                                              offset:0
+                                                         bytesPerRow:W * 4 * sizeof(float)];
+        id<MTLTexture> tx_dst = [buf_dst4 newTextureWithDescriptor:texDesc4
+                                                              offset:0
+                                                         bytesPerRow:W * 4 * sizeof(float)];
+        if (!tx_src || !tx_dst) return false;
+
+        // Param buffers.
+        AxialCaPrepareParams prep_params = {
+            static_cast<uint32_t>(W), static_cast<uint32_t>(H), inv_norm};
+        AxialCaAbParams ab_params = {
+            static_cast<uint32_t>(W), static_cast<uint32_t>(H), epsilon};
+        vector_uint2 dims = {static_cast<uint32_t>(W),
+                             static_cast<uint32_t>(H)};
+        // Edge gating uses the same smoothstep range as the CPU reference
+        // (0.01, 0.06) so the GPU output matches bit-for-bit modulo
+        // floating-point rounding.
+        AxialCaBlendParams blend_params = {
+            static_cast<uint32_t>(W), static_cast<uint32_t>(H),
+            strength, norm_ref, 0.01f, 0.06f};
+
+        // MPS box filter is used for all box-mean passes (guided-filter
+        // box averages and the smoothed-gradient pass).
+        MPSImageBox* box = [[MPSImageBox alloc] initWithDevice:device
+                                                   kernelWidth:(2 * radius + 1)
+                                                  kernelHeight:(2 * radius + 1)];
+
+        const MTLSize threadgroup = MTLSizeMake(16, 16, 1);
+        const MTLSize grid        = MTLSizeMake(W, H, 1);
+
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+
+        // ---------------------------------------------------------------
+        // 1) prepare: normalise & split into R/G/B/GG/RG/BG planes.
+        // ---------------------------------------------------------------
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_prepare];
+            [e setTexture:tx_src atIndex:0];
+            [e setTexture:tx_R   atIndex:1];
+            [e setTexture:tx_G   atIndex:2];
+            [e setTexture:tx_B   atIndex:3];
+            [e setTexture:tx_GG  atIndex:4];
+            [e setTexture:tx_RG  atIndex:5];
+            [e setTexture:tx_BG  atIndex:6];
+            [e setBytes:&prep_params length:sizeof(prep_params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        // ---------------------------------------------------------------
+        // 2) Six box-filter passes for the guided-filter regression
+        //    inputs.  MPS encodes them directly into the same command
+        //    buffer.
+        // ---------------------------------------------------------------
+        [box encodeToCommandBuffer:cb sourceTexture:tx_G  destinationTexture:tx_mG];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_GG destinationTexture:tx_mGG];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_R  destinationTexture:tx_mR];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_RG destinationTexture:tx_mRG];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_B  destinationTexture:tx_mB];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_BG destinationTexture:tx_mBG];
+
+        // ---------------------------------------------------------------
+        // 3) Compute (a, b) regression coefficients for R and B.
+        // ---------------------------------------------------------------
+        auto run_compute_ab = [&](id<MTLTexture> mp, id<MTLTexture> mIp,
+                                   id<MTLTexture> a_out, id<MTLTexture> b_out) {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_compute_ab];
+            [e setTexture:tx_mG  atIndex:0];
+            [e setTexture:tx_mGG atIndex:1];
+            [e setTexture:mp     atIndex:2];
+            [e setTexture:mIp    atIndex:3];
+            [e setTexture:a_out  atIndex:4];
+            [e setTexture:b_out  atIndex:5];
+            [e setBytes:&ab_params length:sizeof(ab_params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        };
+        run_compute_ab(tx_mR, tx_mRG, tx_aR, tx_bR);
+        run_compute_ab(tx_mB, tx_mBG, tx_aB, tx_bB);
+
+        // ---------------------------------------------------------------
+        // 4) Box-smooth the (a, b) coefficient maps.
+        // ---------------------------------------------------------------
+        [box encodeToCommandBuffer:cb sourceTexture:tx_aR destinationTexture:tx_maR];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_bR destinationTexture:tx_mbR];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_aB destinationTexture:tx_maB];
+        [box encodeToCommandBuffer:cb sourceTexture:tx_bB destinationTexture:tx_mbB];
+
+        // ---------------------------------------------------------------
+        // 5) Apply: R_filt = mean_aR · G + mean_bR  (same for B).
+        // ---------------------------------------------------------------
+        auto run_apply = [&](id<MTLTexture> ma, id<MTLTexture> mb,
+                              id<MTLTexture> q_out) {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_apply];
+            [e setTexture:tx_G atIndex:0];
+            [e setTexture:ma   atIndex:1];
+            [e setTexture:mb   atIndex:2];
+            [e setTexture:q_out atIndex:3];
+            [e setBytes:&dims length:sizeof(dims) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        };
+        run_apply(tx_maR, tx_mbR, tx_Rfilt);
+        run_apply(tx_maB, tx_mbB, tx_Bfilt);
+
+        // ---------------------------------------------------------------
+        // 6) Edge map: custom 2-tap finite-difference gradient on G
+        //    (matches the CPU reference exactly).  Then MPS box-smooth
+        //    to match the guided-filter window reach.
+        // ---------------------------------------------------------------
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_grad_g];
+            [e setTexture:tx_G    atIndex:0];
+            [e setTexture:tx_grad atIndex:1];
+            [e setBytes:&dims length:sizeof(dims) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+        [box encodeToCommandBuffer:cb sourceTexture:tx_grad destinationTexture:tx_grad_smooth];
+
+        // ---------------------------------------------------------------
+        // 7) Final edge-gated blend.  Writes the de-normalised result
+        //    straight to the destination RGBA32Float texture.
+        // ---------------------------------------------------------------
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_blend];
+            [e setTexture:tx_src         atIndex:0];
+            [e setTexture:tx_R           atIndex:1];
+            [e setTexture:tx_B           atIndex:2];
+            [e setTexture:tx_Rfilt       atIndex:3];
+            [e setTexture:tx_Bfilt       atIndex:4];
+            [e setTexture:tx_grad_smooth atIndex:5];
+            [e setTexture:tx_dst         atIndex:6];
+            [e setBytes:&blend_params length:sizeof(blend_params) atIndex:0];
+            [e dispatchThreads:grid threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+        }
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            std::cerr << "❌ axial_ca GPU command buffer failed" << std::endl;
+            return false;
+        }
+
+        // Copy the 4-channel staging buffer back into the caller's 3-channel
+        // ImageBufferFloat.
+        {
+            const vector_float3* srcv = (const vector_float3*)[buf_dst4 contents];
+            float (*dst)[3] = rgb_output.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N; i++) {
+                dst[i][0] = srcv[i].x;
+                dst[i][1] = srcv[i].y;
+                dst[i][2] = srcv[i].z;
+            }
+        }
+
+        std::cout << "📷 [GPU] CA axial cleanup (radius=" << radius
+                  << " eps=" << epsilon << " strength=" << strength
+                  << " norm=" << norm_ref << ")" << std::endl;
+        return true;
+    }
+#else
+    (void)rgb_input; (void)rgb_output; (void)radius; (void)epsilon; (void)strength;
+    return false;
+#endif
+}
+
+//===================================================================
 // 遅延ロード + キャッシュ方式の新しいシェーダー管理
 //===================================================================
 
