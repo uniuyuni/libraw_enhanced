@@ -1052,6 +1052,355 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
 }
 
 //===================================================================
+// Lateral chromatic-aberration registration (post-demosaic dense RGB)
+// via pyramidal Lucas-Kanade.  Mirrors CPUAccelerator::ca_register_lateral.
+//
+// GPU layout:
+//   * One R32Float plane texture per channel per pyramid level.  Plane
+//     storage is backed by Shared MTLBuffers so the (small) per-level
+//     pyramid can be built incrementally without round-trips through
+//     RGBA staging.
+//   * Six float buffers for the shift maps (dx_r / dy_r / conf_r /
+//     dx_b / dy_b / conf_b), Shared storage so the CPU can scale,
+//     gate, and smooth them between levels without copies.
+//   * Final apply runs in a single per-pixel kernel.
+//===================================================================
+bool GPUAccelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
+                                          ImageBufferFloat&       rgb_output,
+                                          int   cell_size,
+                                          int   max_iterations,
+                                          float max_shift,
+                                          float min_confidence,
+                                          int   pyramid_levels) {
+#ifdef __OBJC__
+    if (!pimpl_->initialized) return false;
+    if (!rgb_input.is_valid()) return false;
+    if (cell_size < 16) cell_size = 16;
+    if (max_iterations < 1) max_iterations = 1;
+    if (pyramid_levels < 1) pyramid_levels = 1;
+
+    const size_t W0 = rgb_input.width;
+    const size_t H0 = rgb_input.height;
+    const size_t N0 = W0 * H0;
+
+    int effective_levels = pyramid_levels;
+    while (effective_levels > 1 &&
+           ((W0 >> (effective_levels - 1)) < 32 ||
+            (H0 >> (effective_levels - 1)) < 32)) {
+        effective_levels--;
+    }
+
+    const size_t map_w = std::max<size_t>(2, (W0 + cell_size - 1) / cell_size);
+    const size_t map_h = std::max<size_t>(2, (H0 + cell_size - 1) / cell_size);
+    const size_t Ncells = map_w * map_h;
+
+    id<MTLComputePipelineState> p_split      = get_pipeline("lateral_ca", "lateral_ca_split");
+    id<MTLComputePipelineState> p_downsample = get_pipeline("lateral_ca", "lateral_ca_downsample");
+    id<MTLComputePipelineState> p_lk         = get_pipeline("lateral_ca", "lateral_ca_lk_estimate");
+    id<MTLComputePipelineState> p_apply      = get_pipeline("lateral_ca", "lateral_ca_apply");
+    if (!p_split || !p_downsample || !p_lk || !p_apply) {
+        std::cerr << "❌ lateral_ca pipeline(s) missing" << std::endl;
+        return false;
+    }
+
+    @autoreleasepool {
+        id<MTLDevice>       device = pimpl_->device;
+        id<MTLCommandQueue> queue  = pimpl_->command_queue;
+
+        // ---- Source / destination staging buffers (RGBA32Float). -----
+        id<MTLBuffer> buf_src4 = [device newBufferWithLength:N0 * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_dst4 = [device newBufferWithLength:N0 * 4 * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        if (!buf_src4 || !buf_dst4) return false;
+        {
+            vector_float3* dstv = (vector_float3*)[buf_src4 contents];
+            const float (*src)[3] = rgb_input.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N0; i++) {
+                dstv[i] = {src[i][0], src[i][1], src[i][2]};
+            }
+        }
+        MTLTextureDescriptor* d4 = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                          width:W0 height:H0 mipmapped:NO];
+        d4.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> tx_src = [buf_src4 newTextureWithDescriptor:d4 offset:0
+                                                       bytesPerRow:W0 * 4 * sizeof(float)];
+        id<MTLTexture> tx_dst = [buf_dst4 newTextureWithDescriptor:d4 offset:0
+                                                       bytesPerRow:W0 * 4 * sizeof(float)];
+        if (!tx_src || !tx_dst) return false;
+
+        // ---- Plane storage per pyramid level. ------------------------
+        NSMutableArray* keepalive = [NSMutableArray array];
+        std::vector<id<MTLTexture>> tx_R(effective_levels);
+        std::vector<id<MTLTexture>> tx_G(effective_levels);
+        std::vector<id<MTLTexture>> tx_B(effective_levels);
+        std::vector<size_t>         W_lvl(effective_levels);
+        std::vector<size_t>         H_lvl(effective_levels);
+
+        auto make_plane = [&](size_t W, size_t H) -> id<MTLTexture> {
+            // Linear textures require bytesPerRow to be 16-byte aligned.
+            // Pad the row stride up to the nearest 16 bytes when the
+            // raw row size (W * 4) isn't already aligned.  Pixels are
+            // accessed by texture coords so padding is invisible to
+            // shaders.
+            const size_t row_bytes = ((W * sizeof(float)) + 15) & ~size_t(15);
+            id<MTLBuffer> buf = [device newBufferWithLength:row_bytes * H
+                                                    options:MTLResourceStorageModeShared];
+            if (!buf) return nil;
+            [keepalive addObject:buf];
+            MTLTextureDescriptor* dd = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                              width:W height:H mipmapped:NO];
+            dd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            return [buf newTextureWithDescriptor:dd offset:0
+                                      bytesPerRow:row_bytes];
+        };
+
+        for (int L = 0; L < effective_levels; L++) {
+            W_lvl[L] = W0 >> L;
+            H_lvl[L] = H0 >> L;
+            tx_R[L] = make_plane(W_lvl[L], H_lvl[L]);
+            tx_G[L] = make_plane(W_lvl[L], H_lvl[L]);
+            tx_B[L] = make_plane(W_lvl[L], H_lvl[L]);
+            if (!tx_R[L] || !tx_G[L] || !tx_B[L]) return false;
+        }
+
+        // ---- Shift-map buffers (Shared so CPU can manipulate). -------
+        id<MTLBuffer> buf_dx_r   = [device newBufferWithLength:Ncells * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_dy_r   = [device newBufferWithLength:Ncells * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_conf_r = [device newBufferWithLength:Ncells * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_dx_b   = [device newBufferWithLength:Ncells * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_dy_b   = [device newBufferWithLength:Ncells * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_conf_b = [device newBufferWithLength:Ncells * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        if (!buf_dx_r || !buf_dy_r || !buf_conf_r ||
+            !buf_dx_b || !buf_dy_b || !buf_conf_b) return false;
+        // Zero-initialise.
+        std::memset([buf_dx_r   contents], 0, Ncells * sizeof(float));
+        std::memset([buf_dy_r   contents], 0, Ncells * sizeof(float));
+        std::memset([buf_conf_r contents], 0, Ncells * sizeof(float));
+        std::memset([buf_dx_b   contents], 0, Ncells * sizeof(float));
+        std::memset([buf_dy_b   contents], 0, Ncells * sizeof(float));
+        std::memset([buf_conf_b contents], 0, Ncells * sizeof(float));
+
+        const MTLSize threadgroup = MTLSizeMake(16, 16, 1);
+
+        // ===============================================================
+        // Phase 1: build pyramid (split + (L-1) downsamples) and run all
+        // LK levels.  Because dx/dy maps need CPU scaling between levels,
+        // we submit one command buffer per level and wait between them.
+        // ===============================================================
+
+        // --- Submit pyramid construction on one command buffer. ---
+        {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            // Split level 0.
+            {
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:p_split];
+                [e setTexture:tx_src atIndex:0];
+                [e setTexture:tx_R[0] atIndex:1];
+                [e setTexture:tx_G[0] atIndex:2];
+                [e setTexture:tx_B[0] atIndex:3];
+                vector_uint2 dim = {(uint32_t)W0, (uint32_t)H0};
+                [e setBytes:&dim length:sizeof(dim) atIndex:0];
+                [e dispatchThreads:MTLSizeMake(W0, H0, 1)
+                       threadsPerThreadgroup:threadgroup];
+                [e endEncoding];
+            }
+            // Downsample to higher levels.
+            for (int L = 1; L < effective_levels; L++) {
+                LateralCaDownsampleParams pp = {
+                    (uint32_t)W_lvl[L-1], (uint32_t)H_lvl[L-1],
+                    (uint32_t)W_lvl[L],   (uint32_t)H_lvl[L]};
+                auto encode_one = [&](id<MTLTexture> in, id<MTLTexture> out) {
+                    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                    [e setComputePipelineState:p_downsample];
+                    [e setTexture:in  atIndex:0];
+                    [e setTexture:out atIndex:1];
+                    [e setBytes:&pp length:sizeof(pp) atIndex:0];
+                    [e dispatchThreads:MTLSizeMake(W_lvl[L], H_lvl[L], 1)
+                           threadsPerThreadgroup:threadgroup];
+                    [e endEncoding];
+                };
+                encode_one(tx_R[L-1], tx_R[L]);
+                encode_one(tx_G[L-1], tx_G[L]);
+                encode_one(tx_B[L-1], tx_B[L]);
+            }
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+
+        // --- Pyramid LK loop (coarse → fine). ---
+        float* dx_r   = (float*)[buf_dx_r   contents];
+        float* dy_r   = (float*)[buf_dy_r   contents];
+        float* conf_r = (float*)[buf_conf_r contents];
+        float* dx_b   = (float*)[buf_dx_b   contents];
+        float* dy_b   = (float*)[buf_dy_b   contents];
+        float* conf_b = (float*)[buf_conf_b contents];
+
+        for (int L = effective_levels - 1; L >= 0; L--) {
+            const float scale_down = 1.f / static_cast<float>(1 << L);
+            for (size_t i = 0; i < Ncells; i++) {
+                dx_r[i] *= scale_down; dy_r[i] *= scale_down;
+                dx_b[i] *= scale_down; dy_b[i] *= scale_down;
+            }
+            const float level_max_shift = max_shift * scale_down +
+                                          static_cast<float>(1 << L) * 0.5f;
+            LateralCaLkParams lk_p = {
+                (uint32_t)W_lvl[L], (uint32_t)H_lvl[L],
+                (uint32_t)map_w,    (uint32_t)map_h,
+                (uint32_t)max_iterations, level_max_shift,
+                static_cast<float>(W_lvl[L]) / static_cast<float>(map_w),
+                static_cast<float>(H_lvl[L]) / static_cast<float>(map_h)};
+
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            auto encode_lk = [&](id<MTLTexture> Gt, id<MTLTexture> Tt,
+                                  id<MTLBuffer> dxb, id<MTLBuffer> dyb,
+                                  id<MTLBuffer> cfb) {
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:p_lk];
+                [e setTexture:Gt atIndex:0];
+                [e setTexture:Tt atIndex:1];
+                [e setBuffer:dxb offset:0 atIndex:0];
+                [e setBuffer:dyb offset:0 atIndex:1];
+                [e setBuffer:cfb offset:0 atIndex:2];
+                [e setBytes:&lk_p length:sizeof(lk_p) atIndex:3];
+                [e dispatchThreads:MTLSizeMake(map_w, map_h, 1)
+                       threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                [e endEncoding];
+            };
+            encode_lk(tx_G[L], tx_R[L], buf_dx_r, buf_dy_r, buf_conf_r);
+            encode_lk(tx_G[L], tx_B[L], buf_dx_b, buf_dy_b, buf_conf_b);
+            [cb commit];
+            [cb waitUntilCompleted];
+
+            const float scale_up = static_cast<float>(1 << L);
+            for (size_t i = 0; i < Ncells; i++) {
+                dx_r[i] *= scale_up; dy_r[i] *= scale_up;
+                dx_b[i] *= scale_up; dy_b[i] *= scale_up;
+            }
+        }
+
+        // --- Confidence gate (relative to strongest cell at finest level). ---
+        auto zero_lowconf = [&](float* dxm, float* dym, const float* cmap) {
+            float maxc = 0.f;
+            for (size_t i = 0; i < Ncells; i++) maxc = std::max(maxc, cmap[i]);
+            if (maxc <= 0.f) return;
+            const float thr = maxc * min_confidence;
+            for (size_t i = 0; i < Ncells; i++) {
+                if (cmap[i] < thr) { dxm[i] = 0.f; dym[i] = 0.f; }
+            }
+        };
+        zero_lowconf(dx_r, dy_r, conf_r);
+        zero_lowconf(dx_b, dy_b, conf_b);
+
+        // --- 3x3 box smooth on shift maps. ---
+        auto smooth_3x3 = [&](float* m) {
+            std::vector<float> out(Ncells, 0.f);
+            for (int cy = 0; cy < (int)map_h; cy++) {
+                for (int cx = 0; cx < (int)map_w; cx++) {
+                    float acc = 0.f; int n = 0;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            const int yy = cy + dy, xx = cx + dx;
+                            if (yy < 0 || yy >= (int)map_h ||
+                                xx < 0 || xx >= (int)map_w) continue;
+                            acc += m[yy * map_w + xx]; n++;
+                        }
+                    }
+                    out[cy * map_w + cx] = n > 0 ? acc / n : 0.f;
+                }
+            }
+            std::memcpy(m, out.data(), Ncells * sizeof(float));
+        };
+        smooth_3x3(dx_r); smooth_3x3(dy_r);
+        smooth_3x3(dx_b); smooth_3x3(dy_b);
+
+        // --- Diagnostic summary. ---
+        auto rng = [&](const float* m) {
+            float mn = 1e9f, mx = -1e9f;
+            for (size_t i = 0; i < Ncells; i++) {
+                mn = std::min(mn, m[i]); mx = std::max(mx, m[i]);
+            }
+            return std::array<float, 2>{mn, mx};
+        };
+        auto rxr = rng(dx_r); auto ryr = rng(dy_r);
+        auto rxb = rng(dx_b); auto ryb = rng(dy_b);
+        std::cout << "📷 CA-LK[GPU] pyramid=" << effective_levels
+                  << " map " << map_w << "x" << map_h
+                  << " R dx[" << rxr[0] << "," << rxr[1] << "] dy[" << ryr[0]
+                  << "," << ryr[1] << "]"
+                  << " B dx[" << rxb[0] << "," << rxb[1] << "] dy[" << ryb[0]
+                  << "," << ryb[1] << "]" << std::endl;
+
+        // ===============================================================
+        // Phase 2: per-pixel apply.
+        // ===============================================================
+        const float clamp_shift = max_shift * static_cast<float>(1 << (effective_levels - 1));
+        LateralCaApplyParams ap = {
+            (uint32_t)W0, (uint32_t)H0,
+            (uint32_t)map_w, (uint32_t)map_h,
+            static_cast<float>(cell_size),
+            clamp_shift};
+
+        {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p_apply];
+            [e setTexture:tx_R[0] atIndex:0];
+            [e setTexture:tx_G[0] atIndex:1];
+            [e setTexture:tx_B[0] atIndex:2];
+            [e setTexture:tx_dst  atIndex:3];
+            [e setBuffer:buf_dx_r offset:0 atIndex:0];
+            [e setBuffer:buf_dy_r offset:0 atIndex:1];
+            [e setBuffer:buf_dx_b offset:0 atIndex:2];
+            [e setBuffer:buf_dy_b offset:0 atIndex:3];
+            [e setBytes:&ap length:sizeof(ap) atIndex:4];
+            [e dispatchThreads:MTLSizeMake(W0, H0, 1)
+                   threadsPerThreadgroup:threadgroup];
+            [e endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+
+        // --- Copy back. -----------------------------------------------
+        {
+            const vector_float3* dv = (const vector_float3*)[buf_dst4 contents];
+            float (*dst)[3] = rgb_output.image;
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (size_t i = 0; i < N0; i++) {
+                dst[i][0] = dv[i].x;
+                dst[i][1] = dv[i].y;
+                dst[i][2] = dv[i].z;
+            }
+        }
+
+        std::cout << "✅ [GPU] lateral_ca_register (cell=" << cell_size
+                  << " iter=" << max_iterations
+                  << " max_shift=" << max_shift
+                  << " pyramid=" << effective_levels << ")" << std::endl;
+        return true;
+    }
+#else
+    (void)rgb_input; (void)rgb_output; (void)cell_size; (void)max_iterations;
+    (void)max_shift; (void)min_confidence; (void)pyramid_levels;
+    return false;
+#endif
+}
+
+//===================================================================
 // Axial chromatic-aberration cleanup (cross-channel guided filter on
 // R, B with G as guide, edge-gated to bright high-gradient regions).
 //

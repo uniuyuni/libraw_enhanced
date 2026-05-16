@@ -83,6 +83,15 @@ public:
                             float strength,
                             float target_contrast);
 
+    // Lateral-CA registration via pyramidal Lucas-Kanade on planar R/G/B.
+    bool ca_register_lateral(const ImageBufferFloat& rgb_input,
+                             ImageBufferFloat&       rgb_output,
+                             int   cell_size,
+                             int   max_iterations,
+                             float max_shift,
+                             float min_confidence,
+                             int   pyramid_levels);
+
     // Axial-CA cleanup via MPSImageBox + cross-channel guided filter.
     bool ca_axial_cleanup(const ImageBufferFloat& rgb_input,
                           ImageBufferFloat& rgb_output,

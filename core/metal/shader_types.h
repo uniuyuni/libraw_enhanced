@@ -126,6 +126,36 @@ typedef struct {
     float    edge_hi;      // smoothstep upper bound
 } AxialCaBlendParams;
 
+// Lateral-CA: per-level Lucas-Kanade estimation kernel parameters.
+typedef struct {
+    uint32_t W;             // current level plane dimensions
+    uint32_t H;
+    uint32_t map_w;         // shift-map dimensions (same at every level)
+    uint32_t map_h;
+    uint32_t max_iterations;
+    float    max_shift;     // per-level pixel clamp
+    float    cell_w_f;      // W / map_w (float; cells anchored at level)
+    float    cell_h_f;      // H / map_h
+} LateralCaLkParams;
+
+// Lateral-CA: 2x downsample of a planar R32Float texture.
+typedef struct {
+    uint32_t W_in;
+    uint32_t H_in;
+    uint32_t W_out;
+    uint32_t H_out;
+} LateralCaDownsampleParams;
+
+// Lateral-CA: final per-pixel apply of bilinear-sampled R/B shifts.
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t map_w;
+    uint32_t map_h;
+    float    cell_size;     // full-resolution cell side (level-0 pixels)
+    float    clamp_shift;   // absolute clamp on per-pixel sampled shift
+} LateralCaApplyParams;
+
 // Defringe: shared shape/control parameters used by every defringe kernel.
 typedef struct {
     uint32_t width;

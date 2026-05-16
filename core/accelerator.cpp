@@ -465,6 +465,17 @@ bool Accelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
                                       float max_shift,
                                       float min_confidence,
                                       int   pyramid_levels) {
+    // NOTE: GPU implementation (GPUAccelerator::ca_register_lateral) is
+    // available but currently disabled because the per-cell LK kernel
+    // has insufficient parallelism on Apple Silicon (only ~4500 cells,
+    // each thread runs ~9000 iterations sequentially → low SIMD-group
+    // occupancy) and ran ~2x slower than the multi-threaded CPU path on
+    // X-T5-class images.  Switch to GPU here if/when the kernel is
+    // refactored to threadgroup-cooperative reduction.
+    //
+    // if (should_use_gpu()) {
+    //     if (pimpl_->gpu_accelerator->ca_register_lateral(...)) return true;
+    // }
     std::cout << "🔧 Running lateral CA registration (CPU)" << std::endl;
     if (pimpl_->cpu_accelerator->ca_register_lateral(rgb_input, rgb_output,
                                                       cell_size, max_iterations,
