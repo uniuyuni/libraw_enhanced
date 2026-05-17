@@ -1123,19 +1123,21 @@ bool GPUAccelerator::apply_detail_preserving_tonemap(const ImageBufferFloat& rgb
         id<MTLDevice>       device = pimpl_->device;
         id<MTLCommandQueue> queue  = pimpl_->command_queue;
 
-        // R32Float plane factory.
-        const size_t plane_bytes = N * sizeof(float);
+        // R32Float plane factory.  Linear textures require bytesPerRow
+        // to be a multiple of 16 bytes; pad the row stride up so an
+        // odd-W (or non-multiple-of-4-W) image doesn't trigger
+        // _mtlValidateStrideTextureParameters → SIGABRT.  Pixel
+        // accesses use texture coords so padding is invisible to
+        // shaders.  Same fix that lateral_ca already uses.
+        const size_t row_bytes   = ((W * sizeof(float)) + 15) & ~size_t(15);
+        const size_t plane_bytes = row_bytes * H;
         NSMutableArray* plane_buffers = [NSMutableArray array];
-        // Production diagnostic: log once the geometry, byte budget and
-        // bytesPerRow alignment we're about to ask Metal for.  An
-        // odd-W image hits Metal's 16-byte stride assertion (SIGABRT).
         {
-            const size_t bpr = W * sizeof(float);
             std::cerr << "[GPU MEM] detail_tonemap W=" << W << " H=" << H
                       << " plane_MB=" << (plane_bytes >> 20)
-                      << " bpr=" << bpr
-                      << " aligned16=" << ((bpr % 16 == 0) ? 1 : 0)
-                      << " (need aligned16=1 for linear textures)"
+                      << " bpr=" << row_bytes
+                      << " aligned16=" << ((row_bytes % 16 == 0) ? 1 : 0)
+                      << " (padded from " << (W * sizeof(float)) << ")"
                       << std::endl;
         }
         auto make_plane = [&]() -> id<MTLTexture> {
@@ -1152,12 +1154,11 @@ bool GPUAccelerator::apply_detail_preserving_tonemap(const ImageBufferFloat& rgb
                                               width:W height:H mipmapped:NO];
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
             id<MTLTexture> tex = [buf newTextureWithDescriptor:d offset:0
-                                                  bytesPerRow:W * sizeof(float)];
+                                                  bytesPerRow:row_bytes];
             if (!tex) {
                 std::cerr << "[GPU MEM] detail_tonemap newTextureWithDescriptor"
-                          << " returned nil — likely bpr alignment (W="
-                          << W << " bpr=" << (W * sizeof(float)) << ")"
-                          << std::endl;
+                          << " returned nil (W=" << W << " bpr=" << row_bytes
+                          << ")" << std::endl;
             }
             return tex;
         };
@@ -1707,23 +1708,23 @@ bool GPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
 
         // Helper: allocate an R32Float texture-backed buffer big enough
         // for the image.  We use one Shared MTLBuffer per plane so we
-        // can wrap it as an R32Float MTLTexture without copies.
-        const size_t plane_bytes = N * sizeof(float);
+        // can wrap it as an R32Float MTLTexture without copies.  Pad
+        // bytesPerRow to a 16-byte boundary to satisfy Metal's linear
+        // texture stride requirement (otherwise SIGABRT in
+        // _mtlValidateStrideTextureParameters when W*4 is not 16-aligned).
+        const size_t row_bytes   = ((W * sizeof(float)) + 15) & ~size_t(15);
+        const size_t plane_bytes = row_bytes * H;
 
         // Storage for plane buffers — we keep them in an NSMutableArray so
         // they stay live throughout the GPU work (texture-backing buffers
         // can otherwise be released as locals).
         NSMutableArray* plane_buffers = [NSMutableArray array];
-        // Production diagnostic: log geometry, byte budget and
-        // bytesPerRow alignment.  Linear textures require bytesPerRow
-        // to be a multiple of 16; an odd-W image triggers SIGABRT in
-        // _mtlValidateStrideTextureParameters.
         {
-            const size_t bpr = W * sizeof(float);
             std::cerr << "[GPU MEM] axial_ca W=" << W << " H=" << H
                       << " planes=24 total_MB=" << ((24 * plane_bytes) >> 20)
-                      << " bpr=" << bpr
-                      << " aligned16=" << ((bpr % 16 == 0) ? 1 : 0)
+                      << " bpr=" << row_bytes
+                      << " aligned16=" << ((row_bytes % 16 == 0) ? 1 : 0)
+                      << " (padded from " << (W * sizeof(float)) << ")"
                       << std::endl;
         }
         auto make_plane_texture = [&](void) -> id<MTLTexture> {
@@ -1741,12 +1742,11 @@ bool GPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
             id<MTLTexture> tex = [buf newTextureWithDescriptor:d
                                                           offset:0
-                                                     bytesPerRow:W * sizeof(float)];
+                                                     bytesPerRow:row_bytes];
             if (!tex) {
                 std::cerr << "[GPU MEM] axial_ca newTextureWithDescriptor"
-                          << " returned nil — likely bpr alignment (W="
-                          << W << " bpr=" << (W * sizeof(float)) << ")"
-                          << std::endl;
+                          << " returned nil (W=" << W << " bpr=" << row_bytes
+                          << ")" << std::endl;
             }
             return tex;
         };
@@ -2074,18 +2074,17 @@ bool GPUAccelerator::defringe(const ImageBufferFloat& rgb_input,
         id<MTLCommandQueue> queue = pimpl_->command_queue;
 
         // Plane texture factory (one R32Float texture-backed Shared buffer).
-        const size_t plane_bytes = N * sizeof(float);
+        // bytesPerRow padded to a 16-byte boundary to avoid SIGABRT in
+        // _mtlValidateStrideTextureParameters when W*4 isn't 16-aligned.
+        const size_t row_bytes   = ((W * sizeof(float)) + 15) & ~size_t(15);
+        const size_t plane_bytes = row_bytes * H;
         NSMutableArray* plane_buffers = [NSMutableArray array];
-        // Production diagnostic: log geometry + alignment.  Linear
-        // textures require bytesPerRow to be a multiple of 16; an
-        // odd-W image triggers SIGABRT in
-        // _mtlValidateStrideTextureParameters.
         {
-            const size_t bpr = W * sizeof(float);
             std::cerr << "[GPU MEM] defringe W=" << W << " H=" << H
                       << " planes=22 total_MB=" << ((22 * plane_bytes) >> 20)
-                      << " bpr=" << bpr
-                      << " aligned16=" << ((bpr % 16 == 0) ? 1 : 0)
+                      << " bpr=" << row_bytes
+                      << " aligned16=" << ((row_bytes % 16 == 0) ? 1 : 0)
+                      << " (padded from " << (W * sizeof(float)) << ")"
                       << std::endl;
         }
         auto make_plane = [&]() -> id<MTLTexture> {
@@ -2103,12 +2102,11 @@ bool GPUAccelerator::defringe(const ImageBufferFloat& rgb_input,
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
             id<MTLTexture> tex = [buf newTextureWithDescriptor:d
                                                           offset:0
-                                                     bytesPerRow:W * sizeof(float)];
+                                                     bytesPerRow:row_bytes];
             if (!tex) {
                 std::cerr << "[GPU MEM] defringe newTextureWithDescriptor"
-                          << " returned nil — likely bpr alignment (W="
-                          << W << " bpr=" << (W * sizeof(float)) << ")"
-                          << std::endl;
+                          << " returned nil (W=" << W << " bpr=" << row_bytes
+                          << ")" << std::endl;
             }
             return tex;
         };
