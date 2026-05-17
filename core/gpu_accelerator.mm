@@ -16,6 +16,7 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <cstring>
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -61,6 +62,39 @@ bool GPUAccelerator::initialize() {
         }
         std::cout << "📋 Command queue created." << std::endl;
         
+        // ==== Production diagnostic banner ====
+        // Logs device capabilities, working-set caps, cwd, and resolved
+        // shader directories.  When users report "works in dev, crashes
+        // in prod", this single banner usually identifies the cause.
+        {
+            id<MTLDevice> dev = pimpl_->device;
+            char cwd[1024] = {0};
+            if (!getcwd(cwd, sizeof(cwd))) std::strcpy(cwd, "<unknown>");
+            const uint64_t maxBuf  = (uint64_t)[dev maxBufferLength];
+            const uint64_t recSet  = (uint64_t)[dev recommendedMaxWorkingSetSize];
+            std::cout << "[GPU INIT] device=" << [[dev name] UTF8String]
+                      << " unified=" << (int)[dev hasUnifiedMemory]
+                      << " lowPower=" << (int)[dev isLowPower]
+                      << " maxBuffer_MB=" << (maxBuf >> 20)
+                      << " recommendedMaxWorkingSet_MB=" << (recSet >> 20)
+                      << std::endl;
+            std::cout << "[GPU INIT] cwd=" << cwd << std::endl;
+            // Probe each shader search path so we can see which one
+            // (if any) the runtime can actually read from in prod.
+            const char* probes[] = {
+                "metal/shader_types.h",
+                "core/metal/shader_types.h",
+                "../core/metal/shader_types.h",
+                "../../core/metal/shader_types.h",
+            };
+            for (auto* p : probes) {
+                struct stat st;
+                std::cout << "[GPU INIT] shader_probe " << p << " => "
+                          << (::stat(p, &st) == 0 ? "OK" : "MISSING")
+                          << std::endl;
+            }
+        }
+
         pimpl_->initialized = true;
         std::cout << "✅ GPU Initialization SUCCESSFUL." << std::endl;
         return true;
@@ -1092,17 +1126,40 @@ bool GPUAccelerator::apply_detail_preserving_tonemap(const ImageBufferFloat& rgb
         // R32Float plane factory.
         const size_t plane_bytes = N * sizeof(float);
         NSMutableArray* plane_buffers = [NSMutableArray array];
+        // Production diagnostic: log once the geometry, byte budget and
+        // bytesPerRow alignment we're about to ask Metal for.  An
+        // odd-W image hits Metal's 16-byte stride assertion (SIGABRT).
+        {
+            const size_t bpr = W * sizeof(float);
+            std::cerr << "[GPU MEM] detail_tonemap W=" << W << " H=" << H
+                      << " plane_MB=" << (plane_bytes >> 20)
+                      << " bpr=" << bpr
+                      << " aligned16=" << ((bpr % 16 == 0) ? 1 : 0)
+                      << " (need aligned16=1 for linear textures)"
+                      << std::endl;
+        }
         auto make_plane = [&]() -> id<MTLTexture> {
             id<MTLBuffer> buf = [device newBufferWithLength:plane_bytes
                                                     options:MTLResourceStorageModeShared];
-            if (!buf) return nil;
+            if (!buf) {
+                std::cerr << "[GPU MEM] detail_tonemap newBufferWithLength FAILED"
+                          << " plane_MB=" << (plane_bytes >> 20) << std::endl;
+                return nil;
+            }
             [plane_buffers addObject:buf];
             MTLTextureDescriptor* d = [MTLTextureDescriptor
                 texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
                                               width:W height:H mipmapped:NO];
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            return [buf newTextureWithDescriptor:d offset:0
-                                      bytesPerRow:W * sizeof(float)];
+            id<MTLTexture> tex = [buf newTextureWithDescriptor:d offset:0
+                                                  bytesPerRow:W * sizeof(float)];
+            if (!tex) {
+                std::cerr << "[GPU MEM] detail_tonemap newTextureWithDescriptor"
+                          << " returned nil — likely bpr alignment (W="
+                          << W << " bpr=" << (W * sizeof(float)) << ")"
+                          << std::endl;
+            }
+            return tex;
         };
 
         id<MTLTexture> tx_guide   = make_plane();
@@ -1657,18 +1714,41 @@ bool GPUAccelerator::ca_axial_cleanup(const ImageBufferFloat& rgb_input,
         // they stay live throughout the GPU work (texture-backing buffers
         // can otherwise be released as locals).
         NSMutableArray* plane_buffers = [NSMutableArray array];
+        // Production diagnostic: log geometry, byte budget and
+        // bytesPerRow alignment.  Linear textures require bytesPerRow
+        // to be a multiple of 16; an odd-W image triggers SIGABRT in
+        // _mtlValidateStrideTextureParameters.
+        {
+            const size_t bpr = W * sizeof(float);
+            std::cerr << "[GPU MEM] axial_ca W=" << W << " H=" << H
+                      << " planes=24 total_MB=" << ((24 * plane_bytes) >> 20)
+                      << " bpr=" << bpr
+                      << " aligned16=" << ((bpr % 16 == 0) ? 1 : 0)
+                      << std::endl;
+        }
         auto make_plane_texture = [&](void) -> id<MTLTexture> {
             id<MTLBuffer> buf = [device newBufferWithLength:plane_bytes
                                                     options:MTLResourceStorageModeShared];
-            if (!buf) return nil;
+            if (!buf) {
+                std::cerr << "[GPU MEM] axial_ca newBufferWithLength FAILED"
+                          << " plane_MB=" << (plane_bytes >> 20) << std::endl;
+                return nil;
+            }
             [plane_buffers addObject:buf];
             MTLTextureDescriptor* d = [MTLTextureDescriptor
                 texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
                                               width:W height:H mipmapped:NO];
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            return [buf newTextureWithDescriptor:d
-                                            offset:0
-                                       bytesPerRow:W * sizeof(float)];
+            id<MTLTexture> tex = [buf newTextureWithDescriptor:d
+                                                          offset:0
+                                                     bytesPerRow:W * sizeof(float)];
+            if (!tex) {
+                std::cerr << "[GPU MEM] axial_ca newTextureWithDescriptor"
+                          << " returned nil — likely bpr alignment (W="
+                          << W << " bpr=" << (W * sizeof(float)) << ")"
+                          << std::endl;
+            }
+            return tex;
         };
 
         // Plane textures.
@@ -1996,18 +2076,41 @@ bool GPUAccelerator::defringe(const ImageBufferFloat& rgb_input,
         // Plane texture factory (one R32Float texture-backed Shared buffer).
         const size_t plane_bytes = N * sizeof(float);
         NSMutableArray* plane_buffers = [NSMutableArray array];
+        // Production diagnostic: log geometry + alignment.  Linear
+        // textures require bytesPerRow to be a multiple of 16; an
+        // odd-W image triggers SIGABRT in
+        // _mtlValidateStrideTextureParameters.
+        {
+            const size_t bpr = W * sizeof(float);
+            std::cerr << "[GPU MEM] defringe W=" << W << " H=" << H
+                      << " planes=22 total_MB=" << ((22 * plane_bytes) >> 20)
+                      << " bpr=" << bpr
+                      << " aligned16=" << ((bpr % 16 == 0) ? 1 : 0)
+                      << std::endl;
+        }
         auto make_plane = [&]() -> id<MTLTexture> {
             id<MTLBuffer> buf = [device newBufferWithLength:plane_bytes
                                                     options:MTLResourceStorageModeShared];
-            if (!buf) return nil;
+            if (!buf) {
+                std::cerr << "[GPU MEM] defringe newBufferWithLength FAILED"
+                          << " plane_MB=" << (plane_bytes >> 20) << std::endl;
+                return nil;
+            }
             [plane_buffers addObject:buf];
             MTLTextureDescriptor* d = [MTLTextureDescriptor
                 texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
                                               width:W height:H mipmapped:NO];
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            return [buf newTextureWithDescriptor:d
-                                            offset:0
-                                       bytesPerRow:W * sizeof(float)];
+            id<MTLTexture> tex = [buf newTextureWithDescriptor:d
+                                                          offset:0
+                                                     bytesPerRow:W * sizeof(float)];
+            if (!tex) {
+                std::cerr << "[GPU MEM] defringe newTextureWithDescriptor"
+                          << " returned nil — likely bpr alignment (W="
+                          << W << " bpr=" << (W * sizeof(float)) << ")"
+                          << std::endl;
+            }
+            return tex;
         };
 
         // Allocate every plane up front for simplicity (memory pool will
@@ -2456,7 +2559,19 @@ std::string GPUAccelerator::load_shader_file(const std::string& filename) {
             return buffer.str();
         }
     }
-    
+
+    // Production diagnostic: the shader could not be located on any of
+    // the relative search paths.  Print the failed query + cwd so we
+    // can tell from logs whether the package was installed somewhere
+    // the search heuristic doesn't reach.
+    {
+        char cwd[1024] = {0};
+        if (!getcwd(cwd, sizeof(cwd))) std::strcpy(cwd, "<unknown>");
+        std::cerr << "[SHADER] NOT FOUND: " << filename
+                  << " (cwd=" << cwd << ") tried:";
+        for (const auto& p : possible_paths) std::cerr << " " << p;
+        std::cerr << std::endl;
+    }
     return "";
 }
 
