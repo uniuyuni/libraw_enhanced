@@ -1094,7 +1094,8 @@ public:
 
   bool recover_highlights(ImageBufferFloat &rgb_buffer,
                           float saturation_threshold,
-                          float *highlight_mask_out = nullptr) {
+                          float *highlight_mask_out = nullptr,
+                          const float *wb_rgb = nullptr) {
     std::cout << "🔧 Starting highlight recovery... sat: "
               << saturation_threshold << std::endl;
 
@@ -1115,16 +1116,19 @@ public:
     //      anchor — it varies with WB skew across cameras/scenes — so we use
     //      fixed edges in the normalised post-demosaic space.
     //
-    //   2) Neutrality weight = 1 − smoothstep(chroma, 0.5, 0.8), where
-    //      chroma = (max-min)/max on the *post-WB* triplet.  A pure-white
-    //      raw pixel scaled by typical WB (e.g. R×1.8, B×1.3) already shows
-    //      chroma ≈ 0.3–0.5 even though the source is neutral; a linear
-    //      (1−chroma) factor would punish those genuine highlights almost
-    //      as much as a hue-clipped orange (chroma ≈ 0.8).  The smoothstep
-    //      keeps neutrality = 1 for everything below 0.5 (WB-stretched
-    //      whites included) and collapses to 0 above 0.8 (saturated
-    //      coloured highlights where the clipped channel would drag micro-
-    //      contrast detail off-hue).
+    //   2) Neutrality weight = 1 − smoothstep(chroma_n, t_lo, t_hi).
+    //      When `wb_rgb` is supplied we virtually undo the per-channel WB
+    //      multipliers before computing chroma — that gives a tight
+    //      raw-space measurement where a *true* neutral white reads
+    //      chroma_n ≈ 0 regardless of WB skew (post-WB whites would
+    //      otherwise sit at chroma ≈ 0.3–0.5 just from the WB stretch and
+    //      overlap with genuinely tinted highlights).  Edges of (0.10, 0.30)
+    //      keep slight tints (chroma_n < 0.1, e.g. tiny gel cast) at full
+    //      strength and cut off cleanly past chroma_n ≈ 0.25.
+    //      When `wb_rgb` is null we fall back to the previous post-WB
+    //      chroma with the looser (0.50, 0.70) edges — used by the
+    //      standalone `recover_highlights_numpy` path which doesn't thread
+    //      WB through.
     //
     // Computed from the *input* pixel values so the mask captures the
     // original highlight extent before this function rewrites any channels.
@@ -1132,9 +1136,13 @@ public:
     const float mask_t_lo = 0.95f;
     const float mask_inv  = 1.f / std::max(1e-6f, mask_t_hi - mask_t_lo);
 
-    const float chroma_t_lo = 0.50f;
-    const float chroma_t_hi = 0.70f;
+    const float chroma_t_lo = (wb_rgb != nullptr) ? 0.20f : 0.50f;
+    const float chroma_t_hi = (wb_rgb != nullptr) ? 0.45f : 0.70f;
     const float chroma_inv  = 1.f / std::max(1e-6f, chroma_t_hi - chroma_t_lo);
+
+    const float inv_wb_r = (wb_rgb != nullptr) ? 1.f / std::max(1e-6f, wb_rgb[0]) : 1.f;
+    const float inv_wb_g = (wb_rgb != nullptr) ? 1.f / std::max(1e-6f, wb_rgb[1]) : 1.f;
+    const float inv_wb_b = (wb_rgb != nullptr) ? 1.f / std::max(1e-6f, wb_rgb[2]) : 1.f;
 
     // ハイライト部のR/G, B/G比を求める
     float grf = 0.f, gbf = 0.f, count = 0.f;
@@ -1149,9 +1157,15 @@ public:
         if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
         const float w_g = t * t * (3.f - 2.f * t);
 
-        // Neutrality weight: 1 − smoothstep(chroma, 0.5, 0.8).
-        const float mx = std::max(pixel[0], std::max(pixel[1], pixel[2]));
-        const float mn = std::min(pixel[0], std::min(pixel[1], pixel[2]));
+        // WB-undone triplet (purely a chroma-measurement transform; the
+        // actual pixel values stay untouched and continue downstream).
+        // When wb_rgb is null the *_n values equal the input and the
+        // looser edges above keep the post-WB chroma behaviour.
+        const float r_n = pixel[0] * inv_wb_r;
+        const float g_n = pixel[1] * inv_wb_g;
+        const float b_n = pixel[2] * inv_wb_b;
+        const float mx = std::max(r_n, std::max(g_n, b_n));
+        const float mn = std::min(r_n, std::min(g_n, b_n));
         const float chroma = (mx > 1e-6f) ? (mx - mn) / mx : 0.f;
         float ct = (chroma - chroma_t_lo) * chroma_inv;
         if (ct < 0.f) ct = 0.f; else if (ct > 1.f) ct = 1.f;
@@ -1658,9 +1672,13 @@ public:
       highlight_mask = highlight_mask_data.data();
     }
 
-    // Highlight recovery
+    // Highlight recovery — pass the effective WB so the highlight-mask
+    // chroma calculation can virtually undo the WB skew and discriminate
+    // true neutrals from slightly-tinted highlights in raw space.  The
+    // pixel data itself is unaffected; only the mask judgement uses this.
+    const float wb_rgb[3] = { effective_wb[0], effective_wb[1], effective_wb[2] };
     if (params.highlight_mode > 2) {
-      recover_highlights(rgb_buffer, threshold, highlight_mask); // * 0.75f);
+      recover_highlights(rgb_buffer, threshold, highlight_mask, wb_rgb);
       _stage("highlight_recovery");
     }
 
