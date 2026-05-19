@@ -1136,8 +1136,8 @@ public:
     const float mask_t_lo = 0.95f;
     const float mask_inv  = 1.f / std::max(1e-6f, mask_t_hi - mask_t_lo);
 
-    const float chroma_t_lo = (wb_rgb != nullptr) ? 0.20f : 0.50f;
-    const float chroma_t_hi = (wb_rgb != nullptr) ? 0.45f : 0.70f;
+    const float chroma_t_lo = (wb_rgb != nullptr) ? 0.30f : 0.50f;
+    const float chroma_t_hi = (wb_rgb != nullptr) ? 0.60f : 0.70f;
     const float chroma_inv  = 1.f / std::max(1e-6f, chroma_t_hi - chroma_t_lo);
 
     const float inv_wb_r = (wb_rgb != nullptr) ? 1.f / std::max(1e-6f, wb_rgb[0]) : 1.f;
