@@ -77,11 +77,15 @@ public:
                             ImageBufferFloat& rgb_output,
                             float after_scale);
 
+    // `mask` (optional, width*height float plane in [0,1]) selects soft per-
+    // pixel gating via mix() inside the kernel; nullptr falls back to the
+    // legacy threshold-based hard gate.
     bool enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                             ImageBufferFloat& rgb_output,
                             float threshold,
                             float strength,
-                            float target_contrast);
+                            float target_contrast,
+                            const float* mask = nullptr);
 
     // Detail-preserving tone map (guided-filter + ACES gain).
     bool apply_detail_preserving_tonemap(const ImageBufferFloat& rgb_input,

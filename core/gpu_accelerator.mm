@@ -925,123 +925,127 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                                             ImageBufferFloat& rgb_output,
                                             float threshold,
                                             float strength,
-                                            float target_contrast) {
+                                            float target_contrast,
+                                            const float* mask) {
 #ifdef __OBJC__
     if (!pimpl_->initialized) return false;
 
-    // 遅延ローディングでパイプライン取得
+    // Pipelines — separable 1D Gaussian (replaces MPSImageGaussianBlur so the
+    // GPU output matches the CPU's analytical 9×9 Gaussian), plus the main
+    // enhancement kernel.
+    id<MTLComputePipelineState> blur_h_pipeline    = get_pipeline("enhance_micro_contrast", "emc_blur_h_from_packed3");
+    id<MTLComputePipelineState> blur_h_sq_pipeline = get_pipeline("enhance_micro_contrast", "emc_blur_h_sq_from_packed3");
+    id<MTLComputePipelineState> blur_v_pipeline    = get_pipeline("enhance_micro_contrast", "emc_blur_v");
     id<MTLComputePipelineState> enhance_micro_contrast_pipeline = get_pipeline("enhance_micro_contrast");
-    if (!enhance_micro_contrast_pipeline) {
-        std::cerr << "❌ Failed to get enhance micro contrast pipeline" << std::endl;
+    if (!blur_h_pipeline || !blur_h_sq_pipeline || !blur_v_pipeline || !enhance_micro_contrast_pipeline) {
+        std::cerr << "❌ Failed to get enhance micro contrast pipelines" << std::endl;
         return false;
     }
 
     @autoreleasepool {
-        size_t pixel_count = rgb_input.width * rgb_input.height;
-        size_t rgb_bytes   = pixel_count * 3 * sizeof(float);
+        const size_t pixel_count = rgb_input.width * rgb_input.height;
+        const size_t rgb_bytes   = pixel_count * 3 * sizeof(float);
+        const size_t rgba_bytes  = pixel_count * 4 * sizeof(float);
 
-        // Both buffers wrap caller-owned page-aligned memory via newBufferWithBytesNoCopy.
+        // Caller-owned page-aligned RGB planes — wrap without copying.
         id<MTLBuffer> input_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_input.image[0][0]
-                                                            length:rgb_bytes
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
+                                                                      length:rgb_bytes
+                                                                     options:MTLResourceStorageModeShared
+                                                                 deallocator:nil];
         if (!input_buffer) return false;
 
-        id<MTLBuffer> I_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
-        if (!I_buffer) return false;
-        vector_float3* I = (vector_float3 *)[I_buffer contents];
-
-        // Shared (not Private) so CPU can read back after GPU Gaussian blurs to
-        // compute max_local_std correctly — the Metal shader's original approach
-        // of computing a global max with unprotected writes and threadgroup_barrier
-        // was a data race (threadgroup_barrier only syncs within one threadgroup).
-        id<MTLBuffer> local_mean_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
-        if (!local_mean_buffer) return false;
-
-        id<MTLBuffer> local_var_buffer = [pimpl_->device newBufferWithLength:pixel_count * 4 * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
-        if (!local_var_buffer) return false;
-
         id<MTLBuffer> output_buffer = [pimpl_->device newBufferWithBytesNoCopy:&rgb_output.image[0][0]
-                                                            length:rgb_bytes
-                                                            options:MTLResourceStorageModeShared
-                                                            deallocator:nil];
+                                                                       length:rgb_bytes
+                                                                      options:MTLResourceStorageModeShared
+                                                                  deallocator:nil];
         if (!output_buffer) return false;
 
-        // max_local_std will be filled in by CPU after GPU Gaussian blurs complete.
+        // H-pass intermediate (reused for both blur(I) and blur(I²)).
+        // Shared because the V-pass output (local_mean / local_var) must be
+        // CPU-visible for the max_local_std reduction below.
+        id<MTLBuffer> intermediate_buffer = [pimpl_->device newBufferWithLength:rgba_bytes
+                                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> local_mean_buffer   = [pimpl_->device newBufferWithLength:rgba_bytes
+                                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> local_var_buffer    = [pimpl_->device newBufferWithLength:rgba_bytes
+                                                                       options:MTLResourceStorageModeShared];
+        if (!intermediate_buffer || !local_mean_buffer || !local_var_buffer) return false;
+
+        // Image dims for blur kernels.
+        struct { uint32_t w, h; } dims = {
+            static_cast<uint32_t>(rgb_input.width),
+            static_cast<uint32_t>(rgb_input.height)
+        };
+        id<MTLBuffer> dims_buffer = [pimpl_->device newBufferWithBytes:&dims
+                                                                length:sizeof(dims)
+                                                               options:MTLResourceStorageModeShared];
+        if (!dims_buffer) return false;
+
+        // Main-kernel params (max_local_std filled in below, after blurs).
+        const uint32_t use_mask_flag = (mask != nullptr) ? 1u : 0u;
         EnhanceMicroContrastParams params = {
             static_cast<uint32_t>(rgb_input.width),
             static_cast<uint32_t>(rgb_input.height),
             threshold,
             strength,
             target_contrast,
-            0.f  // max_local_std placeholder; overwritten below
+            0.f,
+            use_mask_flag
         };
         id<MTLBuffer> params_buffer = [pimpl_->device newBufferWithBytes:&params
-                                                            length:sizeof(params)
-                                                            options:MTLResourceStorageModeShared];
+                                                                  length:sizeof(params)
+                                                                 options:MTLResourceStorageModeShared];
         if (!params_buffer) return false;
 
-        MTLTextureDescriptor *texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
-                                                            width:NSUInteger(rgb_input.width)
-                                                            height:NSUInteger(rgb_input.height)
-                                                            mipmapped:NO];
-        texDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        id<MTLTexture> I_texture = [I_buffer newTextureWithDescriptor:texDesc
-                                                            offset:0
-                                                            bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
-        id<MTLTexture> local_mean_texture = [local_mean_buffer newTextureWithDescriptor:texDesc
-                                                            offset:0
-                                                            bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
-        id<MTLTexture> local_var_texture = [local_var_buffer newTextureWithDescriptor:texDesc
-                                                            offset:0
-                                                            bytesPerRow:NSUInteger(rgb_input.width * 4 * sizeof(float))];
-
-        MPSImageGaussianBlur *gaussianBlur = [[MPSImageGaussianBlur alloc] initWithDevice:pimpl_->device sigma:5.f / 3.7f];
-
-        id<MTLCommandBuffer> command_buffer;
-
-        MTLSize grid_size = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
-        MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
-
-        // 局所平均の計算
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (uint32_t idx = 0; idx < pixel_count; ++idx) {
-            I[idx] = {rgb_input.image[idx][0], rgb_input.image[idx][1], rgb_input.image[idx][2]};
+        // Mask buffer — wrap caller's plane without copying when supplied,
+        // else bind a 1-element dummy (params.use_mask = 0 keeps it unread).
+        id<MTLBuffer> mask_buffer = nil;
+        if (mask != nullptr) {
+            mask_buffer = [pimpl_->device newBufferWithBytesNoCopy:const_cast<float*>(mask)
+                                                          length:pixel_count * sizeof(float)
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
+        } else {
+            mask_buffer = [pimpl_->device newBufferWithLength:sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
         }
-        command_buffer = [pimpl_->command_queue commandBuffer];
-        [gaussianBlur encodeToCommandBuffer:command_buffer sourceTexture:I_texture destinationTexture:local_mean_texture];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
+        if (!mask_buffer) return false;
 
-        // 局所標準偏差の計算（前半）
-#ifdef _OPENMP
-        #pragma omp parallel for
-#endif
-        for (uint32_t idx = 0; idx < pixel_count; ++idx) {
-            I[idx] = I[idx] * I[idx];
-        }
-        command_buffer = [pimpl_->command_queue commandBuffer];
-        [gaussianBlur encodeToCommandBuffer:command_buffer sourceTexture:I_texture destinationTexture:local_var_texture];
+        const MTLSize grid_size         = MTLSizeMake(rgb_input.width, rgb_input.height, 1);
+        const MTLSize thread_group_size = MTLSizeMake(16, 16, 1);
+
+        // Helper lambda: encode one compute dispatch on the supplied buffer.
+        auto encode_dispatch = [&](id<MTLCommandBuffer> cb,
+                                   id<MTLComputePipelineState> pipe,
+                                   id<MTLBuffer> in_buf,
+                                   id<MTLBuffer> out_buf) {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:in_buf  offset:0 atIndex:0];
+            [enc setBuffer:out_buf offset:0 atIndex:1];
+            [enc setBuffer:dims_buffer offset:0 atIndex:2];
+            [enc dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+            [enc endEncoding];
+        };
+
+        // blur(I) — H then V — writes into local_mean_buffer.
+        // blur(I²) — H (fused-square) then V — writes into local_var_buffer.
+        // Both blurs share the intermediate H buffer; the two V passes only
+        // read the intermediate that immediately precedes them, so a single
+        // command buffer with two H→V serial pairs is safe.
+        id<MTLCommandBuffer> command_buffer = [pimpl_->command_queue commandBuffer];
+        encode_dispatch(command_buffer, blur_h_pipeline,    input_buffer,        intermediate_buffer);
+        encode_dispatch(command_buffer, blur_v_pipeline,    intermediate_buffer, local_mean_buffer);
+        encode_dispatch(command_buffer, blur_h_sq_pipeline, input_buffer,        intermediate_buffer);
+        encode_dispatch(command_buffer, blur_v_pipeline,    intermediate_buffer, local_var_buffer);
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
 
         // ---------------------------------------------------------------
-        // CPU computes max_local_std from GPU-produced Shared buffers.
-        //
-        // Both local_mean_buffer and local_var_buffer are RGBA32Float
-        // (4 floats/pixel) written by MPS Gaussian blur.
-        // variance[i] = blur(I²)[i] - blur(I)[i]²
-        // local_std[i] = sqrt(max(variance[i], 0))
-        // max_local_std = max over all pixels of max(std.r, std.g, std.b)
-        //
-        // waitUntilCompleted above ensures the GPU writes are visible here.
+        // CPU reduction for max_local_std.  Same logic as before; both
+        // local_mean_buffer and local_var_buffer are packed_float4
+        // (alpha = 0, unused).
         // ---------------------------------------------------------------
         {
             const simd_float4* mean_ptr = (const simd_float4*)[local_mean_buffer contents];
@@ -1058,27 +1062,24 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                 float m = std::max({s.x, s.y, s.z});
                 max_local_std = std::max(max_local_std, m);
             }
-            // Write the correct value into the Shared params_buffer that the
-            // GPU kernel will read at buffer(4).
             ((EnhanceMicroContrastParams*)[params_buffer contents])->max_local_std = max_local_std;
         }
 
         command_buffer = [pimpl_->command_queue commandBuffer];
         id<MTLComputeCommandEncoder> post_encoder = [command_buffer computeCommandEncoder];
         [post_encoder setComputePipelineState:enhance_micro_contrast_pipeline];
-        [post_encoder setBuffer:input_buffer  offset:0 atIndex:0];
+        [post_encoder setBuffer:input_buffer      offset:0 atIndex:0];
         [post_encoder setBuffer:local_mean_buffer offset:0 atIndex:1];
         [post_encoder setBuffer:local_var_buffer  offset:0 atIndex:2];
-        [post_encoder setBuffer:output_buffer offset:0 atIndex:3];
-        [post_encoder setBuffer:params_buffer offset:0 atIndex:4];
+        [post_encoder setBuffer:output_buffer     offset:0 atIndex:3];
+        [post_encoder setBuffer:params_buffer     offset:0 atIndex:4];
+        [post_encoder setBuffer:mask_buffer       offset:0 atIndex:5];
         [post_encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
         [post_encoder endEncoding];
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return false;
-
-        // GPU wrote directly into rgb_output.image via newBufferWithBytesNoCopy — no memcpy needed.
 
         return true;
     }

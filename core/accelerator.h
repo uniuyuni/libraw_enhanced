@@ -330,9 +330,15 @@ public:
                                            ImageBufferFloat &rgb_output);
 
   // Enhance Micro Contrast
+  //
+  // When `mask` is non-null it must point to a width*height float plane with
+  // values in [0,1] representing the highlight confidence per pixel.  In that
+  // mode the kernel uses mix(input, enhanced, mask[i]) and ignores `threshold`.
+  // When `mask` is null the legacy threshold-based hard gate is used.
   bool enhance_micro_contrast(const ImageBufferFloat &rgb_input,
                               ImageBufferFloat &rgb_output, float threshold,
-                              float strength, float target_contrast = 0.06);
+                              float strength, float target_contrast = 0.06,
+                              const float *mask = nullptr);
 
   // Defringe: edge-gated Gaussian opponent-chroma suppression (HDR-safe)
   bool defringe(const ImageBufferFloat &rgb_input,

@@ -3136,7 +3136,8 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                                             ImageBufferFloat& rgb_output,
                                             float threshold,
                                             float strength,
-                                            float target_contrast) {
+                                            float target_contrast,
+                                            const float* mask) {
     if (!initialized_) return false;
 
     // 引数チェック
@@ -3157,10 +3158,15 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
         I[idx] = simd_make_float3(rgb_input.image[idx][0], rgb_input.image[idx][1], rgb_input.image[idx][2]);
     }
 
-    int kernel_size = 5;
+    // Match the GPU path: MPSImageGaussianBlur(sigma = 5/3.7) is used there,
+    // and the 2D kernel size needs to cover ~3σ on each side to reproduce the
+    // same smoothing.  Anything smaller (the previous 5×5 with σ=1) clips the
+    // tails and yields visibly less aggressive enhancement than GPU.
+    const float kernel_sigma = 5.f / 3.7f;
+    int kernel_size = 9;  // covers ±3σ at σ≈1.35
 
     // カーネル作成
-    auto kernel = create_gaussian_kernel(kernel_size, 1.f);
+    auto kernel = create_gaussian_kernel(kernel_size, kernel_sigma);
 
     // 局所平均の計算
     std::vector<vector_float3> local_mean_data(height * width);
@@ -3247,16 +3253,29 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
     }
 
     // 画像の再構成
+    //
+    // Two gating modes:
+    //   * mask != nullptr — soft per-pixel weight in [0,1]; smoothly blend the
+    //     enhanced result with the original via mix().  This is the preferred
+    //     path: the mask is built upstream from a smoothstep around the
+    //     saturation point and isolates true highlights without hard banding.
+    //   * mask == nullptr — legacy hard gate on the green channel against
+    //     `threshold` (kept for backward compatibility with callers that have
+    //     not been migrated yet, e.g. enhance_micro_contrast_numpy).
+    if (mask != nullptr) {
 #ifdef _OPENMP
-    #pragma omp parallel for
+        #pragma omp parallel for
 #endif
-    for (uint32_t idx = 0; idx < width * height; ++idx) {
-        if (I[idx][1] >= threshold) {
+        for (uint32_t idx = 0; idx < width * height; ++idx) {
+            const float w = std::clamp(mask[idx], 0.f, 1.f);
+            const float in_r = rgb_input.image[idx][0];
+            const float in_g = rgb_input.image[idx][1];
+            const float in_b = rgb_input.image[idx][2];
+
             float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
             float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
             float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
-            // Preserve highlight detail without hard clipping by scaling
-            // down only if the enhancement pushes above 1.0.
+            // Same highlight-safe rescale as the legacy path.
             float maxc = std::max(r, std::max(g, b));
             if (maxc > 1.f) {
                 float scale = 1.f / maxc;
@@ -3264,13 +3283,35 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                 g *= scale;
                 b *= scale;
             }
-            rgb_output.image[idx][0] = r;
-            rgb_output.image[idx][1] = g;
-            rgb_output.image[idx][2] = b;
-        } else {
-            rgb_output.image[idx][0] = rgb_input.image[idx][0];
-            rgb_output.image[idx][1] = rgb_input.image[idx][1];
-            rgb_output.image[idx][2] = rgb_input.image[idx][2];
+
+            rgb_output.image[idx][0] = in_r + (r - in_r) * w;
+            rgb_output.image[idx][1] = in_g + (g - in_g) * w;
+            rgb_output.image[idx][2] = in_b + (b - in_b) * w;
+        }
+    } else {
+#ifdef _OPENMP
+        #pragma omp parallel for
+#endif
+        for (uint32_t idx = 0; idx < width * height; ++idx) {
+            if (I[idx][1] >= threshold) {
+                float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
+                float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
+                float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
+                float maxc = std::max(r, std::max(g, b));
+                if (maxc > 1.f) {
+                    float scale = 1.f / maxc;
+                    r *= scale;
+                    g *= scale;
+                    b *= scale;
+                }
+                rgb_output.image[idx][0] = r;
+                rgb_output.image[idx][1] = g;
+                rgb_output.image[idx][2] = b;
+            } else {
+                rgb_output.image[idx][0] = rgb_input.image[idx][0];
+                rgb_output.image[idx][1] = rgb_input.image[idx][1];
+                rgb_output.image[idx][2] = rgb_input.image[idx][2];
+            }
         }
     }
 

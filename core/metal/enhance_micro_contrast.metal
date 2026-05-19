@@ -1,4 +1,91 @@
 
+// =====================================================================
+// Separable 9-tap Gaussian blur (sigma = 5/3.7 ≈ 1.3514).
+//
+// Replaces MPSImageGaussianBlur for the local_mean / local_var passes so
+// the GPU result tracks the CPU's analytical 2D Gaussian
+// (cpu_accelerator.cpp::apply_gaussian_blur with kernel_size=9,
+// kernel_sigma=5/3.7).  Two 1D passes (H then V) are mathematically
+// equivalent to the CPU's 9×9 2D convolution.  Edges use clamp-to-edge
+// to match the CPU std::clamp() behaviour.
+// =====================================================================
+
+// Pre-computed normalised 9-tap weights for sigma = 5/3.7.  Sum ≈ 1.0.
+constant float kEmcGaussWeights[9] = {
+    0.003693f,
+    0.025109f,
+    0.098814f,
+    0.224689f,
+    0.295406f,
+    0.224689f,
+    0.098814f,
+    0.025109f,
+    0.003693f
+};
+
+// Horizontal pass on the original RGB image (packed_float3 input).
+// Output is packed_float4 (alpha = 0, unused downstream).
+kernel void emc_blur_h_from_packed3(
+    const device packed_float3* src [[buffer(0)]],
+    device packed_float4* dst [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]],            // .x = width, .y = height
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= dims.x || gid.y >= dims.y) return;
+    const int W = int(dims.x);
+    const int y = int(gid.y);
+    const int x0 = int(gid.x) - 4;
+    float3 sum = float3(0.f);
+    for (int k = 0; k < 9; ++k) {
+        const int x = clamp(x0 + k, 0, W - 1);
+        sum += float3(src[y * W + x]) * kEmcGaussWeights[k];
+    }
+    dst[y * W + int(gid.x)] = float4(sum, 0.f);
+}
+
+// Horizontal pass on the squared RGB image.  Reads I, squares, weights.
+// Fused so we don't need a separate buffer holding I².
+kernel void emc_blur_h_sq_from_packed3(
+    const device packed_float3* src [[buffer(0)]],
+    device packed_float4* dst [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= dims.x || gid.y >= dims.y) return;
+    const int W = int(dims.x);
+    const int y = int(gid.y);
+    const int x0 = int(gid.x) - 4;
+    float3 sum = float3(0.f);
+    for (int k = 0; k < 9; ++k) {
+        const int x = clamp(x0 + k, 0, W - 1);
+        const float3 v = float3(src[y * W + x]);
+        sum += v * v * kEmcGaussWeights[k];
+    }
+    dst[y * W + int(gid.x)] = float4(sum, 0.f);
+}
+
+// Vertical pass on a packed_float4 intermediate (H-pass output).  Same
+// kernel weights, same clamp-to-edge.
+kernel void emc_blur_v(
+    const device packed_float4* src [[buffer(0)]],
+    device packed_float4* dst [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= dims.x || gid.y >= dims.y) return;
+    const int W = int(dims.x);
+    const int H = int(dims.y);
+    const int x = int(gid.x);
+    const int y0 = int(gid.y) - 4;
+    float4 sum = float4(0.f);
+    for (int k = 0; k < 9; ++k) {
+        const int y = clamp(y0 + k, 0, H - 1);
+        sum += float4(src[y * W + x]) * kEmcGaussWeights[k];
+    }
+    dst[int(gid.y) * W + x] = sum;
+}
+
+
 kernel void preprocess_enhance_micro_contrast(
     const device packed_float3* rgb_input [[buffer(0)]],
     device packed_float4* rgb_output [[buffer(1)]],
@@ -23,6 +110,7 @@ kernel void enhance_micro_contrast(
     const device packed_float4* local_var_blur [[buffer(2)]],  // blur(I²) — read-only
     device packed_float3* rgb_output [[buffer(3)]],
     constant EnhanceMicroContrastParams& params [[buffer(4)]],  // read-only; max_local_std pre-computed by CPU
+    const device float* mask [[buffer(5)]],                      // [0,1] per-pixel weight (only read when params.use_mask != 0)
     uint2 gid [[thread_position_in_grid]],
     uint2 grid_size [[threads_per_grid]]
 ) {
@@ -42,30 +130,36 @@ kernel void enhance_micro_contrast(
 
     // 強調係数の計算 - コントラストが低い領域ほど強く強調
     float4 enhance_factor = select(0.f,
-                                   params.strength * (params.target_contrast - contrast_map) / params.target_contrast, 
+                                   params.strength * (params.target_contrast - contrast_map) / params.target_contrast,
                                    contrast_map < params.target_contrast);
 
     // 高周波成分の抽出
-    float4 high_freq = float4(rgb_input[idx].x, rgb_input[idx].y, rgb_input[idx].z, 0.f) - local_mean[idx];
+    float3 in_rgb = float3(rgb_input[idx].x, rgb_input[idx].y, rgb_input[idx].z);
+    float4 high_freq = float4(in_rgb.x, in_rgb.y, in_rgb.z, 0.f) - local_mean[idx];
 
     // 適応的な強調
     float4 enhanced_high_freq = high_freq * (1.f + enhance_factor);
 
-    // 画像の再構成
-    if (rgb_input[idx].y >= params.threshold) {
-        float3 out_rgb = float3(
-            local_mean[idx].x + enhanced_high_freq.x,
-            local_mean[idx].y + enhanced_high_freq.y,
-            local_mean[idx].z + enhanced_high_freq.z
-        );
-        // Preserve highlight detail without hard clipping by scaling
-        // down only if the enhancement pushes above 1.0.
-        float maxc = max(out_rgb.x, max(out_rgb.y, out_rgb.z));
-        if (maxc > 1.f) {
-            out_rgb /= maxc;
-        }
-        rgb_output[idx] = out_rgb;
-    } else {
-        rgb_output[idx] = rgb_input[idx];
+    // Reconstructed enhanced colour (matches the CPU path exactly).
+    float3 enhanced = float3(
+        local_mean[idx].x + enhanced_high_freq.x,
+        local_mean[idx].y + enhanced_high_freq.y,
+        local_mean[idx].z + enhanced_high_freq.z
+    );
+    float maxc = max(enhanced.x, max(enhanced.y, enhanced.z));
+    if (maxc > 1.f) {
+        enhanced /= maxc;
     }
+
+    // Two gating modes (parallels the CPU implementation):
+    //   * use_mask != 0 — soft per-pixel weight from `mask`, mix()d with the
+    //     original.  Edges of the highlight zone fade smoothly.
+    //   * use_mask == 0 — legacy hard gate on the green channel against
+    //     `threshold`; used by `enhance_micro_contrast_numpy` which doesn't
+    //     thread a mask through.
+    float w = (params.use_mask != 0u)
+                  ? clamp(mask[idx], 0.f, 1.f)
+                  : ((in_rgb.y >= params.threshold) ? 1.f : 0.f);
+
+    rgb_output[idx] = in_rgb + (enhanced - in_rgb) * w;
 }

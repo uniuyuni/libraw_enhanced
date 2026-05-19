@@ -89,12 +89,14 @@ public:
                             ImageBufferFloat& rgb_output,
                             float after_scale);
 
-    // Enhance Micro Contrast method
+    // Enhance Micro Contrast method.  `mask` (optional) is a width*height
+    // float plane in [0,1] selecting where to apply enhancement.
     bool enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                         ImageBufferFloat& rgb_output,
                         float threshold,
                         float strength,
-                        float target_contrast);
+                        float target_contrast,
+                        const float* mask = nullptr);
 
     // Defringe: linear RGB, guide-green chroma-ratio suppression.
     // Designed to run before output color-space conversion and gamma.

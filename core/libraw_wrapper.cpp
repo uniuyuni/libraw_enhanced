@@ -1093,7 +1093,8 @@ public:
   //===============================================================
 
   bool recover_highlights(ImageBufferFloat &rgb_buffer,
-                          float saturation_threshold) {
+                          float saturation_threshold,
+                          float *highlight_mask_out = nullptr) {
     std::cout << "🔧 Starting highlight recovery... sat: "
               << saturation_threshold << std::endl;
 
@@ -1101,12 +1102,63 @@ public:
     const size_t height = rgb_buffer.height;
     const size_t channels = rgb_buffer.channels;
 
+    // Soft highlight mask, two factors combined:
+    //
+    //   1) smoothstep of the *green* channel around the sensor saturation
+    //      point.  Demosaic normalises by `maximum_result.maximum`, so a
+    //      pixel where the raw green hit sensor saturation lands at exactly
+    //      1.0 here.  R and B are inflated by WB multipliers (often
+    //      1.5–2.0×) so `max(R,G,B) >= 1.0` would catch bright reds/blues
+    //      that are nowhere near saturation; G has WB_G ≈ 1 and is the
+    //      cleanest proxy for "this pixel hit the sensor ceiling".
+    //      `saturation_threshold` (= maximum/data_maximum) is *not* a stable
+    //      anchor — it varies with WB skew across cameras/scenes — so we use
+    //      fixed edges in the normalised post-demosaic space.
+    //
+    //   2) Neutrality weight = 1 − smoothstep(chroma, 0.5, 0.8), where
+    //      chroma = (max-min)/max on the *post-WB* triplet.  A pure-white
+    //      raw pixel scaled by typical WB (e.g. R×1.8, B×1.3) already shows
+    //      chroma ≈ 0.3–0.5 even though the source is neutral; a linear
+    //      (1−chroma) factor would punish those genuine highlights almost
+    //      as much as a hue-clipped orange (chroma ≈ 0.8).  The smoothstep
+    //      keeps neutrality = 1 for everything below 0.5 (WB-stretched
+    //      whites included) and collapses to 0 above 0.8 (saturated
+    //      coloured highlights where the clipped channel would drag micro-
+    //      contrast detail off-hue).
+    //
+    // Computed from the *input* pixel values so the mask captures the
+    // original highlight extent before this function rewrites any channels.
+    const float mask_t_hi = 1.00f;
+    const float mask_t_lo = 0.95f;
+    const float mask_inv  = 1.f / std::max(1e-6f, mask_t_hi - mask_t_lo);
+
+    const float chroma_t_lo = 0.50f;
+    const float chroma_t_hi = 0.70f;
+    const float chroma_inv  = 1.f / std::max(1e-6f, chroma_t_hi - chroma_t_lo);
+
     // ハイライト部のR/G, B/G比を求める
     float grf = 0.f, gbf = 0.f, count = 0.f;
     std::deque<size_t>
         highlight; // ついでにハイライト処理するピクセルインデクスを保持
     for (size_t idx = 0; idx < width * height; ++idx) {
       float *pixel = rgb_buffer.image[idx];
+
+      if (highlight_mask_out != nullptr) {
+        // Green-channel smoothstep weight.
+        float t = (pixel[1] - mask_t_lo) * mask_inv;
+        if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
+        const float w_g = t * t * (3.f - 2.f * t);
+
+        // Neutrality weight: 1 − smoothstep(chroma, 0.5, 0.8).
+        const float mx = std::max(pixel[0], std::max(pixel[1], pixel[2]));
+        const float mn = std::min(pixel[0], std::min(pixel[1], pixel[2]));
+        const float chroma = (mx > 1e-6f) ? (mx - mn) / mx : 0.f;
+        float ct = (chroma - chroma_t_lo) * chroma_inv;
+        if (ct < 0.f) ct = 0.f; else if (ct > 1.f) ct = 1.f;
+        const float neutrality = 1.f - ct * ct * (3.f - 2.f * ct);
+
+        highlight_mask_out[idx] = w_g * neutrality;
+      }
 
       if (pixel[0] >= saturation_threshold &&
           pixel[2] >= saturation_threshold) {
@@ -1592,9 +1644,23 @@ public:
 
     float threshold = maximum_result.maximum / maximum_result.data_maximum;
 
+    // Soft highlight mask shared between recover_highlights and
+    // enhance_micro_contrast.  Only allocated when both stages can run,
+    // i.e. highlight_mode > 3 (the enhance stage gate).  The mask is built
+    // from the *pre-recovery* pixel values so it captures the original
+    // highlight extent regardless of any later tone-mapping compression;
+    // since it is indexed by pixel position the mapping stays valid even
+    // when tone_mapping is applied between the two stages.
+    AlignedFloatVec highlight_mask_data;
+    float *highlight_mask = nullptr;
+    if (params.highlight_mode > 3) {
+      highlight_mask_data.assign(rgb_buffer.width * rgb_buffer.height, 0.f);
+      highlight_mask = highlight_mask_data.data();
+    }
+
     // Highlight recovery
     if (params.highlight_mode > 2) {
-      recover_highlights(rgb_buffer, threshold); // * 0.75f);
+      recover_highlights(rgb_buffer, threshold, highlight_mask); // * 0.75f);
       _stage("highlight_recovery");
     }
 
@@ -1612,7 +1678,11 @@ public:
     }
 
     if (params.highlight_mode > 3) {
-      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer, threshold + 0.3, 8.f, target_contrast);
+      // `threshold` arg is unused when a mask is supplied; pass the old
+      // value for safety in case the call ever falls back.
+      accelerator->enhance_micro_contrast(rgb_buffer, rgb_buffer,
+                                          threshold + 0.3f, 8.f,
+                                          target_contrast, highlight_mask);
       _stage("enhance_micro_contrast");
     }
 

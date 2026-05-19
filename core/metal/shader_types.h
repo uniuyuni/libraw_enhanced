@@ -99,6 +99,7 @@ typedef struct {
     float strength;
     float target_contrast;
     float max_local_std; // metalが書き込むワーク 0.f 初期化
+    uint32_t use_mask;   // 1: read soft mask buffer; 0: derive a 0/1 weight from threshold
 } EnhanceMicroContrastParams;
 
 // Axial-CA: image preparation (normalise by max(G), split planes, compute G²,
