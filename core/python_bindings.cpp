@@ -1,4 +1,5 @@
 #include "libraw_wrapper.h"
+#include <cstring>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -12,6 +13,43 @@
 
 namespace py = pybind11;
 using namespace libraw_enhanced;
+
+namespace {
+
+bool is_c_contiguous(const py::buffer_info &info) {
+  if (info.ndim <= 0) {
+    return true;
+  }
+
+  py::ssize_t expected_stride = info.itemsize;
+  for (py::ssize_t axis = info.ndim - 1; axis >= 0; --axis) {
+    if (info.shape[axis] == 0) {
+      return true;
+    }
+    if (info.strides[axis] != expected_stride) {
+      return false;
+    }
+    expected_stride *= info.shape[axis];
+  }
+  return true;
+}
+
+std::vector<uint8_t> bytes_from_python_buffer(py::buffer buffer) {
+  py::buffer_info info = buffer.request();
+  if (!is_c_contiguous(info)) {
+    throw py::value_error("load_buffer requires a contiguous byte buffer");
+  }
+
+  const size_t byte_count =
+      static_cast<size_t>(info.size) * static_cast<size_t>(info.itemsize);
+  std::vector<uint8_t> result(byte_count);
+  if (byte_count > 0) {
+    std::memcpy(result.data(), info.ptr, byte_count);
+  }
+  return result;
+}
+
+} // namespace
 
 PYBIND11_MODULE(_core, m) {
   m.doc() = "LibRaw Enhanced Core Module with Metal acceleration";
@@ -278,8 +316,14 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly(
           "data",
           [](ProcessedImageData &self) -> py::array_t<float> {
-            return py::array_t<float>({self.width, self.height, self.channels},
-                                      self.data, py::cast(self));
+            if (!self.is_valid()) {
+              return py::array_t<float>();
+            }
+            return py::array_t<float>(
+                {self.height, self.width, self.channels},
+                {self.width * self.channels * sizeof(float),
+                 self.channels * sizeof(float), sizeof(float)},
+                self.data, py::cast(self));
           })
 #ifdef __arm64__
       .def_property_readonly(
@@ -296,7 +340,16 @@ PYBIND11_MODULE(_core, m) {
   py::class_<LibRawWrapper>(m, "LibRawWrapper")
       .def(py::init<>())
       .def("load_file", &LibRawWrapper::load_file)
-      .def("load_buffer", &LibRawWrapper::load_buffer)
+      .def(
+          "load_buffer",
+          [](LibRawWrapper &self, py::object source) {
+            if (PyObject_CheckBuffer(source.ptr())) {
+              return self.load_buffer(bytes_from_python_buffer(
+                  py::reinterpret_borrow<py::buffer>(source)));
+            }
+            return self.load_buffer(source.cast<std::vector<uint8_t>>());
+          },
+          py::arg("buffer"))
       .def("unpack", &LibRawWrapper::unpack)
       .def("process", &LibRawWrapper::process)
       .def("get_processed_image", &LibRawWrapper::get_processed_image)

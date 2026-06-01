@@ -16,6 +16,7 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <cmath>
 #include <cstring>
 
 #ifdef __OBJC__
@@ -1060,7 +1061,17 @@ bool GPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                 simd_float4 s  = simd_make_float4(std::sqrt(clamped.x), std::sqrt(clamped.y),
                                                   std::sqrt(clamped.z), 0.f);
                 float m = std::max({s.x, s.y, s.z});
-                max_local_std = std::max(max_local_std, m);
+                if (std::isfinite(m)) {
+                    max_local_std = std::max(max_local_std, m);
+                }
+            }
+            if (!std::isfinite(max_local_std) || max_local_std <= 1e-12f ||
+                !std::isfinite(target_contrast) || target_contrast <= 1e-12f ||
+                !std::isfinite(strength)) {
+                if (rgb_input.image != rgb_output.image) {
+                    std::memcpy(&rgb_output.image[0][0], &rgb_input.image[0][0], rgb_bytes);
+                }
+                return true;
             }
             ((EnhanceMicroContrastParams*)[params_buffer contents])->max_local_std = max_local_std;
         }

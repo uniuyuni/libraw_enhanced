@@ -30,6 +30,7 @@ from .constants import (
     HighlightMode,
     ColorSpace,
     DemosaicAlgorithm,
+    get_default_params,
 )
 
 
@@ -62,10 +63,18 @@ class RawImage:
         self._image_info = None
         self._raw_data = None
         self._color_matrix: Optional[np.ndarray] = None
+        self._last_params = get_default_params()
         
         if filepath is not None:
 
             self.load_file(filepath)
+
+    def _clear_cached_state(self):
+        self._filepath = None
+        self._is_loaded = False
+        self._image_info = None
+        self._raw_data = None
+        self._color_matrix = None
     
     def load_file(self, filepath: str):
         """
@@ -81,6 +90,8 @@ class RawImage:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"RAW file not found: {filepath}")
         
+        self._clear_cached_state()
+
         # ファイル読み込み
         load_result = self._wrapper.load_file(filepath)
         if load_result != 0:
@@ -89,6 +100,8 @@ class RawImage:
         # rawpy互換：自動でunpackを実行
         unpack_result = self._wrapper.unpack()
         if unpack_result != 0:
+            self._wrapper.close()
+            self._clear_cached_state()
             raise RuntimeError(f"Failed to unpack RAW data: {unpack_result}")
         
         self._filepath = str(Path(filepath).resolve())
@@ -96,7 +109,7 @@ class RawImage:
         self._image_info = None  # 次回アクセス時に更新
         self._raw_data = None   # 次回アクセス時に更新
     
-    def load_buffer(self, buffer: Union[bytes, np.ndarray]):
+    def load_buffer(self, buffer: Union[bytes, bytearray, memoryview, np.ndarray]):
         """
         メモリバッファからRAWデータを読み込み
         
@@ -107,14 +120,37 @@ class RawImage:
             RuntimeError: データ読み込みに失敗した場合
         """
         if isinstance(buffer, np.ndarray):
-            buffer = buffer.tobytes()
-        
-        # Convert bytes to list for C++ std::vector<uint8_t>
-        buffer_list = list(buffer)
-        self._wrapper.load_buffer(buffer_list)
+            if not buffer.flags.c_contiguous:
+                buffer = np.ascontiguousarray(buffer)
+            buffer = memoryview(buffer).cast("B")
+        else:
+            try:
+                buffer = memoryview(buffer)
+            except TypeError as exc:
+                raise TypeError(
+                    "buffer must be bytes, bytearray, memoryview, or numpy.ndarray"
+                ) from exc
+            if not buffer.contiguous:
+                buffer = memoryview(buffer.tobytes())
+            if buffer.format != "B" or buffer.ndim != 1:
+                buffer = buffer.cast("B")
+
+        self._clear_cached_state()
+
+        load_result = self._wrapper.load_buffer(buffer)
+        if load_result != 0:
+            raise RuntimeError(f"Failed to load RAW buffer: {load_result}")
+
+        unpack_result = self._wrapper.unpack()
+        if unpack_result != 0:
+            self._wrapper.close()
+            self._clear_cached_state()
+            raise RuntimeError(f"Failed to unpack RAW data: {unpack_result}")
+
         self._filepath = "<buffer>"
         self._is_loaded = True
         self._image_info = None
+        self._raw_data = None
     
     def postprocess(self,
                    # Basic processing parameters (rawpy compatible)
@@ -388,12 +424,12 @@ class RawImage:
                 if key == 'user_wb':
                     for i, val in enumerate(value):
                         float_params[f'user_wb_{i}'] = float(val)
-        int_params['preprocess'] = preprocess
         
         # Execute processing with categorized parameters
         result_image = self._wrapper.process_with_dict(
             float_params, int_params, bool_params, string_params
         )
+        self._last_params = params.copy()
         
         # Save timing information for profiling
 
@@ -418,7 +454,9 @@ class RawImage:
         if not self._is_loaded:
             raise RuntimeError("No RAW file loaded")
         
-        self._wrapper.unpack()
+        unpack_result = self._wrapper.unpack()
+        if unpack_result != 0:
+            raise RuntimeError(f"Failed to unpack RAW data: {unpack_result}")
     
     def get_timing_info(self):
         """
@@ -549,9 +587,7 @@ class RawImage:
         """リソースの解放"""
         if self._wrapper:
             self._wrapper.close()
-        self._is_loaded = False
-        self._filepath = None
-        self._image_info = None
+        self._clear_cached_state()
     
     # コンテキストマネージャサポート
     def __enter__(self):
@@ -726,11 +762,10 @@ class RawImage:
         Returns:
             dict: パラメータの辞書
         """
-        return {
-            'use_camera_wb': True,
-            'output_color': 1,  # sRGB
-            'output_bps': 8,
-        }
+        params = self._last_params.copy()
+        if 'output_color_space' in params:
+            params['output_color'] = params['output_color_space']
+        return params
     
     # LibRaw Enhanced拡張プロパティ
     @property
@@ -758,11 +793,11 @@ class RawImage:
         Returns:
             dict: 最適化機能の利用可能性
         """
-        from . import is_available, is_apple_selicon
+        from . import is_available, is_apple_silicon
         
         return {
             'accelerate_available': True,  # Accelerate framework is always available on macOS
-            'apple_silicon': is_apple_selicon(),
+            'apple_silicon': is_apple_silicon(),
             'available': is_available(),
         }
     

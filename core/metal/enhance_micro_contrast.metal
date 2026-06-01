@@ -115,6 +115,14 @@ kernel void enhance_micro_contrast(
     uint2 grid_size [[threads_per_grid]]
 ) {
     const uint idx = (gid.y * params.width + gid.x);
+    float3 in_rgb = float3(rgb_input[idx].x, rgb_input[idx].y, rgb_input[idx].z);
+
+    if (!(params.max_local_std > 1e-12f && params.max_local_std < 3.402823466e38f &&
+          params.target_contrast > 1e-12f && params.target_contrast < 3.402823466e38f &&
+          params.strength > -3.402823466e38f && params.strength < 3.402823466e38f)) {
+        rgb_output[idx] = in_rgb;
+        return;
+    }
 
     // variance = blur(I²) - blur(I)²
     float4 local_var = local_var_blur[idx] - local_mean[idx] * local_mean[idx];
@@ -134,7 +142,6 @@ kernel void enhance_micro_contrast(
                                    contrast_map < params.target_contrast);
 
     // 高周波成分の抽出
-    float3 in_rgb = float3(rgb_input[idx].x, rgb_input[idx].y, rgb_input[idx].z);
     float4 high_freq = float4(in_rgb.x, in_rgb.y, in_rgb.z, 0.f) - local_mean[idx];
 
     // 適応的な強調

@@ -2889,9 +2889,12 @@ bool CPUAccelerator::convert_color_space(const ImageBufferFloat& rgb_input, Imag
     for (size_t i = 0; i < pixel_count; i++) {
         const float* in = rgb_input.image[i];
         float* out = rgb_output.image[i];
-        out[0] = transform[0][0] * in[0] + transform[0][1] * in[1] + transform[0][2] * in[2] + transform[0][3];
-        out[1] = transform[1][0] * in[0] + transform[1][1] * in[1] + transform[1][2] * in[2] + transform[1][3];
-        out[2] = transform[2][0] * in[0] + transform[2][1] * in[1] + transform[2][2] * in[2] + transform[2][3];
+        const float r = in[0];
+        const float g = in[1];
+        const float b = in[2];
+        out[0] = transform[0][0] * r + transform[0][1] * g + transform[0][2] * b + transform[0][3];
+        out[1] = transform[1][0] * r + transform[1][1] * g + transform[1][2] * b + transform[1][3];
+        out[2] = transform[2][0] * r + transform[2][1] * g + transform[2][2] * b + transform[2][3];
     }
     return true;
 }
@@ -3206,16 +3209,36 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
 
     float max_local_std = 0.f;
     for (const auto& v : local_std_data) {
-        max_local_std = std::max(max_local_std, std::max(std::max(v[0], v[1]), v[2]));
+        const float m = std::max(std::max(v[0], v[1]), v[2]);
+        if (std::isfinite(m)) {
+            max_local_std = std::max(max_local_std, m);
+        }
+    }
+
+    if (!std::isfinite(max_local_std) || max_local_std <= 1e-12f ||
+        !std::isfinite(target_contrast) || target_contrast <= 1e-12f ||
+        !std::isfinite(strength)) {
+        if (rgb_input.image != rgb_output.image) {
+#ifdef _OPENMP
+            #pragma omp parallel for
+#endif
+            for (uint32_t idx = 0; idx < width * height; ++idx) {
+                rgb_output.image[idx][0] = rgb_input.image[idx][0];
+                rgb_output.image[idx][1] = rgb_input.image[idx][1];
+                rgb_output.image[idx][2] = rgb_input.image[idx][2];
+            }
+        }
+        return true;
     }
 
     std::vector<vector_float3> contrast_map_data(height * width);
     vector_float3* contrast_map = contrast_map_data.data();
+    const float inv_max_local_std = 1.f / max_local_std;
 #ifdef _OPENMP
     #pragma omp parallel for
 #endif
     for (uint32_t idx = 0; idx < width * height; ++idx) {
-        contrast_map[idx] = local_std[idx] / max_local_std;
+        contrast_map[idx] = local_std[idx] * inv_max_local_std;
     }
 
     // 強調係数の計算 - コントラストが低い領域ほど強く強調
@@ -4452,22 +4475,6 @@ bool CPUAccelerator::defringe(
                              min_dir) *
                   smoothstep(0.18f, 0.58f, balance)
                 : 0.f;
-            // One-sided green halo escape hatch.  Lateral green CA is often
-            // unbalanced (G≫B but G≈R, or vice versa) so balanced_hue dies
-            // because `balance` drops below 0.35.  When defringe_green is
-            // explicitly enabled and this pixel is green-dominant, allow a
-            // magnitude-only gate to substitute, so unbalanced halos still
-            // contribute to c_hue.  Gated on !is_purple so purple-classified
-            // pixels keep their original c_hue exactly (max_dir for them
-            // refers to the purple direction, not the green one).
-            const float green_unbalanced_hue = (enable_green_defringe && !is_purple)
-                ? smoothstep(0.035f * inv_sensitivity,
-                             0.16f  * inv_sensitivity,
-                             max_dir)
-                : 0.f;
-            const float c_hue = std::max(balanced_hue,
-                                         std::max(red_purple_hue_gate,
-                                                  green_unbalanced_hue));
             const float rb_avg = rb_avg_pre;
             const float purple_abs = std::min(std::max(0.f, r0 - g0),
                                               std::max(0.f, b0 - g0)) /
@@ -4475,6 +4482,37 @@ bool CPUAccelerator::defringe(
             const float green_abs_base = std::max(0.f, g0 - rb_avg) / std::max(blur_guide[i], 0.05f);
             const float green_abs_alt  = std::max(0.f, g0 - std::min(r0, b0)) / std::max(blur_guide[i], 0.05f);
             const float green_abs = std::max(green_abs_base, 0.55f * green_abs_alt);
+            const float green_chroma_accept =
+                smoothstep(chroma_threshold * 1.10f * inv_sensitivity,
+                           chroma_threshold * 2.20f * inv_sensitivity,
+                           green_abs);
+            const float green_line_accept =
+                smoothstep(0.045f, 0.140f, line_fringe_support[i]);
+            const float green_clear_edge_accept =
+                smoothstep(0.18f, 0.42f, c_edge_core) *
+                smoothstep(chroma_threshold * 1.55f * inv_sensitivity,
+                           chroma_threshold * 3.00f * inv_sensitivity,
+                           green_abs);
+            const float green_detection_accept =
+                green_chroma_accept * std::max(green_line_accept,
+                                               green_clear_edge_accept);
+            // One-sided green halo escape hatch.  Lateral green CA is often
+            // unbalanced (G≫B but G≈R, or vice versa) so balanced_hue dies
+            // because `balance` drops below 0.35.  When defringe_green is
+            // explicitly enabled and this pixel is green-dominant, allow a
+            // magnitude-only gate to substitute, but only when the chroma
+            // excess is strong and has line/clear-edge evidence.  Without
+            // this extra gate, fine stone/wood texture can masquerade as a
+            // green fringe in real RAW files.
+            const float green_unbalanced_hue = (enable_green_defringe && !is_purple)
+                ? smoothstep(0.035f * inv_sensitivity,
+                             0.16f  * inv_sensitivity,
+                             max_dir) *
+                  green_detection_accept
+                : 0.f;
+            const float c_hue = std::max(balanced_hue,
+                                         std::max(red_purple_hue_gate,
+                                                  green_unbalanced_hue));
             const bool abs_is_purple = purple_abs >= green_abs;
             const float abs_excess = abs_is_purple ? purple_abs : green_abs;
             const float c_abs = smoothstep(chroma_threshold * 0.35f * inv_sensitivity,
@@ -4495,7 +4533,8 @@ bool CPUAccelerator::defringe(
             const float green_soft_edge_boost = (enable_green_defringe && !is_purple)
                 ? c_edge_low * smoothstep(0.05f * inv_sensitivity,
                                           0.20f * inv_sensitivity,
-                                          max_dir)
+                                          max_dir) *
+                  green_detection_accept
                 : 0.f;
             const float c_edge = std::max(c_edge_core,
                                           std::max(c_edge_low * linked_fringe * 1.45f,
@@ -4554,7 +4593,8 @@ bool CPUAccelerator::defringe(
                     const float peak_neighbourhood =
                         smoothstep(0.005f, 0.030f, blur_fringe_support[i]);
                     const float green_peak_mask =
-                        peak_chroma_signal * peak_neighbourhood * c_bright * c_hue;
+                        peak_chroma_signal * peak_neighbourhood * c_bright * c_hue *
+                        green_detection_accept;
                     mask = std::max(mask, green_peak_mask * scene_highlight_gate);
                 }
                 const float green_highlight_protect =

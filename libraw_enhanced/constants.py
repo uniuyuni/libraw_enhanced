@@ -210,6 +210,57 @@ def validate_demosaic_algorithm(algorithm):
         return True
     return False
 
+def get_default_params():
+    """High-level postprocess() defaults as a plain dictionary."""
+    return {
+        'use_camera_wb': True,
+        'half_size': False,
+        'four_color_rgb': False,
+        'output_bps': OutputBitDepth.UInt16.value,
+        'user_flip': -1,
+        'demosaic_algorithm': DemosaicAlgorithm.VNG,
+        'dcb_iterations': 0,
+        'dcb_enhance': False,
+        'fbdd_noise_reduction': FBDDNoiseReduction.Off,
+        'noise_thr': 0.0,
+        'median_filter_passes': 0,
+        'use_auto_wb': False,
+        'user_wb': [1.0, 1.0, 1.0, 1.0],
+        'output_color_space': ColorSpace.sRGB,
+        'bright': 1.0,
+        'no_auto_bright': False,
+        'auto_bright_thr': 0.01,
+        'adjust_maximum_thr': 0.75,
+        'highlight_mode': HighlightMode.Clip,
+        'exp_shift': 1.0,
+        'exp_preserve_highlights': 0.0,
+        'gamma_power': 0.0,
+        'gamma_slope': 0.0,
+        'no_auto_scale': False,
+        'chromatic_aberration_red': 1.0,
+        'chromatic_aberration_blue': 1.0,
+        'user_black': -1,
+        'user_sat': -1,
+        'bad_pixels_path': '',
+        'use_gpu_acceleration': False,
+        'preprocess': False,
+        'defringe': False,
+        'defringe_radius': 10.0,
+        'defringe_strength': 10.0,
+        'defringe_green': False,
+        'defringe_green_strength': 0.3,
+        'lateral_ca_correction': False,
+        'lateral_ca_cell_size': 96,
+        'lateral_ca_max_iterations': 3,
+        'lateral_ca_max_shift': 6.0,
+        'lateral_ca_min_confidence': 0.02,
+        'lateral_ca_pyramid_levels': 3,
+        'axial_ca_correction': False,
+        'axial_ca_radius': 6,
+        'axial_ca_epsilon': 1e-4,
+        'axial_ca_strength': 0.3,
+    }
+
 # Export all constants for wildcard import
 __all__ = [
     # Enum classes

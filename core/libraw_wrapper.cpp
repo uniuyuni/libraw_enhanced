@@ -4,6 +4,7 @@
 #include <chrono>
 #include <iomanip>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
@@ -119,6 +120,7 @@ class LibRawWrapper::Impl {
 public:
   LibRaw processor;
   ProcessingTimes timing_info; // 処理時間情報
+  std::vector<uint8_t> input_buffer;
 
 #ifdef __arm64__
   std::unique_ptr<Accelerator> accelerator;
@@ -1656,7 +1658,17 @@ public:
     }
     _stage("demosaic");
 
-    float threshold = maximum_result.maximum / maximum_result.data_maximum;
+    float threshold = 1.f;
+    if (std::isfinite(maximum_result.maximum) &&
+        std::isfinite(maximum_result.data_maximum) &&
+        maximum_result.maximum > 0.f && maximum_result.data_maximum > 0.f) {
+      threshold = maximum_result.maximum / maximum_result.data_maximum;
+    } else {
+      std::cout << "⚠️ Invalid maximum/data_maximum, using saturation threshold 1.0"
+                << " (maximum=" << maximum_result.maximum
+                << ", data_maximum=" << maximum_result.data_maximum << ")"
+                << std::endl;
+    }
 
     // Soft highlight mask shared between recover_highlights and
     // enhance_micro_contrast.  Only allocated when both stages can run,
@@ -1817,19 +1829,24 @@ public:
       _stage("defringe");
     }
 
-    // Get camera-specific color transformation matrix
-    camera_matrix = compute_camera_transform(
-        imgdata.idata.make, imgdata.idata.model, params.output_color_space);
-    if (!camera_matrix.valid) {
-      std::cout << "⚠️ Camera not in database, using fallback matrix"
+    if (params.output_color_space == ColorSpace::Raw) {
+      std::cout << "✅ Output color Raw, skipping color space conversion"
                 << std::endl;
-      camera_matrix.set_default();
-    }
+    } else {
+      // Get camera-specific color transformation matrix
+      camera_matrix = compute_camera_transform(
+          imgdata.idata.make, imgdata.idata.model, params.output_color_space);
+      if (!camera_matrix.valid) {
+        std::cout << "⚠️ Camera not in database, using fallback matrix"
+                  << std::endl;
+        camera_matrix.set_default();
+      }
 
-    // Convert Color space
-    if (!accelerator->convert_color_space(rgb_buffer, rgb_buffer,
-                                          camera_matrix.transform)) {
-      return false;
+      // Convert Color space
+      if (!accelerator->convert_color_space(rgb_buffer, rgb_buffer,
+                                            camera_matrix.transform)) {
+        return false;
+      }
     }
     _stage("convert_color_space");
 
@@ -1863,11 +1880,14 @@ public:
     // Step 1: raw2image_start equivalent - initialization
     raw2image_start();
 
-    // Step 2: Handle existing processed image
+    // Step 2: Rebuild the processed image every time. The downstream pipeline
+    // mutates imgdata.image in-place, so reusing it makes repeated postprocess()
+    // calls subtract black level and green-balance more than once.
     if (imgdata.image) {
-      std::cout << "ℹ️ Image data already exists, skipping conversion"
+      std::cout << "ℹ️ Resetting existing image data before conversion"
                 << std::endl;
-      return 0;
+      std::free(imgdata.image);
+      imgdata.image = nullptr;
     }
 
     // Step 3: Check for raw data availability
@@ -2486,9 +2506,40 @@ public:
 #endif
   }
 
+  void clear_processed_buffers() {
+#ifdef __arm64__
+    rgb_buffer = ImageBufferFloat{};
+    rgb_buffer_image.clear();
+    last_color_matrix.fill(0.0f);
+#endif
+  }
+
   int load_file(const std::string &filename) {
     start_timer();
+    processor.recycle();
+    input_buffer.clear();
+    clear_processed_buffers();
     int result = processor.open_file(filename.c_str());
+    timing_info.file_load_time = get_elapsed_time();
+
+    return result;
+  }
+
+  int load_buffer(const std::vector<uint8_t> &buffer) {
+    start_timer();
+    processor.recycle();
+    input_buffer = buffer;
+    clear_processed_buffers();
+
+    if (input_buffer.empty()) {
+      timing_info.file_load_time = get_elapsed_time();
+      return LIBRAW_FILE_UNSUPPORTED;
+    }
+
+    int result = processor.open_buffer(input_buffer.data(), input_buffer.size());
+    if (result != LIBRAW_SUCCESS) {
+      input_buffer.clear();
+    }
     timing_info.file_load_time = get_elapsed_time();
 
     return result;
@@ -2688,8 +2739,12 @@ public:
     processor.imgdata.params.exp_preser = params.exp_preserve_highlights;
 
     // Gamma correction parameters
-    processor.imgdata.params.gamm[0] = 1.0 / params.gamma_power;
-    processor.imgdata.params.gamm[1] = params.gamma_slope;
+    processor.imgdata.params.gamm[0] =
+        (std::isfinite(params.gamma_power) && params.gamma_power > 0.f)
+            ? 1.0f / params.gamma_power
+            : 0.0f;
+    processor.imgdata.params.gamm[1] =
+        std::isfinite(params.gamma_slope) ? params.gamma_slope : 0.0f;
     // Set no_auto_scale
     if (params.no_auto_scale) {
       processor.imgdata.params.no_auto_scale = 1;
@@ -2794,9 +2849,7 @@ std::string LibRawWrapper::get_device_info() const {
 
 // New methods for high-level API support
 int LibRawWrapper::load_buffer(const std::vector<uint8_t> &buffer) {
-  // For prototype: just return success, actual implementation would use LibRaw
-  // buffer loading
-  return pimpl->load_file(""); // Placeholder
+  return pimpl->load_buffer(buffer);
 }
 
 std::vector<uint16_t> LibRawWrapper::get_raw_image() {
@@ -2992,6 +3045,8 @@ ProcessedImageData LibRawWrapper::process_with_dict(
 void LibRawWrapper::close() {
   // Reset LibRaw processor
   pimpl->processor.recycle();
+  pimpl->input_buffer.clear();
+  pimpl->clear_processed_buffers();
 }
 
 #ifdef __arm64__

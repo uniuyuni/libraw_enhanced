@@ -21,13 +21,13 @@ if(APPLE)
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     
-else()z
+else()
     set(APPLE_PLATFORM FALSE)
     message(STATUS "Building for non-Apple platform")
 endif()
 
 # 最適化フラグ設定
-if(__arm64__)
+if(APPLE_PLATFORM AND MACHINE_ARCH STREQUAL "arm64")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-a14")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffast-math")
@@ -63,15 +63,43 @@ if(APPLE_PLATFORM)
 endif()
 
 # LibRaw検索
+set(LIBRAW_LOCAL_PREFIX "$ENV{LIBRAW_LOCAL_PREFIX}")
+if(NOT LIBRAW_LOCAL_PREFIX)
+    set(LIBRAW_LOCAL_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libraw-install")
+elseif(NOT IS_ABSOLUTE "${LIBRAW_LOCAL_PREFIX}")
+    get_filename_component(
+        LIBRAW_LOCAL_PREFIX
+        "${LIBRAW_LOCAL_PREFIX}"
+        ABSOLUTE
+        BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+endif()
+
+find_path(LIBRAW_INCLUDE_DIR libraw/libraw.h
+    PATHS "${LIBRAW_LOCAL_PREFIX}/include"
+    NO_DEFAULT_PATH
+)
+find_library(LIBRAW_LIBRARIES raw
+    PATHS "${LIBRAW_LOCAL_PREFIX}/lib"
+    NO_DEFAULT_PATH
+)
+if(LIBRAW_INCLUDE_DIR AND LIBRAW_LIBRARIES)
+    set(LIBRAW_FOUND TRUE)
+    message(STATUS "Found LibRaw (project-local): ${LIBRAW_LIBRARIES}")
+else()
+    unset(LIBRAW_INCLUDE_DIR CACHE)
+    unset(LIBRAW_LIBRARIES CACHE)
+endif()
+
 find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
+if(PkgConfig_FOUND AND NOT LIBRAW_FOUND)
     pkg_check_modules(LIBRAW libraw)
 endif()
 
 if(NOT LIBRAW_FOUND)
     # Homebrewパスを確認
     if(APPLE_PLATFORM)
-        if(__arm64__)
+        if(MACHINE_ARCH STREQUAL "arm64")
             set(HOMEBREW_PREFIX "/opt/homebrew")
         else()
             set(HOMEBREW_PREFIX "/usr/local")
@@ -230,13 +258,13 @@ if(APPLE_PLATFORM)
     # Metal Shader検証ターゲット
     add_custom_target(validate_metal_shaders
         COMMAND xcrun -sdk macosx metal -c -o /dev/null -Wno-unused-variable
-                ${CMAKE_CURRENT_SOURCE_DIR}/core/shaders/*.metal || true
+                ${CMAKE_CURRENT_SOURCE_DIR}/core/metal/*.metal || true
         COMMENT "Validating Metal shaders"
         VERBATIM
     )
     
     # Apple Silicon固有の最適化レポート
-    if(__arm64__)
+    if(MACHINE_ARCH STREQUAL "arm64")
         add_custom_target(optimization_report
             COMMAND ${CMAKE_CXX_COMPILER} ${CMAKE_CXX_FLAGS} -S -mllvm -print-after-all
                     ${CMAKE_CURRENT_SOURCE_DIR}/core/libraw_wrapper.cpp -o /dev/null 2>&1 | 

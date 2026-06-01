@@ -10,8 +10,6 @@ import os
 import sys
 import platform
 import subprocess
-import sysconfig
-import shutil
 import warnings
 from pathlib import Path
 from setuptools import setup
@@ -59,8 +57,21 @@ def get_libomp_paths():
     return None, None
 
 def _default_libraw_install_prefix():
-    """platypus/third_party/libraw-install（setup.py は libraw_enhanced/ 直下）"""
-    return Path(__file__).resolve().parent.parent / "third_party" / "libraw-install"
+    """Project-local third_party/libraw-install."""
+    return Path(__file__).resolve().parent / "third_party" / "libraw-install"
+
+
+def _libraw_dylib_install_name(lib_dir):
+    """Return the install name embedded in the local LibRaw dylib, if any."""
+    dylib = Path(lib_dir) / "libraw.24.dylib"
+    if not dylib.exists() or not is_apple_platform():
+        return None
+    try:
+        output = subprocess.check_output(["otool", "-D", str(dylib)], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[1] if len(lines) > 1 else None
 
 
 def find_libraw():
@@ -221,6 +232,29 @@ class CustomBuildExt(build_ext):
     def build_extension(self, ext):
         """個別拡張モジュールのビルド"""
         super().build_extension(ext)
+        self._fix_macos_libraw_reference(ext)
+
+    def _fix_macos_libraw_reference(self, ext):
+        if not is_apple_platform():
+            return
+        ext_path = Path(self.get_ext_fullpath(ext.name)).resolve()
+        lib_dirs = getattr(ext, "library_dirs", [])
+        libraw_dir = next(
+            (Path(path) for path in lib_dirs
+             if (Path(path) / "libraw.24.dylib").exists()),
+            None,
+        )
+        if libraw_dir is None:
+            return
+
+        old_name = _libraw_dylib_install_name(libraw_dir)
+        new_name = "@rpath/libraw.24.dylib"
+        if old_name and old_name != new_name:
+            subprocess.run(
+                ["install_name_tool", "-change", old_name, new_name,
+                 str(ext_path)],
+                check=True,
+            )
 
 
 def create_extension():
@@ -298,6 +332,9 @@ def create_extension():
             extra_compile_args.extend(['-Xpreprocessor', '-fopenmp'])
             extra_link_args.extend(['-lomp'])
         # ローカルビルド LibRaw / libomp を実行時に解決
+        extra_link_args.extend([
+            "-Wl,-rpath,@loader_path/../third_party/libraw-install/lib"
+        ])
         for _ld in libraw_lib_dirs + ([libomp_lib] if libomp_lib else []):
             if _ld:
                 extra_link_args.extend(["-Wl,-rpath," + _ld])

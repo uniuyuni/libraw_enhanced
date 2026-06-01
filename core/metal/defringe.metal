@@ -452,22 +452,6 @@ kernel void defringe_main(
              min_dir) *
           ss(0.18f, 0.58f, balance)
         : 0.0f;
-    const float green_unbalanced_hue =
-        (p.enable_green_defringe != 0u && !is_purple)
-        ? ss(0.035f * p.inv_sensitivity,
-             0.16f  * p.inv_sensitivity,
-             max_dir)
-        : 0.0f;
-    const float c_hue = max(balanced_hue,
-                            max(red_purple_hue_gate, green_unbalanced_hue));
-
-    const float green_soft_edge_boost =
-        (p.enable_green_defringe != 0u && !is_purple)
-        ? c_edge_low * ss(0.05f * p.inv_sensitivity,
-                          0.20f * p.inv_sensitivity,
-                          max_dir)
-        : 0.0f;
-
     const float rb_avg = rb_avg_pre;
     const float purple_abs =
         min(max(0.0f, r0 - g0), max(0.0f, b0 - g0)) /
@@ -477,6 +461,37 @@ kernel void defringe_main(
     const float green_abs_alt = max(0.0f, g0 - min(r0, b0)) /
         max(blur_guide.read(gid).r, 0.05f);
     const float green_abs = max(green_abs_base, 0.55f * green_abs_alt);
+    const float green_chroma_accept =
+        ss(p.chroma_threshold * 1.10f * p.inv_sensitivity,
+           p.chroma_threshold * 2.20f * p.inv_sensitivity,
+           green_abs);
+    const float green_line_accept =
+        ss(0.045f, 0.140f, line_fringe_support.read(gid).r);
+    const float green_clear_edge_accept =
+        ss(0.18f, 0.42f, c_edge_core) *
+        ss(p.chroma_threshold * 1.55f * p.inv_sensitivity,
+           p.chroma_threshold * 3.00f * p.inv_sensitivity,
+           green_abs);
+    const float green_detection_accept =
+        green_chroma_accept * max(green_line_accept, green_clear_edge_accept);
+    const float green_unbalanced_hue =
+        (p.enable_green_defringe != 0u && !is_purple)
+        ? ss(0.035f * p.inv_sensitivity,
+             0.16f  * p.inv_sensitivity,
+             max_dir) *
+          green_detection_accept
+        : 0.0f;
+    const float c_hue = max(balanced_hue,
+                            max(red_purple_hue_gate, green_unbalanced_hue));
+
+    const float green_soft_edge_boost =
+        (p.enable_green_defringe != 0u && !is_purple)
+        ? c_edge_low * ss(0.05f * p.inv_sensitivity,
+                          0.20f * p.inv_sensitivity,
+                          max_dir) *
+          green_detection_accept
+        : 0.0f;
+
     const bool abs_is_purple = purple_abs >= green_abs;
     const float abs_excess = abs_is_purple ? purple_abs : green_abs;
     const float c_abs = ss(p.chroma_threshold * 0.35f * p.inv_sensitivity,
