@@ -1858,6 +1858,19 @@ public:
     }
     _stage("gamma_correct");
 
+    if (params.output_bps == 8 || params.output_bps == 16) {
+      const size_t num_pixels = rgb_buffer.width * rgb_buffer.height;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+      for (size_t i = 0; i < num_pixels; ++i) {
+        rgb_buffer.image[i][0] = std::clamp(rgb_buffer.image[i][0], 0.0f, 1.0f);
+        rgb_buffer.image[i][1] = std::clamp(rgb_buffer.image[i][1], 0.0f, 1.0f);
+        rgb_buffer.image[i][2] = std::clamp(rgb_buffer.image[i][2], 0.0f, 1.0f);
+      }
+      _stage("integer_output_clamp");
+    }
+
     {
       double total_ms = std::chrono::duration<double, std::milli>(
           _clk::now() - _t_total0).count();

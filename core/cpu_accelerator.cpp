@@ -3298,14 +3298,6 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
             float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
             float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
             float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
-            // Same highlight-safe rescale as the legacy path.
-            float maxc = std::max(r, std::max(g, b));
-            if (maxc > 1.f) {
-                float scale = 1.f / maxc;
-                r *= scale;
-                g *= scale;
-                b *= scale;
-            }
 
             rgb_output.image[idx][0] = in_r + (r - in_r) * w;
             rgb_output.image[idx][1] = in_g + (g - in_g) * w;
@@ -3320,13 +3312,6 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                 float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
                 float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
                 float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
-                float maxc = std::max(r, std::max(g, b));
-                if (maxc > 1.f) {
-                    float scale = 1.f / maxc;
-                    r *= scale;
-                    g *= scale;
-                    b *= scale;
-                }
                 rgb_output.image[idx][0] = r;
                 rgb_output.image[idx][1] = g;
                 rgb_output.image[idx][2] = b;

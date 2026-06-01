@@ -164,6 +164,26 @@ def test_micro_contrast_noops_when_target_contrast_is_zero():
     np.testing.assert_array_equal(output, image)
 
 
+def test_micro_contrast_preserves_superwhite_float_values():
+    import libraw_enhanced as lre
+
+    wrapper = lre._core.LibRawWrapper()
+    image = np.ones((64, 64, 3), dtype=np.float32)
+    image[0:8, 0:8, :] = 0.0
+    image[0:8, 8:16, :] = 2.0
+    image[32, 32, :] = 1.01
+
+    try:
+        output = wrapper.enhance_micro_contrast(
+            image, threshold=0.0, strength=8.0, target_contrast=0.04
+        )
+    finally:
+        wrapper.close()
+
+    assert np.isfinite(output).all()
+    assert float(output[32, 32].max()) > 1.0
+
+
 def test_cpu_color_space_conversion_math_is_in_place_safe():
     pixel = np.array([0.25, 0.50, 0.75], dtype=np.float32)
     transform = np.array(

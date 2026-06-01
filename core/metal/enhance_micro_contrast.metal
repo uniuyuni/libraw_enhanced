@@ -153,10 +153,6 @@ kernel void enhance_micro_contrast(
         local_mean[idx].y + enhanced_high_freq.y,
         local_mean[idx].z + enhanced_high_freq.z
     );
-    float maxc = max(enhanced.x, max(enhanced.y, enhanced.z));
-    if (maxc > 1.f) {
-        enhanced /= maxc;
-    }
 
     // Two gating modes (parallels the CPU implementation):
     //   * use_mask != 0 — soft per-pixel weight from `mask`, mix()d with the
