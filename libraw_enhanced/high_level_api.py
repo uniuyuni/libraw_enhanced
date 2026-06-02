@@ -186,7 +186,7 @@ class RawImage:
                    # Highlight processing
                    highlight_mode: HighlightMode = HighlightMode.Clip,
                    
-                   # NEW: Exposure correction parameters (rawpy compatible)
+                   # Exposure correction parameters (rawpy compatible)
                    exp_shift: float = 1.0,
                    exp_preserve_highlights: float = 0.0,
                    
@@ -194,14 +194,14 @@ class RawImage:
                    gamma: Tuple[float, float] = (0.0, 0.0), # (2.222, 4.5),
                    no_auto_scale: bool = False,
                    
-                   # NEW: Color correction parameters (rawpy compatible)
+                   # Color correction parameters (rawpy compatible)
                    chromatic_aberration: Optional[Tuple[float, float]] = None,
                    
                    # User adjustments
                    user_black: Optional[int] = None,
                    user_sat: Optional[int] = None,
                    
-                   # NEW: File-based corrections (rawpy compatible)
+                   # File-based corrections (rawpy compatible)
                    bad_pixels_path: Optional[str] = None,
                    
                    # LibRaw Enhanced extensions
@@ -229,18 +229,16 @@ class RawImage:
                    axial_ca_epsilon: float = 1e-4,
                    axial_ca_strength: float = 0.3) -> np.ndarray:
         """
-        RAW画像の現像処理を実行 (rawpy完全互換 + 拡張機能)
-
-        
-        This method provides full rawpy.postprocess() compatibility with all
-        parameters, plus LibRaw Enhanced extensions.
+        Develop a RAW image using rawpy-compatible parameters plus
+        LibRaw Enhanced corrections.
         
         Args:
             # Basic processing parameters
             use_camera_wb: Use camera white balance settings
             half_size: Output half-size image for speed
             four_color_rgb: Use separate interpolation for two green components
-            output_bps: Output bit depth (8 or 16)
+            output_bps: Output bit depth. 8/16 return integer arrays clipped
+                to display range; 32 returns float32 and preserves HDR values.
             user_flip: Manual image rotation (-1=auto, 0,1,2,3=angles)
             
             # Demosaicing parameters
@@ -267,9 +265,11 @@ class RawImage:
             adjust_maximum_thr: Maximum adjustment threshold
             
             # Highlight processing
-            highlight_mode: Highlight recovery mode (clip, blend, rebuild)
+            highlight_mode: Highlight recovery mode. Use
+                RebuildAndMicroContrast, RebuildAndDetailToneMap, or
+                RebuildAndToneMap for the LibRaw Enhanced highlight stages.
             
-            # Exposure correction (NEW - rawpy compatible)
+            # Exposure correction
             exp_shift: Exposure shift in linear scale (0.25-8.0)
             exp_preserve_highlights: Highlight preservation (0.0-1.0)
             
@@ -291,19 +291,19 @@ class RawImage:
             user_black: Custom black level (-1=auto)
             user_sat: Custom saturation level (-1=auto)
             
-            # File-based corrections (NEW - rawpy compatible)
+            # File-based corrections
             bad_pixels_path: Path to bad pixels file
             
             # LibRaw Enhanced extensions
-            metal_acceleration: Use Metal Performance Shaders (Apple Silicon)
-            use_gpu_acceleration: Alternative name for metal_acceleration (overrides if specified)
+            use_gpu_acceleration: Use the Metal pipeline when available.
             preprocess: If true, stops processing before demosaicing and returns the raw/modified bayer data.
 
             # Defringe parameters
             defringe: If True, apply linear RGB chromatic aberration fringe removal before output gamma.
             defringe_radius: Gaussian blur radius for fringe detection (default 10.0).
             defringe_strength: Correction strength and detection sensitivity (default 10.0).
-            defringe_green: Also correct green fringes. Disabled by default to protect natural green highlights.
+            defringe_green: Also correct green fringes. Disabled by default because
+                weak green dominance can be real texture, not a fringe.
 
         Returns:
 
@@ -318,10 +318,10 @@ class RawImage:
         # Build processing parameters from all rawpy-compatible parameters
         from .constants import DemosaicAlgorithm
         
-        # Handle GPU acceleration parameters (allow use_gpu_acceleration to override)
+        # Forward extension flags to the C++ processing layer.
         gpu_acceleration = use_gpu_acceleration
         
-        # Create parameters structure (assuming it will be passed to C++ layer)
+        # Build the parameter dict consumed by the pybind/C++ wrapper.
         params = {
             # Basic processing parameters
             'use_camera_wb': use_camera_wb,
@@ -356,7 +356,7 @@ class RawImage:
             # Highlight processing
             'highlight_mode': int(highlight_mode),
             
-            # NEW: Exposure correction parameters
+            # Exposure correction parameters
             'exp_shift': exp_shift,
             'exp_preserve_highlights': exp_preserve_highlights,
             
@@ -365,7 +365,7 @@ class RawImage:
             'gamma_slope': gamma[1],
             'no_auto_scale': no_auto_scale,
             
-            # NEW: Color correction parameters
+            # Color correction parameters
             'chromatic_aberration_red': chromatic_aberration[0] if chromatic_aberration else 1.0,
             'chromatic_aberration_blue': chromatic_aberration[1] if chromatic_aberration else 1.0,
             
@@ -373,7 +373,7 @@ class RawImage:
             'user_black': user_black if user_black is not None else -1,
             'user_sat': user_sat if user_sat is not None else -1,
             
-            # NEW: File-based corrections
+            # File-based corrections
             'bad_pixels_path': bad_pixels_path if bad_pixels_path is not None else '',
             
             # LibRaw Enhanced extensions
@@ -507,7 +507,7 @@ class RawImage:
         トーンマッピングを実行し、新しい numpy 配列を返す。
 
         Args:
-            image: 入力画像 (H, W, 3) float32 numpy 配列, 値域 0.0-1.0
+            image: 入力画像 (H, W, 3) float32 numpy 配列。HDR 値も可。
             after_scale: 処理後のスケール係数（デフォルト 1.0）
 
         Returns:
@@ -528,9 +528,10 @@ class RawImage:
                                target_contrast: float = 0.06) -> np.ndarray:
         """
         マイクロコントラスト強調を実行し、新しい numpy 配列を返す。
+        float32 の superwhite/HDR 値は 1.0 に丸めません。
 
         Args:
-            image: 入力画像 (H, W, 3) float32 numpy 配列, 値域 0.0-1.0
+            image: 入力画像 (H, W, 3) float32 numpy 配列。HDR 値も可。
             threshold: 処理対象の閾値。-1 のとき maximum/data_maximum を自動使用。
             strength: 強調の強さ（デフォルト 8.0）
             target_contrast: 目標コントラスト値（デフォルト 0.06）

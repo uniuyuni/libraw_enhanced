@@ -1,7 +1,7 @@
 # LibRaw Enhanced
 
 Enhanced LibRaw Python wrapper with Apple Silicon Metal GPU acceleration.  
-Version **0.11.7**
+Version **0.11.13**
 
 ## Features
 
@@ -9,7 +9,7 @@ Version **0.11.7**
 - Apple Silicon Metal GPU acceleration for demosaicing, defringing, CA correction, tone mapping, and more
 - Pyramidal Lucas-Kanade lateral chromatic aberration (CA) correction (CPU)
 - Guided-filter axial CA correction (CPU + Metal GPU via MPS)
-- Edge-gated Gaussian chroma-suppression defringe — purple/green fringe removal (CPU + Metal GPU, ~3.7× speedup)
+- Edge-gated log-ratio defringe — purple/green fringe removal (CPU + Metal GPU, ~3.7× speedup)
 - Detail tone mapping (CPU + Metal GPU, ~3.7× speedup on 51 MP)
 - Micro-contrast enhancement (CPU + Metal GPU)
 - Full Bayer (linear, AMaZE) and X-Trans (1-pass, 3-pass) demosaicing on Metal GPU
@@ -35,8 +35,12 @@ import libraw_enhanced as lre
 with lre.imread('image.CR2') as raw:
     rgb = raw.postprocess(
         use_camera_wb=True,
-        use_gpu_acceleration=True,   # enable Metal GPU pipeline
-        defringe=True,               # remove purple/green fringes
+        output_bps=32,               # keep float32 HDR / superwhite values
+        output_color=lre.ColorSpace.Raw,
+        gamma=(1.0, 1.0),
+        highlight_mode=lre.HighlightMode.RebuildAndDetailToneMap,
+        use_gpu_acceleration=True,   # enable Metal GPU pipeline when available
+        defringe=True,               # remove purple fringes
         lateral_ca_correction=True,  # sub-pixel lateral CA registration
         axial_ca_correction=True,    # guided-filter axial CA cleanup
     )
@@ -69,7 +73,7 @@ Develops the RAW image and returns an `(H, W, 3)` NumPy array.
 | `user_wb` | tuple[float,float,float,float] | `None` | Manual WB multipliers (R,G,B,G) |
 | `half_size` | bool | `False` | Half-size output for speed |
 | `four_color_rgb` | bool | `False` | Separate interpolation for two green channels |
-| `output_bps` | int | `16` | Output bit depth (8 or 16) |
+| `output_bps` | int | `16` | Output bit depth (`8`, `16`, or `32`). `32` returns float32 and preserves HDR values above 1.0 |
 | `user_flip` | int | `None` | Rotation override (-1=auto, 0/1/2/3) |
 | `demosaic_algorithm` | DemosaicAlgorithm | `VNG` | Demosaicing algorithm |
 | `dcb_iterations` | int | `0` | DCB interpolation iterations |
@@ -82,7 +86,7 @@ Develops the RAW image and returns an `(H, W, 3)` NumPy array.
 | `no_auto_bright` | bool | `False` | Disable automatic brightness |
 | `auto_bright_thr` | float | `None` | Auto-brightness clip threshold |
 | `adjust_maximum_thr` | float | `0.75` | Maximum adjustment threshold |
-| `highlight_mode` | HighlightMode | `Clip` | Highlight recovery mode |
+| `highlight_mode` | HighlightMode | `Clip` | Highlight recovery mode. Enhanced modes: `RebuildAndMicroContrast` (4), `RebuildAndDetailToneMap` (5), `RebuildAndToneMap` (6) |
 | `exp_shift` | float | `1.0` | Exposure shift in linear scale (0.25–8.0) |
 | `exp_preserve_highlights` | float | `0.0` | Highlight preservation (0.0–1.0) |
 | `gamma` | tuple[float,float] | `(0.0, 0.0)` | Gamma curve (power, slope) |
@@ -97,7 +101,7 @@ Develops the RAW image and returns an `(H, W, 3)` NumPy array.
 | `defringe` | bool | `False` | Enable chroma-suppression fringe removal |
 | `defringe_radius` | float | `10.0` | Gaussian blur radius for fringe detection (px) |
 | `defringe_strength` | float | `10.0` | Correction strength / detection sensitivity |
-| `defringe_green` | bool | `False` | Also correct green fringes (off by default to protect natural highlights) |
+| `defringe_green` | bool | `False` | Also correct green fringes. More conservative than before, but still best kept off unless needed |
 | `defringe_green_strength` | float | `0.3` | Green fringe correction strength |
 | **Lateral CA** | | | |
 | `lateral_ca_correction` | bool | `False` | Pyramidal LK sub-pixel lateral CA registration (post-demosaic) |
@@ -114,7 +118,7 @@ Develops the RAW image and returns an `(H, W, 3)` NumPy array.
 
 ### Standalone methods
 
-These operate on an already-processed `(H, W, 3) float32` NumPy array (linear RGB, 0.0–1.0):
+These operate on an already-processed `(H, W, 3) float32` NumPy array. Linear HDR values above `1.0` are allowed:
 
 ```python
 with lre.imread('image.CR2') as raw:
@@ -131,6 +135,18 @@ with lre.imread('image.CR2') as raw:
     # Defringe (also available standalone)
     defringed = raw.defringe(rgb, radius=10.0, strength=10.0, defringe_green=False)
 ```
+
+### HDR / clipping notes
+
+- `output_bps=32` returns float32 without the final integer-output clamp, so HDR/superwhite values can remain above `1.0`.
+- `output_bps=8` and `output_bps=16` are clamped to `[0, 1]` at the end of the pipeline before integer conversion.
+- `output_color=ColorSpace.Raw` skips color-space matrix conversion. Use it when you want camera/linear RGB for analysis or your own downstream transform.
+- `gamma=(1.0, 1.0)` disables output gamma correction. This is the usual choice for linear HDR workflows.
+- Micro-contrast preserves superwhite float values. Tone mapping still compresses highlights before micro-contrast when `highlight_mode` is `RebuildAndDetailToneMap` or `RebuildAndToneMap`.
+
+### CA and defringe guidance
+
+Start with `defringe=True` and `defringe_green=False`. Enable `lateral_ca_correction` only when lateral color shifts are visible, and use `defringe_green=True` only for clear green fringes. Running every correction at once can hide the source of artifacts, especially on fine texture.
 
 ### Platform detection
 

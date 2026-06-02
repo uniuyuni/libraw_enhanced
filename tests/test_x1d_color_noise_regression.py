@@ -109,7 +109,7 @@ def _process_x1d(all_corrections, **overrides):
         "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
         "output_color": lre.ColorSpace.Raw,
         "gamma": (1.0, 1.0),
-        "highlight_mode": 5,
+        "highlight_mode": lre.HighlightMode.RebuildAndDetailToneMap,
         "no_auto_bright": True,
         "use_gpu_acceleration": _env_bool("LRE_X1D_USE_GPU"),
     }

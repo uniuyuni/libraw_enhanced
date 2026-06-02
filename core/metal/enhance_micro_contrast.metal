@@ -164,5 +164,6 @@ kernel void enhance_micro_contrast(
                   ? clamp(mask[idx], 0.f, 1.f)
                   : ((in_rgb.y >= params.threshold) ? 1.f : 0.f);
 
+    // Preserve superwhite float values; integer output clamps later.
     rgb_output[idx] = in_rgb + (enhanced - in_rgb) * w;
 }

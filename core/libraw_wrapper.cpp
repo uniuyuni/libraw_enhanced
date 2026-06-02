@@ -1694,7 +1694,10 @@ public:
       _stage("highlight_recovery");
     }
 
-    // Tone mapping / highlight detail recovery
+    // Highlight detail stages:
+    //   4: RebuildAndMicroContrast
+    //   5: RebuildAndDetailToneMap
+    //   6: RebuildAndToneMap
     float target_contrast = 0.04f;
     if (params.highlight_mode > 5) {
       accelerator->tone_mapping(rgb_buffer, rgb_buffer, 1.f);
@@ -1858,6 +1861,8 @@ public:
     }
     _stage("gamma_correct");
 
+    // Only integer outputs need display-range clipping.  Float32 output keeps
+    // HDR/superwhite values for downstream tone mapping or analysis.
     if (params.output_bps == 8 || params.output_bps == 16) {
       const size_t num_pixels = rgb_buffer.width * rgb_buffer.height;
 #ifdef _OPENMP

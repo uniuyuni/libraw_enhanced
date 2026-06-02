@@ -454,7 +454,7 @@ def test_xt5_defringe_integration():
         img_no_df = raw.postprocess(
             use_camera_wb=True,
             output_bps=16,
-            highlight_mode=5,
+            highlight_mode=lre.HighlightMode.RebuildAndDetailToneMap,
             #gamma=(1.0, 1.0),
         )
     print(f"  Without defringe: {time.perf_counter()-t0:.2f}s, shape={img_no_df.shape}, dtype={img_no_df.dtype}")
@@ -466,7 +466,7 @@ def test_xt5_defringe_integration():
         img_df = raw.postprocess(
             use_camera_wb=True,
             output_bps=16,
-            highlight_mode=5,
+            highlight_mode=lre.HighlightMode.RebuildAndDetailToneMap,
             #gamma=(1.0, 1.0),
             defringe=True,
             #defringe_strength=10.0,

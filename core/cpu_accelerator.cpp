@@ -3299,6 +3299,7 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
             float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
             float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
 
+            // Preserve superwhite float values; integer output clamps later.
             rgb_output.image[idx][0] = in_r + (r - in_r) * w;
             rgb_output.image[idx][1] = in_g + (g - in_g) * w;
             rgb_output.image[idx][2] = in_b + (b - in_b) * w;
@@ -3312,6 +3313,7 @@ bool CPUAccelerator::enhance_micro_contrast(const ImageBufferFloat& rgb_input,
                 float r = local_mean[idx][0] + enhanced_high_freq[idx][0];
                 float g = local_mean[idx][1] + enhanced_high_freq[idx][1];
                 float b = local_mean[idx][2] + enhanced_high_freq[idx][2];
+                // Preserve superwhite float values; integer output clamps later.
                 rgb_output.image[idx][0] = r;
                 rgb_output.image[idx][1] = g;
                 rgb_output.image[idx][2] = b;

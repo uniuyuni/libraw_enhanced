@@ -47,6 +47,14 @@ def test_constants_all_exports_exist():
     assert not missing
 
 
+def test_highlight_mode_enhanced_names_match_pipeline_thresholds():
+    import libraw_enhanced as lre
+
+    assert int(lre.HighlightMode.RebuildAndMicroContrast) == 4
+    assert int(lre.HighlightMode.RebuildAndDetailToneMap) == 5
+    assert int(lre.HighlightMode.RebuildAndToneMap) == 6
+
+
 def test_optimization_info_property_is_usable():
     from libraw_enhanced.high_level_api import RawImage
 

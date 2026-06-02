@@ -24,11 +24,18 @@ class ColorSpace(IntEnum):
 
 # Highlight handling modes
 class HighlightMode(IntEnum):
-    """ハイライト処理モード（LibRaw互換）"""
-    Clip = 0        # クリッピング
-    Unclip = 1      # アンクリップ
-    Blend = 2       # ブレンド
-    Rebuild = 3     # 再構築
+    """ハイライト処理モード。
+
+    0-3 は LibRaw/rawpy 互換名。4 以上は LibRaw Enhanced の拡張で、
+    再構築後にどの追加段を有効にするかを明示する。
+    """
+    Clip = 0                         # クリッピング
+    Unclip = 1                       # アンクリップ
+    Blend = 2                        # ブレンド
+    Rebuild = 3                      # ハイライト再構築
+    RebuildAndMicroContrast = 4      # 再構築 + ハイライト部マイクロコントラスト
+    RebuildAndDetailToneMap = 5      # 再構築 + detail-preserving tone map + micro-contrast
+    RebuildAndToneMap = 6            # 再構築 + standard tone map + micro-contrast
 
 
 # FBDD Noise Reduction

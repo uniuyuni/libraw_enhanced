@@ -95,7 +95,7 @@ def process_raw_file(raw_path, output_dir):
         "demosaic_algorithm": lre.DemosaicAlgorithm.AMaZE,
         "use_gpu_acceleration": True,
         "output_color": lre.ColorSpace.ProPhotoRGB,
-        "highlight_mode": 5,
+        "highlight_mode": lre.HighlightMode.RebuildAndDetailToneMap,
         #"gamma": (1.0, 1.0),
     }
     test_configs = [
