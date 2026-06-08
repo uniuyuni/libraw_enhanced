@@ -20,8 +20,7 @@ cmake = "*"
 make = "*"
 
 [activation.env]
-# setup.py の既定値 (/Users/.../PythonProjects/third_party/...) を上書きして、
-# このリポジトリ内に libraw-install を作る。
+# setup.py の既定値を明示し、このリポジトリ内に libraw-install を作る。
 LIBRAW_LOCAL_PREFIX = "./third_party/libraw-install"
 
 [tasks]
