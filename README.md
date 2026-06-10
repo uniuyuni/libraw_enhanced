@@ -220,3 +220,21 @@ pip install -e ".[dev]"
 ```
 
 Set `LIBRAW_ENHANCED_DEBUG=1` for verbose initialisation output.
+
+## Pixi を使わないセットアップ
+
+このリポジトリには `pixi` を使った開発環境定義（`pixi.toml`）がありますが、`pixi` を使わずに同等の環境を再構築するために、リポジトリルートに `setup.sh` を用意しています。
+
+使い方:
+
+```bash
+./setup.sh
+```
+
+このスクリプトは以下を行います:
+- `.pixi/libraw-install` に LibRaw をビルド・インストール（`external/LibRaw-master` が存在する場合）
+- 仮想環境を `.venv` に作成し、`pip install -e "[dev]"` を実行
+- 環境変数 `LIBRAW_LOCAL_PREFIX` を `.pixi/libraw-install` に設定してセットアップ
+
+ビルドに必要なシステム依存（`cmake`, `make`, `pkg-config`, `libomp` など）は自動でインストールしません。macOS では `brew install libomp cmake pkg-config` を推奨します。
+

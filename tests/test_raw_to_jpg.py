@@ -118,6 +118,8 @@ def process_raw_file(raw_path, output_dir):
             with lre.imread(str(raw_path)) as raw_fresh:
                 # 画像情報表示
                 try:
+                    geometry = raw_fresh.get_output_geometry()
+                    print(f"📐 RAW geometry: {geometry['width']}x{geometry['height']}")
                     print(f"📏 Dimensions: {raw_fresh.sizes.width}x{raw_fresh.sizes.height}")
                     camera_info = raw_fresh.camera_info
                     print(f"📱 Camera: {camera_info.get('make','?')} {camera_info.get('model','?')}")
