@@ -20,10 +20,11 @@ cmake = "*"
 make = "*"
 
 [activation.env]
-# setup.py の既定値を明示し、このリポジトリ内に libraw-install を作る。
-LIBRAW_LOCAL_PREFIX = "./third_party/libraw-install"
+# setup.py の既定値を明示し、.pixi 環境内に libraw-install を作る。
+# これにより pixi activation 環境でビルド・インストールすると .pixi/libraw-install を参照します。
+LIBRAW_LOCAL_PREFIX = "./.pixi/libraw-install"
 
 [tasks]
-build-libraw = "mkdir -p \"./third_party/libraw-install\" && cd \"./external/LibRaw-master\" && ./configure --prefix=\"$(pwd)/../../third_party/libraw-install\" && make -j$(sysctl -n hw.ncpu) && make install"
+build-libraw = "mkdir -p \"./.pixi/libraw-install\" && cd \"./external/LibRaw-master\" && ./configure --prefix=\"$(pwd)/../../.pixi/libraw-install\" && make -j$(sysctl -n hw.ncpu) && make install"
 install-libraw-enhanced = "python -m pip install -e \".[dev]\""
 test = "pytest tests -v"
