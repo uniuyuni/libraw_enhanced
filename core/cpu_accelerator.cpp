@@ -3480,22 +3480,30 @@ static void lk_estimate_level(const std::vector<float>& G_plane,
     }
 }
 
-// 3x3 box-smooth a per-cell map (single pass).
-static void smooth_3x3_cells(std::vector<float>& m, size_t map_w, size_t map_h) {
+// 3x3 confidence-weighted smooth/fill for a per-cell shift map.  This keeps
+// reliable border/edge cells from being diluted by zeroed low-confidence
+// neighbours, while still filling weak cells from nearby reliable estimates.
+static void smooth_3x3_cells_weighted(std::vector<float>& m,
+                                      const std::vector<float>& weights,
+                                      size_t map_w, size_t map_h) {
     std::vector<float> out(m.size(), 0.f);
     for (int cy = 0; cy < static_cast<int>(map_h); cy++) {
         for (int cx = 0; cx < static_cast<int>(map_w); cx++) {
-            float acc = 0.f; int n = 0;
+            float acc = 0.f;
+            float wsum = 0.f;
             for (int dy = -1; dy <= 1; dy++) {
                 for (int dx = -1; dx <= 1; dx++) {
                     const int yy = cy + dy, xx = cx + dx;
                     if (yy < 0 || yy >= static_cast<int>(map_h) ||
                         xx < 0 || xx >= static_cast<int>(map_w)) continue;
-                    acc += m[yy * map_w + xx];
-                    n++;
+                    const size_t ii = static_cast<size_t>(yy) * map_w + xx;
+                    const float w = weights[ii];
+                    if (w <= 0.f) continue;
+                    acc += m[ii] * w;
+                    wsum += w;
                 }
             }
-            out[cy * map_w + cx] = n > 0 ? acc / n : 0.f;
+            out[cy * map_w + cx] = wsum > 0.f ? acc / wsum : 0.f;
         }
     }
     m.swap(out);
@@ -3590,25 +3598,28 @@ bool CPUAccelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
         }
     }
 
-    // Confidence gate (relative to strongest cell at finest level).
-    auto zero_lowconf = [&](std::vector<float>& dxm,
-                             std::vector<float>& dym,
-                             const std::vector<float>& cmap) {
+    // Confidence weights (relative to strongest cell at finest level).  The
+    // old path zeroed weak cells before an unweighted 3x3 average, which made
+    // high-confidence edge/corner estimates shrink toward zero.  Weighted
+    // smoothing rejects weak cells without diluting reliable neighbours.
+    auto confidence_weights = [&](const std::vector<float>& cmap) {
+        std::vector<float> weights(cmap.size(), 0.f);
         float maxc = 0.f;
         for (float c : cmap) maxc = std::max(maxc, c);
-        if (maxc <= 0.f) return;
+        if (maxc <= 0.f) return weights;
         const float thr = maxc * min_confidence;
-        for (size_t i = 0; i < dxm.size(); i++) {
-            if (cmap[i] < thr) { dxm[i] = 0.f; dym[i] = 0.f; }
+        for (size_t i = 0; i < cmap.size(); i++) {
+            weights[i] = cmap[i] >= thr ? cmap[i] : 0.f;
         }
+        return weights;
     };
-    zero_lowconf(dx_r, dy_r, conf_r);
-    zero_lowconf(dx_b, dy_b, conf_b);
+    const std::vector<float> weights_r = confidence_weights(conf_r);
+    const std::vector<float> weights_b = confidence_weights(conf_b);
 
-    smooth_3x3_cells(dx_r, map_w, map_h);
-    smooth_3x3_cells(dy_r, map_w, map_h);
-    smooth_3x3_cells(dx_b, map_w, map_h);
-    smooth_3x3_cells(dy_b, map_w, map_h);
+    smooth_3x3_cells_weighted(dx_r, weights_r, map_w, map_h);
+    smooth_3x3_cells_weighted(dy_r, weights_r, map_w, map_h);
+    smooth_3x3_cells_weighted(dx_b, weights_b, map_w, map_h);
+    smooth_3x3_cells_weighted(dy_b, weights_b, map_w, map_h);
 
     // Diagnostic summary.
     auto rng = [](const std::vector<float>& m) {
@@ -3627,12 +3638,14 @@ bool CPUAccelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
 
     // Apply per-pixel shifts to R and B (G untouched).
     const float clamp_shift = max_shift * static_cast<float>(1 << (effective_levels - 1));
+    const float cell_w0 = static_cast<float>(W0) / static_cast<float>(map_w);
+    const float cell_h0 = static_cast<float>(H0) / static_cast<float>(map_h);
     auto sample_shift = [&](const std::vector<float>& dxm,
                              const std::vector<float>& dym,
                              float px, float py,
                              float& out_dx, float& out_dy) {
-        const float gx_f = (px / static_cast<float>(cell_size)) - 0.5f;
-        const float gy_f = (py / static_cast<float>(cell_size)) - 0.5f;
+        const float gx_f = (px / cell_w0) - 0.5f;
+        const float gy_f = (py / cell_h0) - 0.5f;
         int gx0 = static_cast<int>(std::floor(gx_f));
         int gy0 = static_cast<int>(std::floor(gy_f));
         if (gx0 < 0) gx0 = 0;

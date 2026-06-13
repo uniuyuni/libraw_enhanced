@@ -1547,40 +1547,49 @@ bool GPUAccelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
             }
         }
 
-        // --- Confidence gate (relative to strongest cell at finest level). ---
-        auto zero_lowconf = [&](float* dxm, float* dym, const float* cmap) {
+        // --- Confidence-weighted smooth/fill (relative to strongest cell). ---
+        auto confidence_weights = [&](const float* cmap) {
+            std::vector<float> weights(Ncells, 0.f);
             float maxc = 0.f;
             for (size_t i = 0; i < Ncells; i++) maxc = std::max(maxc, cmap[i]);
-            if (maxc <= 0.f) return;
+            if (maxc <= 0.f) return weights;
             const float thr = maxc * min_confidence;
             for (size_t i = 0; i < Ncells; i++) {
-                if (cmap[i] < thr) { dxm[i] = 0.f; dym[i] = 0.f; }
+                weights[i] = cmap[i] >= thr ? cmap[i] : 0.f;
             }
+            return weights;
         };
-        zero_lowconf(dx_r, dy_r, conf_r);
-        zero_lowconf(dx_b, dy_b, conf_b);
+        const std::vector<float> weights_r = confidence_weights(conf_r);
+        const std::vector<float> weights_b = confidence_weights(conf_b);
 
-        // --- 3x3 box smooth on shift maps. ---
-        auto smooth_3x3 = [&](float* m) {
+        // --- 3x3 confidence-weighted smooth on shift maps. ---
+        auto smooth_3x3_weighted = [&](float* m, const std::vector<float>& weights) {
             std::vector<float> out(Ncells, 0.f);
             for (int cy = 0; cy < (int)map_h; cy++) {
                 for (int cx = 0; cx < (int)map_w; cx++) {
-                    float acc = 0.f; int n = 0;
+                    float acc = 0.f;
+                    float wsum = 0.f;
                     for (int dy = -1; dy <= 1; dy++) {
                         for (int dx = -1; dx <= 1; dx++) {
                             const int yy = cy + dy, xx = cx + dx;
                             if (yy < 0 || yy >= (int)map_h ||
                                 xx < 0 || xx >= (int)map_w) continue;
-                            acc += m[yy * map_w + xx]; n++;
+                            const size_t ii = yy * map_w + xx;
+                            const float w = weights[ii];
+                            if (w <= 0.f) continue;
+                            acc += m[ii] * w;
+                            wsum += w;
                         }
                     }
-                    out[cy * map_w + cx] = n > 0 ? acc / n : 0.f;
+                    out[cy * map_w + cx] = wsum > 0.f ? acc / wsum : 0.f;
                 }
             }
             std::memcpy(m, out.data(), Ncells * sizeof(float));
         };
-        smooth_3x3(dx_r); smooth_3x3(dy_r);
-        smooth_3x3(dx_b); smooth_3x3(dy_b);
+        smooth_3x3_weighted(dx_r, weights_r);
+        smooth_3x3_weighted(dy_r, weights_r);
+        smooth_3x3_weighted(dx_b, weights_b);
+        smooth_3x3_weighted(dy_b, weights_b);
 
         // --- Diagnostic summary. ---
         auto rng = [&](const float* m) {
@@ -1606,7 +1615,8 @@ bool GPUAccelerator::ca_register_lateral(const ImageBufferFloat& rgb_input,
         LateralCaApplyParams ap = {
             (uint32_t)W0, (uint32_t)H0,
             (uint32_t)map_w, (uint32_t)map_h,
-            static_cast<float>(cell_size),
+            static_cast<float>(W0) / static_cast<float>(map_w),
+            static_cast<float>(H0) / static_cast<float>(map_h),
             clamp_shift};
 
         {

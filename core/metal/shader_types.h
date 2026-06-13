@@ -162,7 +162,8 @@ typedef struct {
     uint32_t height;
     uint32_t map_w;
     uint32_t map_h;
-    float    cell_size;     // full-resolution cell side (level-0 pixels)
+    float    cell_w_f;      // width / map_w at full resolution
+    float    cell_h_f;      // height / map_h at full resolution
     float    clamp_shift;   // absolute clamp on per-pixel sampled shift
 } LateralCaApplyParams;
 

@@ -197,8 +197,8 @@ kernel void lateral_ca_apply(
     const float px = float(gid.x);
     const float py = float(gid.y);
 
-    const float gx_f = (px / p.cell_size) - 0.5f;
-    const float gy_f = (py / p.cell_size) - 0.5f;
+    const float gx_f = (px / p.cell_w_f) - 0.5f;
+    const float gy_f = (py / p.cell_h_f) - 0.5f;
     int gx0 = (int)floor(gx_f);
     int gy0 = (int)floor(gy_f);
     if (gx0 < 0) gx0 = 0;
