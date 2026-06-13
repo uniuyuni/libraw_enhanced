@@ -1919,8 +1919,16 @@ public:
     int do_crop = 0;
 
     // === ステップ1: クロップ処理が必要かチェック ===
-    // cropbox[2]とcropbox[3]が設定されている場合（~演算子でビット反転チェック）
-    if (~imgdata.params.cropbox[2] && ~imgdata.params.cropbox[3]) {
+    // Treat crop as active only when LibRaw did not leave width/height at the
+    // all-bits-one "unset" sentinel AND the dimensions are positive.  Some
+    // callers initialise cropbox to all-zero to mean "no crop"; the old
+    // bitwise-~ test interpreted that as an active 0x0 crop and threw an int
+    // exception, which reached Python as "Caught an unknown exception" before
+    // image allocation.
+    const bool has_crop =
+        ~imgdata.params.cropbox[2] && ~imgdata.params.cropbox[3] &&
+        imgdata.params.cropbox[2] > 0 && imgdata.params.cropbox[3] > 0;
+    if (has_crop) {
 
       // --- クロップ座標の初期化と検証 ---
       int crop[4]; // [left, top, width, height]
@@ -1976,46 +1984,52 @@ public:
 
       // 無効なクロップサイズの検出
       if (crop[2] <= 0 || crop[3] <= 0) {
-        throw LIBRAW_EXCEPTION_BAD_CROP;
-      }
+        std::cerr << "⚠️ Ignoring invalid cropbox after bounds check: left=" << crop[0]
+                  << " top=" << crop[1] << " width=" << crop[2]
+                  << " height=" << crop[3]
+                  << " image=" << imgdata.sizes.width << "x"
+                  << imgdata.sizes.height << std::endl;
+        do_crop = 0;
+      } else {
 
-      // --- 画像サイズ情報の更新 ---
+        // --- 画像サイズ情報の更新 ---
 
-      // マージン調整（クロップ開始位置分だけマージンを増加）
-      imgdata.sizes.left_margin += crop[0];
-      imgdata.sizes.top_margin += crop[1];
+        // マージン調整（クロップ開始位置分だけマージンを増加）
+        imgdata.sizes.left_margin += crop[0];
+        imgdata.sizes.top_margin += crop[1];
 
-      // 新しい画像サイズを設定
-      imgdata.sizes.width = crop[2];
-      imgdata.sizes.height = crop[3];
+        // 新しい画像サイズを設定
+        imgdata.sizes.width = crop[2];
+        imgdata.sizes.height = crop[3];
 
-      // 縮小処理を考慮した最終画像サイズ
-      imgdata.sizes.iheight =
-          (imgdata.sizes.height + imgdata.rawdata.ioparams.shrink) >>
-          imgdata.rawdata.ioparams.shrink; // >> IO.shrink は /2^shrink と同じ
-      imgdata.sizes.iwidth =
-          (imgdata.sizes.width + imgdata.rawdata.ioparams.shrink) >>
-          imgdata.rawdata.ioparams.shrink;
+        // 縮小処理を考慮した最終画像サイズ
+        imgdata.sizes.iheight =
+            (imgdata.sizes.height + imgdata.rawdata.ioparams.shrink) >>
+            imgdata.rawdata.ioparams.shrink; // >> IO.shrink は /2^shrink と同じ
+        imgdata.sizes.iwidth =
+            (imgdata.sizes.width + imgdata.rawdata.ioparams.shrink) >>
+            imgdata.rawdata.ioparams.shrink;
 
-      // --- Bayerフィルターパターンの再計算 ---
-      // 通常のBayerセンサー（Fuji以外）でクロップした場合
-      if (!imgdata.rawdata.ioparams.fuji_width && imgdata.idata.filters &&
-          imgdata.idata.filters >= 1000) {
+        // --- Bayerフィルターパターンの再計算 ---
+        // 通常のBayerセンサー（Fuji以外）でクロップした場合
+        if (!imgdata.rawdata.ioparams.fuji_width && imgdata.idata.filters &&
+            imgdata.idata.filters >= 1000) {
 
-        int filt, c;
+          int filt, c;
 
-        // 新しいクロップ位置での4x4 Bayerパターンを再計算
-        for (filt = c = 0; c < 16; c++) {
-          // 4x4グリッドの各位置での色を計算
-          int row = (c >> 1) + crop[1]; // 行位置 = (c/2) + top_offset
-          int col = (c & 1) + crop[0];  // 列位置 = (c%2) + left_offset
+          // 新しいクロップ位置での4x4 Bayerパターンを再計算
+          for (filt = c = 0; c < 16; c++) {
+            // 4x4グリッドの各位置での色を計算
+            int row = (c >> 1) + crop[1]; // 行位置 = (c/2) + top_offset
+            int col = (c & 1) + crop[0];  // 列位置 = (c%2) + left_offset
 
-          // FC関数で該当位置の色を取得し、2ビットずつ格納
-          filt |= fcol_bayer_native(row, col, imgdata.idata.filters) << (c * 2);
+            // FC関数で該当位置の色を取得し、2ビットずつ格納
+            filt |= fcol_bayer_native(row, col, imgdata.idata.filters) << (c * 2);
+          }
+
+          // 新しいフィルターパターンを設定
+          imgdata.idata.filters = filt;
         }
-
-        // 新しいフィルターパターンを設定
-        imgdata.idata.filters = filt;
       }
     }
 
