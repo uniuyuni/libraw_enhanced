@@ -2084,7 +2084,11 @@ public:
               << std::endl;
 
     // Step 6: Copy data based on source type
-    if (imgdata.rawdata.color4_image) {
+    const bool has_mosaic_raw = imgdata.rawdata.raw_image && imgdata.idata.filters;
+    if (has_mosaic_raw) {
+      std::cout << "🔧 Copying from raw_image (Bayer/X-Trans)..." << std::endl;
+      copy_bayer_image();
+    } else if (imgdata.rawdata.color4_image) {
       std::cout << "🔧 Copying from color4_image..." << std::endl;
       copy_color4_image();
     } else if (imgdata.rawdata.color3_image) {
@@ -2120,9 +2124,9 @@ public:
     auto &O = imgdata.params;
 
     // Handle half-size processing
-    bool shrink = !imgdata.rawdata.color4_image &&
-                  !imgdata.rawdata.color3_image && imgdata.idata.filters &&
-                  O.half_size;
+    const bool has_mosaic_raw =
+        imgdata.rawdata.raw_image && imgdata.idata.filters;
+    bool shrink = has_mosaic_raw && O.half_size;
 
     // Calculate final image dimensions
     if (shrink) {
@@ -3108,9 +3112,9 @@ py::dict LibRawWrapper::get_output_geometry_dict(bool half_size) const {
   int width = static_cast<int>(sizes.width);
   int height = static_cast<int>(sizes.height);
 
-  const bool can_shrink = half_size && imgdata.idata.filters &&
-                          !imgdata.rawdata.color4_image &&
-                          !imgdata.rawdata.color3_image;
+  const bool has_mosaic_raw =
+      imgdata.rawdata.raw_image && imgdata.idata.filters;
+  const bool can_shrink = half_size && has_mosaic_raw;
   const int shrink = can_shrink ? 1 : 0;
   if (can_shrink) {
     width = (width + 1) >> 1;
