@@ -57,13 +57,55 @@ def get_libomp_paths():
     return None, None
 
 def _default_libraw_install_prefix():
-    """Project-local third_party/libraw-install."""
-    return Path(__file__).resolve().parent / "third_party" / "libraw-install"
+    """Project-local .pixi/libraw-install."""
+    return Path(__file__).resolve().parent / ".pixi" / "libraw-install"
 
 
-def _libraw_dylib_install_name(lib_dir):
+def _libraw_install_prefix_candidates():
+    """Local LibRaw prefixes, newest layout first, legacy layout last."""
+    root = Path(__file__).resolve().parent
+    candidates = []
+    env_p = os.environ.get("LIBRAW_LOCAL_PREFIX", "").strip()
+    if env_p:
+        candidates.append(Path(env_p).expanduser().resolve())
+    candidates.extend([
+        root / ".pixi" / "libraw-install",
+        root.parent / ".pixi" / "libraw-install",
+        root / "third_party" / "libraw-install",
+    ])
+    return [Path(prefix).expanduser().resolve() for prefix in candidates]
+
+
+def _libraw_dylib_path(lib_dir):
+    """Return the concrete LibRaw dylib selected for this build."""
+    lib_dir = Path(lib_dir)
+    dylib = lib_dir / "libraw.dylib"
+    if dylib.exists():
+        return dylib
+    versioned = sorted(lib_dir.glob("libraw.*.dylib"))
+    return versioned[-1] if versioned else None
+
+
+def _extension_package_dir():
+    """Directory where the extension module lives in an editable checkout."""
+    return Path(__file__).resolve().parent / "libraw_enhanced"
+
+
+def _loader_relative_rpath(lib_dir):
+    """Return an @loader_path-relative rpath for a local library directory."""
+    try:
+        rel = os.path.relpath(Path(lib_dir).resolve(), _extension_package_dir())
+    except ValueError:
+        return None
+    rel = rel.replace(os.sep, "/")
+    if rel == ".":
+        return "@loader_path"
+    return f"@loader_path/{rel}"
+
+
+def _libraw_dylib_install_name(dylib):
     """Return the install name embedded in the local LibRaw dylib, if any."""
-    dylib = Path(lib_dir) / "libraw.24.dylib"
+    dylib = Path(dylib)
     if not dylib.exists() or not is_apple_platform():
         return None
     try:
@@ -74,35 +116,53 @@ def _libraw_dylib_install_name(lib_dir):
     return lines[1] if len(lines) > 1 else None
 
 
-def find_libraw():
-    """LibRaw は pixi でビルドした third_party/libraw-install のみ（システム・Homebrew は使わない）。"""
-    libraries = ["raw"]
-    candidates = []
-    env_p = os.environ.get("LIBRAW_LOCAL_PREFIX", "").strip()
-    if env_p:
-        candidates.append(Path(env_p))
-    candidates.append(_default_libraw_install_prefix())
+def _macho_rpaths(path):
+    """Return LC_RPATH entries from a Mach-O binary."""
+    if not is_apple_platform():
+        return []
+    try:
+        output = subprocess.check_output(["otool", "-l", str(path)], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
 
-    for prefix in candidates:
+    rpaths = []
+    in_rpath = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped == "cmd LC_RPATH":
+            in_rpath = True
+            continue
+        if in_rpath and stripped.startswith("path "):
+            rpaths.append(stripped.split(" (offset", 1)[0].removeprefix("path "))
+            in_rpath = False
+    return rpaths
+
+
+def find_libraw():
+    """LibRaw はローカル prefix のみ（システム・Homebrew は使わない）。"""
+    for prefix in _libraw_install_prefix_candidates():
         inc = prefix / "include"
         lib = prefix / "lib"
         pc = lib / "pkgconfig" / "libraw.pc"
         has_pc = pc.is_file()
         has_headers = (inc / "libraw" / "libraw.h").is_file()
-        has_lib = (
-            (lib / "libraw.dylib").is_file()
+        dylib = _libraw_dylib_path(lib)
+        shared_or_static = (
+            dylib
             or (lib / "libraw.so").is_file()
             or (lib / "libraw.a").is_file()
         )
-        if (has_pc or has_headers) and has_lib:
+        if (has_pc or has_headers) and shared_or_static:
             print(f"Found LibRaw (project-local): {prefix}")
-            return [str(inc)], [str(lib)], libraries
+            if is_apple_platform() and dylib:
+                return [str(inc)], [str(lib)], [], [str(dylib)]
+            return [str(inc)], [str(lib)], ["raw"], []
 
     raise RuntimeError(
         "LibRaw が見つかりません（/usr/local や Homebrew は参照しません）。\n"
         "  pixi run build-libraw\n"
         "  pixi run install-libraw-enhanced\n"
-        "を実行して third_party/libraw-install を作成し、"
+        "を実行して .pixi/libraw-install を作成し、"
         "pixi shell（activation で LIBRAW_LOCAL_PREFIX が載る）でビルドしてください。"
     )
 
@@ -233,22 +293,25 @@ class CustomBuildExt(build_ext):
         """個別拡張モジュールのビルド"""
         super().build_extension(ext)
         self._fix_macos_libraw_reference(ext)
+        self._fix_macos_rpaths(ext)
 
     def _fix_macos_libraw_reference(self, ext):
         if not is_apple_platform():
             return
         ext_path = Path(self.get_ext_fullpath(ext.name)).resolve()
         lib_dirs = getattr(ext, "library_dirs", [])
-        libraw_dir = next(
-            (Path(path) for path in lib_dirs
-             if (Path(path) / "libraw.24.dylib").exists()),
+        libraw_dylib = next(
+            (_libraw_dylib_path(path) for path in lib_dirs
+             if _libraw_dylib_path(path)),
             None,
         )
-        if libraw_dir is None:
+        if libraw_dylib is None:
             return
 
-        old_name = _libraw_dylib_install_name(libraw_dir)
-        new_name = "@rpath/libraw.24.dylib"
+        old_name = _libraw_dylib_install_name(libraw_dylib)
+        if not old_name:
+            return
+        new_name = f"@rpath/{Path(old_name).name}"
         if old_name and old_name != new_name:
             subprocess.run(
                 ["install_name_tool", "-change", old_name, new_name,
@@ -256,13 +319,37 @@ class CustomBuildExt(build_ext):
                 check=True,
             )
 
+    def _fix_macos_rpaths(self, ext):
+        if not is_apple_platform():
+            return
+        ext_path = Path(self.get_ext_fullpath(ext.name)).resolve()
+        desired = list(dict.fromkeys(getattr(ext, "_local_rpaths", [])))
+        existing = _macho_rpaths(ext_path)
+
+        # Conda/pixi Python injects absolute build-environment rpaths. Those are
+        # useful locally but must not be embedded in a distributable extension.
+        for rpath in existing:
+            if rpath.startswith("/"):
+                subprocess.run(
+                    ["install_name_tool", "-delete_rpath", rpath, str(ext_path)],
+                    check=True,
+                )
+
+        existing = _macho_rpaths(ext_path)
+        for rpath in desired:
+            if rpath and rpath not in existing:
+                subprocess.run(
+                    ["install_name_tool", "-add_rpath", rpath, str(ext_path)],
+                    check=True,
+                )
+
 
 def create_extension():
     package_version = get_package_version()
     """拡張モジュールの作成"""
     
     # LibRaw検出
-    libraw_includes, libraw_lib_dirs, libraw_libs = find_libraw()
+    libraw_includes, libraw_lib_dirs, libraw_libs, libraw_extra_objects = find_libraw()
     
     # Apple フレームワーク検出
     apple_frameworks, apple_framework_dirs = get_apple_frameworks()
@@ -317,15 +404,17 @@ def create_extension():
     
     # リンクフラグ
     extra_link_args = []
+    local_rpaths = [
+        "@loader_path/../third_party/libraw-install/lib",
+        "@loader_path",
+        "@loader_path/../lib",
+    ]
     
     # Apple固有設定
     if is_apple_platform():
         # フレームワークリンク
         for framework in apple_frameworks:
             extra_link_args.extend(['-framework', framework])
-        
-        # Objective-C++ compilation flags (handled by CustomBuildExt for .mm files)
-        extra_compile_args.extend(['-fmodules'])
         
         # OpenMPサポートを追加
         if libomp_include and libomp_lib:
@@ -337,7 +426,10 @@ def create_extension():
         ])
         for _ld in libraw_lib_dirs + ([libomp_lib] if libomp_lib else []):
             if _ld:
-                extra_link_args.extend(["-Wl,-rpath," + _ld])
+                rpath = _loader_relative_rpath(_ld)
+                if rpath:
+                    local_rpaths.append(rpath)
+                    extra_link_args.extend(["-Wl,-rpath," + rpath])
         
         # デバッグ情報（デバッグビルド時）- O3は維持
         if os.environ.get('DEBUG'):
@@ -357,7 +449,10 @@ def create_extension():
             extra_link_args.extend(["-fopenmp"])
         for _ld in libraw_lib_dirs + ([libomp_lib] if libomp_lib else []):
             if _ld:
-                extra_link_args.extend(["-Wl,-rpath," + _ld])
+                rpath = _loader_relative_rpath(_ld)
+                if rpath:
+                    local_rpaths.append(rpath)
+                    extra_link_args.extend(["-Wl,-rpath," + rpath])
     
     # 警告レベル
     if sys.platform != 'win32':
@@ -387,12 +482,14 @@ def create_extension():
         include_dirs=include_dirs,
         libraries=libraries,
         library_dirs=library_dirs,
+        extra_objects=libraw_extra_objects,
         define_macros=define_macros,
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
         language='c++',
         cxx_std=17,
     )
+    ext._local_rpaths = local_rpaths
     
     return ext
 

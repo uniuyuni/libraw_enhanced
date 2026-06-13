@@ -26,5 +26,5 @@ LIBRAW_LOCAL_PREFIX = "./.pixi/libraw-install"
 
 [tasks]
 build-libraw = "mkdir -p \"./.pixi/libraw-install\" && cd \"./external/LibRaw-master\" && ./configure --prefix=\"$(pwd)/../../.pixi/libraw-install\" && make -j$(sysctl -n hw.ncpu) && make install"
-install-libraw-enhanced = "python -m pip install -e \".[dev]\""
+install-libraw-enhanced = "python -m pip --disable-pip-version-check install -e \".[dev]\" --no-build-isolation --force-reinstall --no-deps --no-cache-dir"
 test = "pytest tests -v"
