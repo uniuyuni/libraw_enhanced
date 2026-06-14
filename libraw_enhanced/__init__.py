@@ -12,6 +12,7 @@ __author__ = "LibRaw Enhanced Team"
 import warnings
 import platform
 import os
+import numpy as np
 
 # --- Runtime dependency preload (macOS / OpenMP) -----------------------------
 # The native extension links against OpenMP symbols (___kmpc_*). In some launch
@@ -105,6 +106,24 @@ else:
     ImageBufferFloat = None
     ProcessingParams = None
 
+_detail_tonemap_wrapper = None
+
+
+def detail_preserving_tonemap(image, use_gpu_acceleration=True):
+    """Apply detail-preserving tone mapping to a float32 RGB numpy image."""
+    if not _CORE_AVAILABLE or _core is None:
+        raise RuntimeError("LibRaw Enhanced core module not available")
+
+    global _detail_tonemap_wrapper
+    if _detail_tonemap_wrapper is None:
+        _detail_tonemap_wrapper = _core.LibRawWrapper()
+    try:
+        _detail_tonemap_wrapper.set_gpu_acceleration(bool(use_gpu_acceleration))
+    except AttributeError:
+        pass
+    arr = np.ascontiguousarray(image, dtype=np.float32)
+    return _detail_tonemap_wrapper.detail_preserving_tonemap(arr)
+
 # Constants and enums
 from .constants import (
     ColorSpace,
@@ -184,6 +203,7 @@ __all__ = [
     "RawImage", 
     "imread",
     "imread_buffer",
+    "detail_preserving_tonemap",
     
     # Core classes (low-level API)
     "Accelerator", 

@@ -127,6 +127,8 @@ public:
   py::array_t<float> tone_mapping_numpy(py::array_t<float> image,
                                         float after_scale = 1.f);
   py::array_t<float>
+  detail_preserving_tonemap_numpy(py::array_t<float> image);
+  py::array_t<float>
   enhance_micro_contrast_numpy(py::array_t<float> image, float threshold = -1.f,
                                float strength = 8.f,
                                float target_contrast = 0.06f);

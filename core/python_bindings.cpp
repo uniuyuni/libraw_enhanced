@@ -383,6 +383,11 @@ PYBIND11_MODULE(_core, m) {
            py::arg("after_scale") = 1.f,
            "Apply tone mapping on a (H,W,3) float32 numpy array. "
            "Returns a new array.")
+      .def("detail_preserving_tonemap",
+           &LibRawWrapper::detail_preserving_tonemap_numpy, py::arg("image"),
+           "Apply detail-preserving tone mapping on a (H,W,3) float32 numpy "
+           "array. Uses GPU when available and falls back to the CPU reference. "
+           "Returns a new array.")
       .def("enhance_micro_contrast",
            &LibRawWrapper::enhance_micro_contrast_numpy, py::arg("image"),
            py::arg("threshold") = -1.f, py::arg("strength") = 8.f,

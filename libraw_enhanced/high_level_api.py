@@ -521,6 +521,20 @@ class RawImage:
         arr = np.ascontiguousarray(image, dtype=np.float32)
         return self._wrapper.tone_mapping(arr, after_scale)
 
+    def detail_preserving_tonemap(self, image: np.ndarray) -> np.ndarray:
+        """
+        ディテール保持トーンマッピングを実行し、新しい numpy 配列を返す。
+        RAW の読み込み状態に依存しない standalone 処理。
+
+        Args:
+            image: 入力画像 (H, W, 3) float32 numpy 配列。HDR 値も可。
+
+        Returns:
+            numpy.ndarray: 処理後の新しい (H, W, 3) float32 配列
+        """
+        arr = np.ascontiguousarray(image, dtype=np.float32)
+        return self._wrapper.detail_preserving_tonemap(arr)
+
     def enhance_micro_contrast(self,
                                image: np.ndarray,
                                threshold: float = -1.0,
