@@ -1,3 +1,16 @@
+/*
+ * LibRaw Enhanced CPU acceleration.
+ *
+ * License: GPL-3.0-or-later.
+ *
+ * Portions of the AMaZE and X-Trans demosaicing implementations in this file
+ * are ports of or derived from RawTherapee demosaicing code. RawTherapee is
+ * distributed under the GNU General Public License version 3.
+ *
+ * This file also interoperates with LibRaw data structures and processing
+ * conventions; LibRaw is distributed under LGPL-2.1 or CDDL-1.0.
+ */
+
 #include "cpu_accelerator.h"
 #include "accelerator.h"
 #include "metal/constants.h"

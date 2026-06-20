@@ -1,3 +1,11 @@
+//
+// demosaic_xtrans_3pass.metal
+// X-Trans 3-pass demosaic.
+//
+// License: GPL-3.0-or-later.
+// Ported from or derived from RawTherapee X-Trans demosaicing logic.
+//
+
 #include "shader_types.h"
 #include "shader_common.h"
 #include <metal_stdlib>

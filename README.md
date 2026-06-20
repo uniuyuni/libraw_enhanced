@@ -3,6 +3,16 @@
 Enhanced LibRaw Python wrapper with Apple Silicon Metal GPU acceleration.  
 Version **0.11.13**
 
+## License
+
+LibRaw Enhanced is licensed under the GNU General Public License version 3 or
+later (GPL-3.0-or-later) in this repository.
+
+This package includes demosaicing code ported from or derived from RawTherapee
+AMaZE and X-Trans implementations, which are GPL-3.0 licensed. It also links
+against LibRaw, which is available under LGPL-2.1 or CDDL-1.0. See the
+repository-level `THIRD_PARTY_NOTICES.md` for attribution details.
+
 ## Features
 
 - rawpy-compatible API (`imread`, `postprocess`, context manager)
@@ -237,4 +247,3 @@ Set `LIBRAW_ENHANCED_DEBUG=1` for verbose initialisation output.
 - 環境変数 `LIBRAW_LOCAL_PREFIX` を `.pixi/libraw-install` に設定してセットアップ
 
 ビルドに必要なシステム依存（`cmake`, `make`, `pkg-config`, `libomp` など）は自動でインストールしません。macOS では `brew install libomp cmake pkg-config` を推奨します。
-

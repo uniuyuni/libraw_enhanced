@@ -2,6 +2,9 @@
 // demosaic_xtrans_1pass.metal
 // X-Trans 1-pass demosaic - CPU identical implementation
 //
+// License: GPL-3.0-or-later.
+// Ported from or derived from RawTherapee X-Trans demosaicing logic.
+//
 
 #include "shader_types.h"
 #include "shader_common.h"

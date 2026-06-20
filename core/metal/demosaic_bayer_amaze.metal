@@ -1,4 +1,8 @@
 // demosaic_bayer_amaze.metal
+//
+// License: GPL-3.0-or-later.
+// Ported from or derived from RawTherapee AMaZE demosaicing logic.
+//
 // ✅ AMaZEアルゴリズム C++版完全移植 最終完成版（修正済み）
 // すべての問題を修正した完全なシェーダーコード
 
